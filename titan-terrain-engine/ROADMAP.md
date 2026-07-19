@@ -1,6 +1,13 @@
 # Titan Roadmap — from v0.2.0 to shipping product
 
-## Where we are (July 2026)
+> **Status update (2026-07-19):** Phases 0–3 are implemented and verified
+> (engine hardening + threading + exporters; web-lab layer stack UX;
+> TitanLab macOS app with passing smoke test; TitanBridge plugin compiled
+> against UE 5.8). Phase 4 deliverables are drafted in docs/launch/ and
+> site/ — remaining items are the human-only account steps listed in
+> docs/launch/launch-checklists.md.
+
+## Where we were at v0.2.0 (July 2026)
 
 **Done:**
 - `libTitanCore` (C++20): seeded simplex/fBm/ridged/billow noise, domain

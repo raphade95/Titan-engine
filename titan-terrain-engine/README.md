@@ -9,10 +9,11 @@ All terrain math lives in **one C++ library** compiled to multiple targets:
 
 | Component | What it is | Status |
 |---|---|---|
-| `libTitanCore` (cpp/) | Pure C++20 engine: noise, erosion, mesh generation. No UI, no graphics API. | Active |
-| **TitanLab (web)** (src/) | React + Three.js viewer that runs libTitanCore as WebAssembly. Development sandbox and demo. | Active |
-| TitanLab (macOS) | Swift/Metal native app linking libTitanCore directly. | Planned |
-| TitanBridge | Unreal Engine plugin (Fab marketplace) wrapping the same library. | Planned |
+| `libTitanCore` (cpp/) | Pure C++20 engine: noise, erosion, exporters, mesh generation. Deterministic and multithreaded. | **Active** |
+| **Web Lab** (src/) | React + Three.js app running the engine as WASM: layer stack, presets, .titan projects. Free tier. | **Active** |
+| **TitanLab (macOS)** (macos/) | SwiftUI + Metal native app linking libTitanCore directly. `./macos/build_app.sh --smoke` | **Active** |
+| **TitanBridge** (unreal/) | Unreal Engine plugin (Fab): in-editor generation via `ATitanTerrainActor`. | **Active** |
+| Launch kit (docs/, site/) | Docs, marketing site, pricing/EULA drafts, launch checklists. | Drafted |
 
 The viewer contains **zero terrain math** — [src/core/TitanCore.ts](src/core/TitanCore.ts)
 only marshals parameters in and copies buffers out across the C API
