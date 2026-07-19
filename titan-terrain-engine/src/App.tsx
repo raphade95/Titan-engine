@@ -5,9 +5,8 @@ import { motion, AnimatePresence } from 'motion/react';
 import { 
   Settings2, 
   Mountain, 
-  Droplets, 
-  Wind, 
-  RotateCcw, 
+  Droplets,
+  RotateCcw,
   Download, 
   Layers,
   Activity,
@@ -23,11 +22,32 @@ import {
   Waves,
   Minus,
   Lock,
-  Unlock
+  Unlock,
+  Undo2,
+  Redo2,
+  Plus,
+  Trash2,
+  ArrowUp,
+  ArrowDown,
+  Save,
+  FolderOpen,
+  X
 } from 'lucide-react';
 
 import { TitanCore } from './core/TitanCore';
 import { TerrainParams } from './core/types';
+import {
+  Layer,
+  LAYER_DEFS,
+  LayerType,
+  PRESETS,
+  TitanProject,
+  deserializeProject,
+  instantiatePreset,
+  makeLayer,
+  runPipeline,
+  serializeProject,
+} from './core/pipeline';
 
 import { Button } from '@/components/ui/button';
 import { Slider } from '@/components/ui/slider';
@@ -64,13 +84,16 @@ export default function App() {
   const [isGenerating, setIsGenerating] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [stats, setStats] = useState({ vertices: 0, triangles: 0, time: 0, flora: 0 });
-  const [erosionIterations, setErosionIterations] = useState(50000);
-  const [thermalIterations, setThermalIterations] = useState(10);
-  const [fluvialIterations, setFluvialIterations] = useState(2);
-  const [fluvialStrength, setFluvialStrength] = useState(1.0);
+  const [stack, setStack] = useState<Layer[]>([]);
+  const [progress, setProgress] = useState<{ frac: number; label: string } | null>(null);
   const [seedLocked, setSeedLocked] = useState(false);
   const [engineStatus, setEngineStatus] = useState<'loading' | 'ready' | 'error'>('loading');
   const [engineVersion, setEngineVersion] = useState('');
+  const [historyState, setHistoryState] = useState({ canUndo: false, canRedo: false });
+  const runIdRef = useRef(0);
+  const historyRef = useRef<{ past: string[]; future: string[] }>({ past: [], future: [] });
+  const applyingHistoryRef = useRef(false);
+  const loadFileRef = useRef<HTMLInputElement | null>(null);
   const [floraDensity, setFloraDensity] = useState(2000);
   const [isInspectMode, setIsInspectMode] = useState(false);
   const [probeData, setProbeData] = useState<{ x: number, y: number, h: number, s: number, f: number, slope: number } | null>(null);
@@ -584,117 +607,162 @@ export default function App() {
     setStats(prev => ({ ...prev, flora: instances.length }));
   }, [params.size, params.heightMultiplier, params.biome, floraDensity]);
 
-  const generateTerrain = React.useCallback(() => {
+  // Runs the whole layer stack, chunked so the viewport updates live and the
+  // UI never freezes. A newer run (or Cancel) simply invalidates this one.
+  const runStack = React.useCallback(async () => {
     const engine = engineRef.current;
     if (!sceneRef.current || !engine) return;
+    const myRun = ++runIdRef.current;
     setIsGenerating(true);
     setError(null);
     const startTime = performance.now();
 
     try {
-      engine.configure(params);
-      engine.generate();
-
-      updateMesh();
-
-      const endTime = performance.now();
-      setStats(prev => ({ ...prev, time: Math.round(endTime - startTime) }));
+      const project: TitanProject = { version: 1, params, stack };
+      const completed = await runPipeline(engine, project, {
+        onProgress: (frac, label) => {
+          if (runIdRef.current === myRun) setProgress({ frac, label });
+        },
+        onChunk: () => {
+          if (runIdRef.current === myRun) updateMesh();
+        },
+        shouldCancel: () => runIdRef.current !== myRun,
+      });
+      if (completed && runIdRef.current === myRun) {
+        setStats(prev => ({ ...prev, time: Math.round(performance.now() - startTime) }));
+      }
     } catch (err) {
-      console.error('Generation failed:', err);
+      console.error('Pipeline failed:', err);
       setError(err instanceof Error ? err.message : 'Unknown error during generation');
     } finally {
-      setIsGenerating(false);
+      if (runIdRef.current === myRun) {
+        setIsGenerating(false);
+        setProgress(null);
+      }
     }
-  }, [params, updateMesh]);
+  }, [params, stack, updateMesh]);
+
+  const cancelRun = React.useCallback(() => {
+    runIdRef.current++;
+    setIsGenerating(false);
+    setProgress(null);
+  }, []);
 
   // "Regenerate" pulls a fresh seed unless the user has locked it, so no two
   // generations ever look the same by accident.
   const handleRegenerate = React.useCallback(() => {
     if (seedLocked) {
-      generateTerrain();
+      runStack();
     } else {
       setParams(p => ({ ...p, seed: randomSeed() }));
     }
-  }, [seedLocked, generateTerrain]);
+  }, [seedLocked, runStack]);
 
-  const applyErosion = () => {
-    if (!engineRef.current) return;
-    setIsGenerating(true);
-    setError(null);
-    const startTime = performance.now();
-
-    try {
-      engineRef.current.erodeHydraulic(erosionIterations);
-
-      updateMesh();
-
-      const endTime = performance.now();
-      setStats(prev => ({ ...prev, time: Math.round(endTime - startTime) }));
-    } catch (err) {
-      console.error('Erosion failed:', err);
-      setError(err instanceof Error ? err.message : 'Unknown error during erosion');
-    } finally {
-      setIsGenerating(false);
+  // --- Undo/redo over (params, stack) snapshots ---------------------------
+  useEffect(() => {
+    const snapshot = serializeProject({ version: 1, params, stack });
+    const h = historyRef.current;
+    if (applyingHistoryRef.current) {
+      applyingHistoryRef.current = false;
+    } else if (h.past[h.past.length - 1] !== snapshot) {
+      h.past.push(snapshot);
+      if (h.past.length > 50) h.past.shift();
+      h.future = [];
     }
+    setHistoryState({ canUndo: h.past.length > 1, canRedo: h.future.length > 0 });
+  }, [params, stack]);
+
+  const applySnapshot = React.useCallback((json: string) => {
+    const project = deserializeProject(json);
+    applyingHistoryRef.current = true;
+    setParams(project.params);
+    setStack(project.stack);
+  }, []);
+
+  const undo = React.useCallback(() => {
+    const h = historyRef.current;
+    if (h.past.length < 2) return;
+    h.future.push(h.past.pop()!);
+    applySnapshot(h.past[h.past.length - 1]);
+    setHistoryState({ canUndo: h.past.length > 1, canRedo: true });
+  }, [applySnapshot]);
+
+  const redo = React.useCallback(() => {
+    const h = historyRef.current;
+    const next = h.future.pop();
+    if (!next) return;
+    h.past.push(next);
+    applySnapshot(next);
+    setHistoryState({ canUndo: true, canRedo: h.future.length > 0 });
+  }, [applySnapshot]);
+
+  // --- Stack editing helpers ----------------------------------------------
+  const addLayer = (type: LayerType) => setStack(s => [...s, makeLayer(type)]);
+  const removeLayer = (id: string) => setStack(s => s.filter(l => l.id !== id));
+  const toggleLayer = (id: string, enabled: boolean) =>
+    setStack(s => s.map(l => (l.id === id ? { ...l, enabled } : l)));
+  const setLayerParam = (id: string, key: string, value: number) =>
+    setStack(s => s.map(l => (l.id === id ? { ...l, params: { ...l.params, [key]: value } } : l)));
+  const moveLayer = (id: string, dir: -1 | 1) =>
+    setStack(s => {
+      const i = s.findIndex(l => l.id === id);
+      if (i < 0 || i + dir < 0 || i + dir >= s.length) return s;
+      const copy = [...s];
+      [copy[i], copy[i + dir]] = [copy[i + dir], copy[i]];
+      return copy;
+    });
+
+  const applyPreset = (index: number) => {
+    const { params: presetParams, stack: presetStack } = instantiatePreset(PRESETS[index]);
+    setParams(p => ({
+      ...p,
+      ...presetParams,
+      seed: seedLocked ? p.seed : randomSeed(),
+    }));
+    setStack(presetStack);
   };
 
-  const applyFluvial = () => {
-    if (!engineRef.current) return;
-    setIsGenerating(true);
-    setError(null);
-    const startTime = performance.now();
-
-    try {
-      engineRef.current.erodeFluvial(fluvialIterations, fluvialStrength);
-
-      updateMesh();
-
-      const endTime = performance.now();
-      setStats(prev => ({ ...prev, time: Math.round(endTime - startTime) }));
-    } catch (err) {
-      console.error('Fluvial erosion failed:', err);
-      setError(err instanceof Error ? err.message : 'Unknown error during fluvial erosion');
-    } finally {
-      setIsGenerating(false);
-    }
-  };
-
-  const exportHeightmap = () => {
-    if (!engineRef.current) return;
-    const size = params.size;
-    const bedrock = engineRef.current.getBedrockMap();
-    const sediment = engineRef.current.getSedimentMap();
-    
-    // Create a 16-bit RAW heightmap (Little Endian)
-    const buffer = new ArrayBuffer(size * size * 2);
-    const view = new DataView(buffer);
-    
-    let minH = Infinity;
-    let maxH = -Infinity;
-    
-    for (let i = 0; i < size * size; i++) {
-      const h = bedrock[i] + sediment[i];
-      if (h < minH) minH = h;
-      if (h > maxH) maxH = h;
-    }
-    
-    const range = maxH - minH || 1;
-    
-    for (let i = 0; i < size * size; i++) {
-        const h = bedrock[i] + sediment[i];
-        // Normalize to 0-65535
-        const normalized = Math.floor(((h - minH) / range) * 65535);
-        view.setUint16(i * 2, normalized, true);
-    }
-    
-    const blob = new Blob([buffer], { type: 'application/octet-stream' });
+  // --- Project save/load ---------------------------------------------------
+  const saveProject = () => {
+    const json = serializeProject({ version: 1, params, stack });
+    const blob = new Blob([json], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = `titan_heightmap_${size}x${size}.r16`;
+    a.download = `terrain_${params.seed}.titan`;
     a.click();
     URL.revokeObjectURL(url);
   };
+
+  const loadProject = async (file: File) => {
+    try {
+      const project = deserializeProject(await file.text());
+      setParams(project.params);
+      setStack(project.stack);
+      setError(null);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Could not read project file');
+    }
+  };
+
+  const downloadBinary = (data: Uint8Array, filename: string) => {
+    const blob = new Blob([data as BlobPart], { type: 'application/octet-stream' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const exportVia = (kind: 'png16' | 'r16' | 'r32' | 'exr' | 'obj', ext: string) => {
+    if (!engineRef.current) return;
+    downloadBinary(
+      engineRef.current.exportFile(kind),
+      `titan_${params.seed}_${params.size}x${params.size}.${ext}`
+    );
+  };
+
 
   const exportHeightmapPNG = () => {
     if (!engineRef.current) return;
@@ -775,27 +843,6 @@ export default function App() {
     a.click();
   };
 
-  const applyThermal = () => {
-    if (!engineRef.current) return;
-    setIsGenerating(true);
-    setError(null);
-    const startTime = performance.now();
-
-    try {
-      engineRef.current.erodeThermal(thermalIterations);
-
-      updateMesh();
-
-      const endTime = performance.now();
-      setStats(prev => ({ ...prev, time: Math.round(endTime - startTime) }));
-    } catch (err) {
-      console.error('Weathering failed:', err);
-      setError(err instanceof Error ? err.message : 'Unknown error during weathering');
-    } finally {
-      setIsGenerating(false);
-    }
-  };
-
   const updateParam = (key: keyof TerrainParams, value: any) => {
     console.log(`Updating param ${key} to ${value}`);
     if (key !== 'seed' && (typeof value !== 'number' || isNaN(value))) return;
@@ -846,14 +893,14 @@ export default function App() {
     };
   }, []);
 
-  // Terrain generation on params change (and once the engine comes up)
+  // Rebuild the full stack when anything changes (and once the engine is up)
   useEffect(() => {
     if (engineStatus !== 'ready') return;
     const timer = setTimeout(() => {
-      generateTerrain();
-    }, 150);
+      runStack();
+    }, 250);
     return () => clearTimeout(timer);
-  }, [generateTerrain, params, engineStatus]);
+  }, [runStack, engineStatus]);
 
   return (
     <div className="relative w-full h-screen bg-[#87CEEB] text-zinc-100 font-sans overflow-hidden">
@@ -920,15 +967,55 @@ export default function App() {
                   Error: {error}
                 </div>
               )}
+              <div className="flex items-center justify-end gap-1 mb-3">
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="h-7 px-2 text-zinc-500 hover:text-zinc-100 disabled:opacity-30"
+                  onClick={undo}
+                  disabled={!historyState.canUndo}
+                  title="Undo"
+                >
+                  <Undo2 className="w-3.5 h-3.5" />
+                </Button>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="h-7 px-2 text-zinc-500 hover:text-zinc-100 disabled:opacity-30"
+                  onClick={redo}
+                  disabled={!historyState.canRedo}
+                  title="Redo"
+                >
+                  <Redo2 className="w-3.5 h-3.5" />
+                </Button>
+              </div>
               <Tabs defaultValue="generator" className="w-full">
                 <TabsList className="grid w-full grid-cols-4 bg-zinc-900 mb-8">
                   <TabsTrigger value="generator" className="text-[10px] uppercase tracking-wider">Base</TabsTrigger>
-                  <TabsTrigger value="erosion" className="text-[10px] uppercase tracking-wider">Erosion</TabsTrigger>
+                  <TabsTrigger value="erosion" className="text-[10px] uppercase tracking-wider">Stack</TabsTrigger>
                   <TabsTrigger value="render" className="text-[10px] uppercase tracking-wider">Render</TabsTrigger>
                   <TabsTrigger value="export" className="text-[10px] uppercase tracking-wider">Export</TabsTrigger>
                 </TabsList>
 
                 <TabsContent value="generator" className="space-y-8">
+                  <div className="space-y-3">
+                    <Label className="text-[11px] uppercase tracking-widest text-zinc-400">Presets</Label>
+                    <div className="space-y-2">
+                      {PRESETS.map((preset, i) => (
+                        <button
+                          key={preset.name}
+                          onClick={() => applyPreset(i)}
+                          className="w-full text-left p-3 bg-zinc-900 hover:bg-zinc-800 border border-zinc-800 hover:border-emerald-500/40 rounded-lg transition-colors group"
+                        >
+                          <div className="text-xs font-bold uppercase tracking-widest group-hover:text-emerald-400">{preset.name}</div>
+                          <div className="text-[10px] text-zinc-500 mt-0.5">{preset.tagline}</div>
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  <Separator className="bg-zinc-800" />
+
                   <div className="space-y-4">
                     <Label className="text-[11px] uppercase tracking-widest text-zinc-400">Biological Biome</Label>
                     <div className="grid grid-cols-4 gap-2">
@@ -1116,111 +1203,77 @@ export default function App() {
                   </div>
                 </TabsContent>
 
-                <TabsContent value="erosion" className="space-y-8">
-                  <div className="p-4 bg-zinc-900 rounded-lg border border-zinc-800">
-                    <div className="flex items-center gap-3 mb-3">
-                      <Droplets className="w-5 h-5 text-blue-400" />
-                      <h3 className="text-xs font-bold uppercase tracking-widest">Hydraulic Erosion</h3>
-                    </div>
-                    <p className="text-[10px] text-zinc-500 mb-4 leading-relaxed">
-                      Simulates water droplets carving riverbeds and depositing sediment based on momentum and slope.
-                    </p>
-                    <div className="space-y-4 mb-6">
-                      <div className="flex items-center justify-between">
-                        <Label className="text-[10px] uppercase text-zinc-400">Iterations</Label>
-                        <span className="text-xs font-mono">{erosionIterations.toLocaleString()}</span>
-                      </div>
-                      <Slider 
-                        value={[erosionIterations || 50000]} 
-                        min={1000} 
-                        max={200000} 
-                        step={1000} 
-                        onValueChange={(v: number[]) => setErosionIterations(v[0] || 50000)}
-                      />
-                    </div>
-                    <Button 
-                      onClick={applyErosion} 
-                      variant="secondary" 
-                      className="w-full text-xs uppercase font-bold tracking-widest"
-                      disabled={isGenerating}
-                    >
-                      Apply Simulation
-                    </Button>
-                  </div>
+                <TabsContent value="erosion" className="space-y-6">
+                  <p className="text-[10px] text-zinc-500 leading-relaxed">
+                    The stack runs top to bottom on every rebuild. Same seed + same stack = identical terrain, every time.
+                  </p>
 
-                  <div className="p-4 bg-zinc-900 rounded-lg border border-zinc-800">
-                    <div className="flex items-center gap-3 mb-3">
-                      <Waves className="w-5 h-5 text-cyan-400" />
-                      <h3 className="text-xs font-bold uppercase tracking-widest">River Networks</h3>
+                  {stack.length === 0 && (
+                    <div className="p-6 bg-zinc-900/50 border border-dashed border-zinc-800 rounded-lg text-center">
+                      <span className="text-[10px] uppercase tracking-widest text-zinc-600">No layers yet — add one below or pick a preset</span>
                     </div>
-                    <p className="text-[10px] text-zinc-500 mb-4 leading-relaxed">
-                      Stream-power fluvial erosion: routes rainfall across the whole map and carves connected, branching drainage networks.
-                    </p>
-                    <div className="space-y-4 mb-4">
-                      <div className="flex items-center justify-between">
-                        <Label className="text-[10px] uppercase text-zinc-400">Passes</Label>
-                        <span className="text-xs font-mono">{fluvialIterations}</span>
-                      </div>
-                      <Slider
-                        value={[fluvialIterations]}
-                        min={1}
-                        max={10}
-                        step={1}
-                        onValueChange={(v: number[]) => setFluvialIterations(v[0] || 2)}
-                      />
-                    </div>
-                    <div className="space-y-4 mb-6">
-                      <div className="flex items-center justify-between">
-                        <Label className="text-[10px] uppercase text-zinc-400">Strength</Label>
-                        <span className="text-xs font-mono">{fluvialStrength.toFixed(1)}</span>
-                      </div>
-                      <Slider
-                        value={[fluvialStrength]}
-                        min={0.1}
-                        max={3}
-                        step={0.1}
-                        onValueChange={(v: number[]) => setFluvialStrength(v[0] || 1.0)}
-                      />
-                    </div>
-                    <Button
-                      onClick={applyFluvial}
-                      variant="secondary"
-                      className="w-full text-xs uppercase font-bold tracking-widest"
-                      disabled={isGenerating}
-                    >
-                      Carve Rivers
-                    </Button>
-                  </div>
+                  )}
 
-                  <div className="p-4 bg-zinc-900 rounded-lg border border-zinc-800">
-                    <div className="flex items-center gap-3 mb-3">
-                      <Wind className="w-5 h-5 text-orange-400" />
-                      <h3 className="text-xs font-bold uppercase tracking-widest">Thermal Weathering</h3>
-                    </div>
-                    <p className="text-[10px] text-zinc-500 mb-4 leading-relaxed">
-                      Simulates the "Angle of Repose" where loose material falls down steep cliffs to form talus slopes.
-                    </p>
-                    <div className="space-y-4 mb-6">
-                      <div className="flex items-center justify-between">
-                        <Label className="text-[10px] uppercase text-zinc-400">Passes</Label>
-                        <span className="text-xs font-mono">{thermalIterations}</span>
+                  {stack.map((layer, idx) => {
+                    const def = LAYER_DEFS[layer.type];
+                    return (
+                      <div key={layer.id} className={`p-4 bg-zinc-900 rounded-lg border ${layer.enabled ? 'border-zinc-800' : 'border-zinc-800/50 opacity-50'}`}>
+                        <div className="flex items-center gap-2 mb-2">
+                          <Switch checked={layer.enabled} onCheckedChange={(v) => toggleLayer(layer.id, v)} />
+                          <h3 className="text-xs font-bold uppercase tracking-widest flex-1">{def.label}</h3>
+                          <Button variant="ghost" size="sm" className="h-6 w-6 p-0 text-zinc-600 hover:text-zinc-200 disabled:opacity-20" disabled={idx === 0} onClick={() => moveLayer(layer.id, -1)}>
+                            <ArrowUp className="w-3 h-3" />
+                          </Button>
+                          <Button variant="ghost" size="sm" className="h-6 w-6 p-0 text-zinc-600 hover:text-zinc-200 disabled:opacity-20" disabled={idx === stack.length - 1} onClick={() => moveLayer(layer.id, 1)}>
+                            <ArrowDown className="w-3 h-3" />
+                          </Button>
+                          <Button variant="ghost" size="sm" className="h-6 w-6 p-0 text-zinc-600 hover:text-red-400" onClick={() => removeLayer(layer.id)}>
+                            <Trash2 className="w-3 h-3" />
+                          </Button>
+                        </div>
+                        <p className="text-[9px] text-zinc-600 mb-4 leading-relaxed">{def.description}</p>
+                        <div className="space-y-4">
+                          {def.params.map(pd => (
+                            <div key={pd.key} className="space-y-2">
+                              <div className="flex items-center justify-between">
+                                <Label className="text-[10px] uppercase text-zinc-400">{pd.label}</Label>
+                                {!pd.choices && (
+                                  <span className="text-xs font-mono">{(layer.params[pd.key] ?? pd.defaultValue).toLocaleString()}</span>
+                                )}
+                              </div>
+                              {pd.choices ? (
+                                <div className="grid grid-cols-2 gap-2">
+                                  {pd.choices.map((choice, ci) => (
+                                    <Button key={choice} variant="outline" size="sm"
+                                      className={`h-7 text-[9px] uppercase tracking-wider bg-zinc-950 border-zinc-800 ${layer.params[pd.key] === ci ? 'border-emerald-500/50 text-emerald-400' : 'text-zinc-500'}`}
+                                      onClick={() => setLayerParam(layer.id, pd.key, ci)}>
+                                      {choice}
+                                    </Button>
+                                  ))}
+                                </div>
+                              ) : (
+                                <Slider value={[layer.params[pd.key] ?? pd.defaultValue]} min={pd.min} max={pd.max} step={pd.step}
+                                  onValueChange={(v: number[]) => { if (v && v.length > 0) setLayerParam(layer.id, pd.key, v[0]); }} />
+                              )}
+                            </div>
+                          ))}
+                        </div>
                       </div>
-                      <Slider 
-                        value={[thermalIterations || 10]} 
-                        min={1} 
-                        max={50} 
-                        step={1} 
-                        onValueChange={(v: number[]) => setThermalIterations(v[0] || 10)}
-                      />
+                    );
+                  })}
+
+                  <div className="space-y-2">
+                    <Label className="text-[11px] uppercase tracking-widest text-zinc-400">Add Layer</Label>
+                    <div className="grid grid-cols-2 gap-2">
+                      {(Object.keys(LAYER_DEFS) as LayerType[]).map(type => (
+                        <Button key={type} variant="outline"
+                          className="h-9 justify-start text-[10px] uppercase tracking-wider bg-zinc-900 border-zinc-800 hover:bg-zinc-800"
+                          onClick={() => addLayer(type)}>
+                          <Plus className="w-3 h-3 mr-2" />
+                          {LAYER_DEFS[type].label}
+                        </Button>
+                      ))}
                     </div>
-                    <Button 
-                      onClick={applyThermal} 
-                      variant="secondary" 
-                      className="w-full text-xs uppercase font-bold tracking-widest"
-                      disabled={isGenerating}
-                    >
-                      Apply Weathering
-                    </Button>
                   </div>
 
                   <div className="p-4 bg-zinc-900 rounded-lg border border-zinc-800">
@@ -1385,26 +1438,34 @@ export default function App() {
                     </p>
                     
                     <div className="grid grid-cols-2 gap-3">
-                      <Button 
-                        onClick={exportHeightmap}
-                        variant="outline" 
-                        className="w-full border-zinc-800 hover:bg-zinc-800 text-[10px] uppercase tracking-widest h-12 text-center flex flex-col items-center justify-center"
-                      >
-                        <div className="flex items-center mb-1">
-                          <FileCode className="w-3 h-3 mr-1" />
-                          <span>.r16</span>
-                        </div>
-                        <span className="text-[8px] opacity-60">16-bit Unreal</span>
-                      </Button>
-
-                      <Button 
+                      {([
+                        { kind: 'r16', ext: 'r16', label: '.r16', sub: '16-bit RAW · Unreal' },
+                        { kind: 'png16', ext: 'png', label: '.png 16', sub: '16-bit PNG · Unity' },
+                        { kind: 'exr', ext: 'exr', label: '.exr', sub: 'Float32 · Blender/Nuke' },
+                        { kind: 'r32', ext: 'r32', label: '.r32', sub: 'Float32 RAW · absolute' },
+                        { kind: 'obj', ext: 'obj', label: '.obj', sub: 'Mesh · Blender' },
+                      ] as const).map(f => (
+                        <Button
+                          key={f.kind}
+                          onClick={() => exportVia(f.kind, f.ext)}
+                          variant="outline"
+                          className="w-full border-zinc-800 hover:bg-zinc-800 text-[10px] uppercase tracking-widest h-12 text-center flex flex-col items-center justify-center"
+                        >
+                          <div className="flex items-center mb-1">
+                            <FileCode className="w-3 h-3 mr-1" />
+                            <span>{f.label}</span>
+                          </div>
+                          <span className="text-[8px] opacity-60">{f.sub}</span>
+                        </Button>
+                      ))}
+                      <Button
                         onClick={exportHeightmapPNG}
-                        variant="outline" 
+                        variant="outline"
                         className="w-full border-zinc-800 hover:bg-zinc-800 text-[10px] uppercase tracking-widest h-12 text-center flex flex-col items-center justify-center"
                       >
                         <div className="flex items-center mb-1">
                           <ImageIcon className="w-3 h-3 mr-1" />
-                          <span>.png</span>
+                          <span>.png 8</span>
                         </div>
                         <span className="text-[8px] opacity-60">8-bit Mask</span>
                       </Button>
@@ -1420,12 +1481,52 @@ export default function App() {
                     </Button>
                   </div>
 
+                  <div className="p-4 bg-zinc-900 rounded-lg border border-zinc-800">
+                    <div className="flex items-center gap-3 mb-3">
+                      <Save className="w-5 h-5 text-sky-400" />
+                      <h3 className="text-xs font-bold uppercase tracking-widest">Project</h3>
+                    </div>
+                    <p className="text-[10px] text-zinc-500 mb-4 leading-relaxed">
+                      A .titan file stores the seed, base parameters, and full layer stack — a perfect, tiny reproduction recipe.
+                    </p>
+                    <div className="grid grid-cols-2 gap-3">
+                      <Button
+                        onClick={saveProject}
+                        variant="outline"
+                        className="border-zinc-800 hover:bg-zinc-800 text-[10px] uppercase tracking-widest h-10"
+                      >
+                        <Save className="w-3 h-3 mr-2" />
+                        Save .titan
+                      </Button>
+                      <Button
+                        onClick={() => loadFileRef.current?.click()}
+                        variant="outline"
+                        className="border-zinc-800 hover:bg-zinc-800 text-[10px] uppercase tracking-widest h-10"
+                      >
+                        <FolderOpen className="w-3 h-3 mr-2" />
+                        Load .titan
+                      </Button>
+                    </div>
+                    <input
+                      ref={loadFileRef}
+                      type="file"
+                      accept=".titan,application/json"
+                      className="hidden"
+                      onChange={(e) => {
+                        const file = e.target.files?.[0];
+                        if (file) loadProject(file);
+                        e.target.value = '';
+                      }}
+                    />
+                  </div>
+
                   <div className="p-4 bg-emerald-500/5 rounded-lg border border-emerald-500/20">
                     <h4 className="text-[10px] font-bold text-emerald-400 uppercase tracking-widest mb-2">Import Guide</h4>
                     <ul className="text-[9px] text-zinc-400 space-y-1 list-disc pl-4">
-                      <li>Heightmap: Use "Import from File" in Landscape mode.</li>
-                      <li>Format: 16-bit Grayscale (Little Endian).</li>
-                      <li>Splatmap: R=Rock, G=Height, B=Sediment.</li>
+                      <li>Unreal: Landscape mode → "Import from File" → .r16 (16-bit LE RAW).</li>
+                      <li>Unity: Terrain → Import Raw, or the 16-bit PNG.</li>
+                      <li>Blender: .exr as displacement, or import the .obj mesh directly.</li>
+                      <li>Splatmap: R=Rock, G=Height, B=Flow/Wetness.</li>
                     </ul>
                   </div>
                 </TabsContent>
@@ -1458,6 +1559,29 @@ export default function App() {
             </div>
           </div>
         )}
+
+      {/* Pipeline progress */}
+      {progress && (
+        <div className="absolute bottom-6 left-1/2 -translate-x-1/2 z-30 w-[420px] max-w-[80vw]">
+          <Card className="bg-zinc-950/90 backdrop-blur-md border-zinc-800 p-3">
+            <div className="flex items-center gap-3">
+              <Activity className="w-3.5 h-3.5 text-emerald-400 animate-pulse" />
+              <div className="flex-1">
+                <div className="flex justify-between mb-1.5">
+                  <span className="text-[9px] uppercase tracking-widest text-zinc-400">{progress.label}</span>
+                  <span className="text-[9px] font-mono text-zinc-500">{Math.round(progress.frac * 100)}%</span>
+                </div>
+                <div className="h-1 bg-zinc-800 rounded overflow-hidden">
+                  <div className="h-full bg-emerald-500 transition-all duration-150" style={{ width: `${progress.frac * 100}%` }} />
+                </div>
+              </div>
+              <Button variant="ghost" size="sm" className="h-6 w-6 p-0 text-zinc-500 hover:text-red-400" onClick={cancelRun}>
+                <X className="w-3 h-3" />
+              </Button>
+            </div>
+          </Card>
+        </div>
+      )}
 
       {/* Footer / Overlay */}
       <div className="absolute bottom-6 right-6 z-20 flex flex-col items-end gap-2 pointer-events-none">
