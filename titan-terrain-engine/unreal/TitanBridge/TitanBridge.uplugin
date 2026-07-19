@@ -1,0 +1,30 @@
+{
+  "FileVersion": 3,
+  "Version": 1,
+  "VersionName": "0.3.0",
+  "FriendlyName": "Titan Terrain Bridge",
+  "Description": "Deterministic procedural terrain generation powered by libTitanCore: fractal noise with domain warping, hydraulic/fluvial/thermal erosion, and instant in-editor preview. Same seed, same terrain — on Mac and Windows.",
+  "Category": "Procedural",
+  "CreatedBy": "Titan Terrain",
+  "CreatedByURL": "https://titanterrain.app",
+  "DocsURL": "https://titanterrain.app/docs/unreal",
+  "MarketplaceURL": "",
+  "SupportURL": "https://titanterrain.app/support",
+  "CanContainContent": false,
+  "IsBetaVersion": true,
+  "Installed": false,
+  "Modules": [
+    {
+      "Name": "TitanBridge",
+      "Type": "Runtime",
+      "LoadingPhase": "Default",
+      "PlatformAllowList": ["Mac", "Win64"]
+    }
+  ],
+  "Plugins": [
+    {
+      "Name": "ProceduralMeshComponent",
+      "Enabled": true
+    }
+  ]
+}
