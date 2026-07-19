@@ -56,7 +56,6 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { Switch } from '@/components/ui/switch';
 import { Label } from '@/components/ui/label';
 import { Separator } from '@/components/ui/separator';
-import { ScrollArea } from '@/components/ui/scroll-area';
 
 const randomSeed = () => Math.random().toString(36).substring(2, 9);
 
@@ -961,7 +960,7 @@ export default function App() {
         <div
           className="absolute top-0 left-0 h-full w-[380px] bg-zinc-950/90 backdrop-blur-xl border-r border-zinc-800 z-20 flex flex-col pt-24 pointer-events-auto"
         >
-          <ScrollArea className="flex-1 px-6 pb-8">
+          <div className="flex-1 min-h-0 overflow-y-auto px-6 pb-8">
               {error && (
                 <div className="mb-6 p-3 bg-red-500/10 border border-red-500/50 rounded text-[10px] text-red-400 font-mono uppercase tracking-wider">
                   Error: {error}
@@ -1531,7 +1530,7 @@ export default function App() {
                   </div>
                 </TabsContent>
               </Tabs>
-            </ScrollArea>
+            </div>
 
             <div className="p-6 border-t border-zinc-800 bg-zinc-950">
               <div className="flex items-center justify-between mb-4">
