@@ -136,9 +136,13 @@ void TerrainEngine::ApplyFluvialErosion(int iterations, const FluvialParams& p) 
             if (drop <= 0.0f) continue;
             const float slope = drop / dist;
 
-            float erode = p.strength * p.erodeConstant
-                        * std::pow(area[i], p.areaExponent)
-                        * std::pow(slope, p.slopeExponent);
+            // Fast paths for the standard exponents (m=0.5, n=1) — pow() on
+            // a million cells is measurable.
+            const float areaTerm = (p.areaExponent == 0.5f)
+                ? std::sqrt(area[i]) : std::pow(area[i], p.areaExponent);
+            const float slopeTerm = (p.slopeExponent == 1.0f)
+                ? slope : std::pow(slope, p.slopeExponent);
+            float erode = p.strength * p.erodeConstant * areaTerm * slopeTerm;
 
             // Never invert the local gradient, never exceed the step cap.
             erode = std::min(erode, drop * 0.8f);

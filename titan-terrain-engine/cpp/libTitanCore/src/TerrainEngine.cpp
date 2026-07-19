@@ -4,6 +4,11 @@
 #include <algorithm>
 #include <cmath>
 
+#if !defined(__EMSCRIPTEN__)
+#include <future>
+#include <thread>
+#endif
+
 namespace Titan {
 
 void TerrainEngine::Initialize(const TerrainParams& params) {
@@ -12,10 +17,13 @@ void TerrainEngine::Initialize(const TerrainParams& params) {
     m_Bedrock.assign(count, 0.0f);
     m_Sediment.assign(count, 0.0f);
     m_Flow.assign(count, 0.0f);
+    m_DropletCursor = 0;
+    if (m_Precipitation.size() != count) m_Precipitation.clear();
 }
 
 void TerrainEngine::GenerateHeightmap() {
     const int size = m_Params.size;
+    m_DropletCursor = 0;
 
     if (m_Params.noiseType == static_cast<int>(NoiseType::None)) {
         std::fill(m_Bedrock.begin(), m_Bedrock.end(), 0.0f);
@@ -33,7 +41,7 @@ void TerrainEngine::GenerateHeightmap() {
     fp.ridgeGain = m_Params.ridgeGain;
     fp.warpStrength = m_Params.warpStrength;
 
-    FractalNoise noise(m_Params.seed, fp);
+    const FractalNoise noise(m_Params.seed, fp);
 
     // Noise is sampled in world space, then scaled so `scale` noise features
     // span the tile regardless of resolution. Tiles that share an origin grid
@@ -41,19 +49,36 @@ void TerrainEngine::GenerateHeightmap() {
     const float extent = static_cast<float>(size) * m_Params.cellSize;
     const float frequency = extent > 0.0f ? m_Params.scale / extent : 0.0f;
 
-    for (int y = 0; y < size; ++y) {
-        for (int x = 0; x < size; ++x) {
-            const float worldX = m_Params.originX + (static_cast<float>(x) - size * 0.5f) * m_Params.cellSize;
-            const float worldY = m_Params.originY + (static_cast<float>(y) - size * 0.5f) * m_Params.cellSize;
+    auto generateRows = [&](int yBegin, int yEnd) {
+        for (int y = yBegin; y < yEnd; ++y) {
+            for (int x = 0; x < size; ++x) {
+                const float worldX = m_Params.originX + (static_cast<float>(x) - size * 0.5f) * m_Params.cellSize;
+                const float worldY = m_Params.originY + (static_cast<float>(y) - size * 0.5f) * m_Params.cellSize;
 
-            float h = noise.Sample(worldX * frequency, worldY * frequency); // [0, 1]
-            h = std::pow(std::clamp(h, 0.0f, 1.0f), m_Params.exponent);
+                float h = noise.Sample(worldX * frequency, worldY * frequency); // [0, 1]
+                h = std::pow(std::clamp(h, 0.0f, 1.0f), m_Params.exponent);
 
-            const float total = h * m_Params.heightMultiplier;
-            m_Bedrock[Index(x, y)] = total * 0.8f;
-            m_Sediment[Index(x, y)] = total * 0.2f;
+                const float total = h * m_Params.heightMultiplier;
+                m_Bedrock[Index(x, y)] = total * 0.8f;
+                m_Sediment[Index(x, y)] = total * 0.2f;
+            }
         }
+    };
+
+#if defined(__EMSCRIPTEN__)
+    generateRows(0, size);
+#else
+    // Rows are independent — deterministic regardless of the split.
+    const int bands = std::min(8, size);
+    std::vector<std::future<void>> jobs;
+    jobs.reserve(bands);
+    for (int b = 0; b < bands; ++b) {
+        const int yBegin = size * b / bands;
+        const int yEnd = size * (b + 1) / bands;
+        jobs.push_back(std::async(std::launch::async, generateRows, yBegin, yEnd));
     }
+    for (auto& j : jobs) j.get();
+#endif
 
     std::fill(m_Flow.begin(), m_Flow.end(), 0.0f);
 }
@@ -106,15 +131,35 @@ float TerrainEngine::SampleHeight(float x, float y) const {
            GetHeight(nx + 1, ny + 1) * u * v;
 }
 
-float TerrainEngine::SampleSediment(float x, float y) const {
+void TerrainEngine::SetPrecipitationMap(const float* data, int size) {
+    if (!data || size != m_Params.size) {
+        m_Precipitation.clear();
+        return;
+    }
+    m_Precipitation.assign(data, data + static_cast<size_t>(size) * size);
+}
+
+void TerrainEngine::ClearPrecipitationMap() {
+    m_Precipitation.clear();
+}
+
+float TerrainEngine::SamplePrecipitation(float x, float y) const {
+    if (m_Precipitation.empty()) return 1.0f;
+    const int size = m_Params.size;
     const int nx = static_cast<int>(std::floor(x));
     const int ny = static_cast<int>(std::floor(y));
     const float u = x - nx;
     const float v = y - ny;
-    return GetSediment(nx, ny) * (1 - u) * (1 - v) +
-           GetSediment(nx + 1, ny) * u * (1 - v) +
-           GetSediment(nx, ny + 1) * (1 - u) * v +
-           GetSediment(nx + 1, ny + 1) * u * v;
+
+    auto at = [&](int px, int py) -> float {
+        px = std::clamp(px, 0, size - 1);
+        py = std::clamp(py, 0, size - 1);
+        return m_Precipitation[py * size + px];
+    };
+    return at(nx, ny) * (1 - u) * (1 - v) +
+           at(nx + 1, ny) * u * (1 - v) +
+           at(nx, ny + 1) * (1 - u) * v +
+           at(nx + 1, ny + 1) * u * v;
 }
 
 void TerrainEngine::GradientAt(float x, float y, float& gx, float& gy) const {
@@ -132,76 +177,54 @@ void TerrainEngine::GradientAt(float x, float y, float& gx, float& gy) const {
     gy = (h01 - h00) * (1 - u) + (h11 - h10) * u;
 }
 
-void TerrainEngine::DepositSediment(float x, float y, float amount) {
-    const int nx = static_cast<int>(std::floor(x));
-    const int ny = static_cast<int>(std::floor(y));
-    const float u = x - nx;
-    const float v = y - ny;
+// ---------------------------------------------------------------------------
+// Shaping modifiers. Both scale bedrock and sediment proportionally so the
+// two-layer ratio is preserved.
+// ---------------------------------------------------------------------------
 
-    auto add = [this](int px, int py, float a) {
-        if (!InBounds(px, py)) return;
-        m_Sediment[Index(px, py)] += a;
-    };
-    add(nx, ny, amount * (1 - u) * (1 - v));
-    add(nx + 1, ny, amount * u * (1 - v));
-    add(nx, ny + 1, amount * (1 - u) * v);
-    add(nx + 1, ny + 1, amount * u * v);
-}
+void TerrainEngine::ApplyTerrace(float interval, float strength, float sharpness) {
+    if (interval <= 0.0f || strength <= 0.0f) return;
+    strength = std::clamp(strength, 0.0f, 1.0f);
+    sharpness = std::max(1.0f, sharpness);
+    const size_t count = m_Bedrock.size();
 
-namespace {
+    for (size_t i = 0; i < count; ++i) {
+        const float h = m_Bedrock[i] + m_Sediment[i];
+        if (h <= 0.0f) continue;
 
-// Shared brush kernel: distributes `amount` over a radius with linear
-// falloff, removing from `layer` and never below zero. Returns the amount
-// actually removed.
-float ApplyErodeBrush(std::vector<float>& layer, int size, float x, float y,
-                      float amount, float radius) {
-    // Hot path (millions of calls per erosion run): fixed-size stack buffer,
-    // radius clamped so the kernel always fits.
-    radius = std::min(radius, 15.0f);
-    const int centerX = static_cast<int>(std::floor(x));
-    const int centerY = static_cast<int>(std::floor(y));
-    const int r = static_cast<int>(radius);
+        const float t = h / interval;
+        const float level = std::floor(t);
+        float frac = t - level;
+        // Sharpened smoothstep: pushes the transition toward the step edge.
+        frac = std::pow(frac, sharpness);
+        frac = frac * frac * (3.0f - 2.0f * frac);
+        const float terraced = (level + frac) * interval;
 
-    struct Sample { int idx; float w; };
-    Sample samples[1024];
-    int count = 0;
-    float weightSum = 0.0f;
-
-    for (int j = -r; j <= r; ++j) {
-        for (int i = -r; i <= r; ++i) {
-            const int px = centerX + i;
-            const int py = centerY + j;
-            if (px < 0 || px >= size || py < 0 || py >= size) continue;
-            const float dx = static_cast<float>(px) - x;
-            const float dy = static_cast<float>(py) - y;
-            const float dist = std::sqrt(dx * dx + dy * dy);
-            if (dist >= radius) continue;
-            samples[count++] = {py * size + px, 1.0f - dist / radius};
-            weightSum += 1.0f - dist / radius;
-        }
+        const float target = h + (terraced - h) * strength;
+        const float ratio = target / h;
+        m_Bedrock[i] *= ratio;
+        m_Sediment[i] *= ratio;
     }
+}
 
-    if (weightSum <= 0.0f) return 0.0f;
+void TerrainEngine::ApplyPlateau(float plateauHeight, float softness) {
+    if (plateauHeight <= 0.0f) return;
+    softness = std::max(0.01f, softness);
+    const size_t count = m_Bedrock.size();
+    const float shoulder = plateauHeight - softness;
 
-    float removed = 0.0f;
-    for (int k = 0; k < count; ++k) {
-        const float want = amount * (samples[k].w / weightSum);
-        const float have = layer[samples[k].idx];
-        const float take = std::min(want, have);
-        layer[samples[k].idx] = have - take;
-        removed += take;
+    for (size_t i = 0; i < count; ++i) {
+        const float h = m_Bedrock[i] + m_Sediment[i];
+        if (h <= shoulder || h <= 0.0f) continue;
+
+        // Rounded shoulder: heights above (plateau - softness) compress
+        // asymptotically toward the plateau height.
+        const float over = h - shoulder;
+        const float target = shoulder + softness * std::tanh(over / softness);
+        const float ratio = target / h;
+        m_Bedrock[i] *= ratio;
+        m_Sediment[i] *= ratio;
     }
-    return removed;
-}
-
-} // namespace
-
-float TerrainEngine::ErodeSedimentBrush(float x, float y, float amount, float radius) {
-    return ApplyErodeBrush(m_Sediment, m_Params.size, x, y, amount, radius);
-}
-
-float TerrainEngine::ErodeBedrockBrush(float x, float y, float amount, float radius) {
-    return ApplyErodeBrush(m_Bedrock, m_Params.size, x, y, amount, radius);
 }
 
 void TerrainEngine::Carve(float x, float y, float radius, float depth) {
@@ -242,6 +265,10 @@ void TerrainEngine::BuildMesh() {
 
     const float c2 = 2.0f * m_Params.cellSize;
 
+    // Rock mask by slope *angle*: bare rock above ~40 deg, none below ~20 deg.
+    const float rockLo = 0.36f; // tan(20 deg)
+    const float rockHi = 0.84f; // tan(40 deg)
+
     for (int y = 0; y < size; ++y) {
         for (int x = 0; x < size; ++x) {
             const size_t i = static_cast<size_t>(Index(x, y));
@@ -253,7 +280,6 @@ void TerrainEngine::BuildMesh() {
             m_MeshPositions[i * 3 + 1] = h;
             m_MeshPositions[i * 3 + 2] = (static_cast<float>(y) - size * 0.5f) * m_Params.cellSize;
 
-            // Central-difference normal, cell-size aware.
             const float dhdx = (GetHeight(x + 1, y) - GetHeight(x - 1, y)) / c2;
             const float dhdy = (GetHeight(x, y + 1) - GetHeight(x, y - 1)) / c2;
             float nx = -dhdx, ny = 1.0f, nz = -dhdy;
@@ -265,14 +291,14 @@ void TerrainEngine::BuildMesh() {
             m_MeshUVs[i * 2 + 0] = static_cast<float>(x) / (size - 1);
             m_MeshUVs[i * 2 + 1] = static_cast<float>(y) / (size - 1);
 
-            // Splat data — R: rock (slope), G: normalized height,
+            // Splat data — R: rock (slope angle), G: normalized height,
             // B: flow/wetness, A: sediment depth.
             const float slope = std::sqrt(dhdx * dhdx + dhdy * dhdy);
-            m_MeshColors[i * 4 + 0] = std::clamp(slope * 2.5f, 0.0f, 1.0f);
+            m_MeshColors[i * 4 + 0] = std::clamp((slope - rockLo) / (rockHi - rockLo), 0.0f, 1.0f);
             m_MeshColors[i * 4 + 1] = m_Params.heightMultiplier > 0.0f
                 ? std::clamp(h / m_Params.heightMultiplier, 0.0f, 1.0f) : 0.0f;
             m_MeshColors[i * 4 + 2] = std::clamp(m_Flow[i] * 0.5f, 0.0f, 1.0f);
-            m_MeshColors[i * 4 + 3] = std::clamp(s / 5.0f, 0.0f, 1.0f);
+            m_MeshColors[i * 4 + 3] = std::clamp(s / 3.0f, 0.0f, 1.0f);
         }
     }
 
@@ -291,6 +317,18 @@ void TerrainEngine::BuildMesh() {
             m_MeshIndices[idx++] = i3;
         }
     }
+}
+
+void TerrainEngine::CollectHeightRange(float& minH, float& maxH) const {
+    minH = 1e30f;
+    maxH = -1e30f;
+    const size_t count = m_Bedrock.size();
+    for (size_t i = 0; i < count; ++i) {
+        const float h = m_Bedrock[i] + m_Sediment[i];
+        minH = std::min(minH, h);
+        maxH = std::max(maxH, h);
+    }
+    if (minH > maxH) { minH = 0.0f; maxH = 0.0f; }
 }
 
 } // namespace Titan

@@ -3,28 +3,142 @@
 
 #include <algorithm>
 #include <cmath>
+#include <vector>
+
+#if !defined(__EMSCRIPTEN__)
+#include <future>
+#endif
 
 namespace Titan {
 
 // ---------------------------------------------------------------------------
 // Hydraulic erosion — Lagrangian droplet model.
 //
-// Fully deterministic: droplet spawns come from a PCG32 stream derived from
-// the terrain seed, so the same seed + iteration count always produces the
-// identical terrain on every platform.
+// Parallel *and* deterministic. Every droplet's RNG derives from
+// (terrain seed, global droplet index), so spawn sequences don't depend on
+// thread scheduling or how iterations are split across calls. Droplets run
+// in fixed batches (kDropletBatch) grouped into rounds (kBatchesPerRound):
+// all batches in a round read the same terrain snapshot and write private
+// delta buffers, which merge in batch order at the end of the round. The
+// result is bit-identical on 1 thread, 8 threads, or WASM.
 // ---------------------------------------------------------------------------
-void TerrainEngine::ApplyHydraulicErosion(int iterations, const HydraulicParams& p) {
+
+namespace {
+
+// Removes up to `amount` from base+delta with a linear-falloff brush,
+// clamped so base+delta never goes negative. Returns the amount taken.
+float BrushTake(const std::vector<float>& base, std::vector<float>& delta,
+                int size, float x, float y, float amount, float radius) {
+    radius = std::min(radius, 15.0f);
+    const int centerX = static_cast<int>(std::floor(x));
+    const int centerY = static_cast<int>(std::floor(y));
+    const int r = static_cast<int>(radius);
+
+    struct Sample { int idx; float w; };
+    Sample samples[1024];
+    int count = 0;
+    float weightSum = 0.0f;
+
+    for (int j = -r; j <= r; ++j) {
+        for (int i = -r; i <= r; ++i) {
+            const int px = centerX + i;
+            const int py = centerY + j;
+            if (px < 0 || px >= size || py < 0 || py >= size) continue;
+            const float dx = static_cast<float>(px) - x;
+            const float dy = static_cast<float>(py) - y;
+            const float dist = std::sqrt(dx * dx + dy * dy);
+            if (dist >= radius) continue;
+            samples[count++] = {py * size + px, 1.0f - dist / radius};
+            weightSum += 1.0f - dist / radius;
+        }
+    }
+
+    if (weightSum <= 0.0f) return 0.0f;
+
+    float taken = 0.0f;
+    for (int k = 0; k < count; ++k) {
+        const float want = amount * (samples[k].w / weightSum);
+        const float have = std::max(0.0f, base[samples[k].idx] + delta[samples[k].idx]);
+        const float take = std::min(want, have);
+        delta[samples[k].idx] -= take;
+        taken += take;
+    }
+    return taken;
+}
+
+void DepositToDelta(std::vector<float>& delta, int size, float x, float y, float amount) {
+    const int nx = static_cast<int>(std::floor(x));
+    const int ny = static_cast<int>(std::floor(y));
+    const float u = x - nx;
+    const float v = y - ny;
+
+    auto add = [&](int px, int py, float a) {
+        if (px < 0 || px >= size || py < 0 || py >= size) return;
+        delta[py * size + px] += a;
+    };
+    add(nx, ny, amount * (1 - u) * (1 - v));
+    add(nx + 1, ny, amount * u * (1 - v));
+    add(nx, ny + 1, amount * (1 - u) * v);
+    add(nx + 1, ny + 1, amount * u * v);
+}
+
+float SampleWithDelta(const std::vector<float>& base, const std::vector<float>& delta,
+                      int size, float x, float y) {
+    const int nx = static_cast<int>(std::floor(x));
+    const int ny = static_cast<int>(std::floor(y));
+    const float u = x - nx;
+    const float v = y - ny;
+
+    auto at = [&](int px, int py) -> float {
+        px = std::clamp(px, 0, size - 1);
+        py = std::clamp(py, 0, size - 1);
+        const int i = py * size + px;
+        return std::max(0.0f, base[i] + delta[i]);
+    };
+    return at(nx, ny) * (1 - u) * (1 - v) +
+           at(nx + 1, ny) * u * (1 - v) +
+           at(nx, ny + 1) * (1 - u) * v +
+           at(nx + 1, ny + 1) * u * v;
+}
+
+} // namespace
+
+void TerrainEngine::RunDropletBatch(uint64_t firstDroplet, int count, const HydraulicParams& p,
+                                    std::vector<float>& sedimentDelta,
+                                    std::vector<float>& bedrockDelta,
+                                    std::vector<float>& flowDelta) const {
     const int size = m_Params.size;
-    if (size < 2) return;
-
-    uint64_t seedState = static_cast<uint64_t>(m_Params.seed) ^ 0x8BADF00D5EEDULL;
-    Pcg32 rng(SplitMix64(seedState), SplitMix64(seedState));
-
     const float maxCoord = static_cast<float>(size) - 1.001f;
+    const auto spawnMode = static_cast<SpawnMode>(p.spawnMode);
+    const bool usePrecip = spawnMode == SpawnMode::Precipitation && !m_Precipitation.empty();
 
-    for (int it = 0; it < iterations; ++it) {
+    for (int d = 0; d < count; ++d) {
+        // Per-droplet RNG stream: depends only on seed + global index.
+        uint64_t state = (static_cast<uint64_t>(m_Params.seed) << 20) ^ (firstDroplet + d);
+        Pcg32 rng(SplitMix64(state), SplitMix64(state));
+
         float posX = rng.NextFloat() * maxCoord;
         float posY = rng.NextFloat() * maxCoord;
+
+        // Weighted spawning via rejection sampling (bounded retries keep the
+        // per-droplet cost fixed).
+        if (spawnMode != SpawnMode::Uniform) {
+            for (int attempt = 0; attempt < 8; ++attempt) {
+                float weight;
+                if (usePrecip) {
+                    weight = std::clamp(SamplePrecipitation(posX, posY), 0.0f, 1.0f);
+                } else {
+                    const float h = SampleHeight(posX, posY);
+                    weight = m_Params.heightMultiplier > 0.0f
+                        ? std::clamp(h / m_Params.heightMultiplier, 0.05f, 1.0f)
+                        : 1.0f;
+                }
+                if (rng.NextFloat() <= weight) break;
+                posX = rng.NextFloat() * maxCoord;
+                posY = rng.NextFloat() * maxCoord;
+            }
+        }
+
         float dirX = 0.0f, dirY = 0.0f;
         float speed = 1.0f;
         float water = 1.0f;
@@ -37,8 +151,6 @@ void TerrainEngine::ApplyHydraulicErosion(int iterations, const HydraulicParams&
             float gx, gy;
             GradientAt(posX, posY, gx, gy);
 
-            // Momentum blend: inertia lets droplets carve through small
-            // ridges and form curved riverbeds instead of zigzagging.
             dirX = dirX * p.inertia - gx * (1.0f - p.inertia);
             dirY = dirY * p.inertia - gy * (1.0f - p.inertia);
 
@@ -63,38 +175,36 @@ void TerrainEngine::ApplyHydraulicErosion(int iterations, const HydraulicParams&
                                             p.minSedimentCapacity);
 
             if (sediment > capacity || deltaHeight > 0.0f) {
-                // Going uphill or over capacity: deposit.
                 const float amountToDeposit = (deltaHeight > 0.0f)
                     ? std::min(deltaHeight, sediment)
                     : (sediment - capacity) * p.depositSpeed;
                 sediment -= amountToDeposit;
-                DepositSediment(oldPosX, oldPosY, amountToDeposit);
+                DepositToDelta(sedimentDelta, size, oldPosX, oldPosY, amountToDeposit);
             } else {
-                // Erode, but never more than the height difference (prevents
-                // digging pits below the downstream level).
                 const float amountToErode = std::min((capacity - sediment) * p.dissolveSpeed,
                                                      -deltaHeight);
-                const float sedimentHere = SampleSediment(oldPosX, oldPosY);
+                const float sedimentHere = SampleWithDelta(m_Sediment, sedimentDelta,
+                                                           size, oldPosX, oldPosY);
 
                 if (sedimentHere >= amountToErode) {
-                    // Loose sediment covers the demand.
-                    sediment += ErodeSedimentBrush(oldPosX, oldPosY, amountToErode, p.erosionRadius);
+                    sediment += BrushTake(m_Sediment, sedimentDelta, size,
+                                          oldPosX, oldPosY, amountToErode, p.erosionRadius);
                 } else {
-                    // Take all loose sediment, then chew bedrock slowly,
-                    // scaled by the local strata hardness.
                     const float hardness = HardnessAt(oldHeight);
                     const float bedrockDemand = (amountToErode - sedimentHere)
                         * (p.bedrockErosionSpeed / hardness);
-                    sediment += ErodeSedimentBrush(oldPosX, oldPosY, sedimentHere, p.erosionRadius);
-                    sediment += ErodeBedrockBrush(oldPosX, oldPosY, bedrockDemand, p.erosionRadius);
+                    sediment += BrushTake(m_Sediment, sedimentDelta, size,
+                                          oldPosX, oldPosY, sedimentHere, p.erosionRadius);
+                    sediment += BrushTake(m_Bedrock, bedrockDelta, size,
+                                          oldPosX, oldPosY, bedrockDemand, p.erosionRadius);
                 }
             }
 
             speed = std::sqrt(std::max(0.0f, speed * speed + deltaHeight * p.gravity));
             water *= (1.0f - p.evaporateSpeed);
 
-            if (InBounds(nodeX, nodeY)) {
-                m_Flow[Index(nodeX, nodeY)] += water * 0.1f;
+            if (nodeX >= 0 && nodeX < size && nodeY >= 0 && nodeY < size) {
+                flowDelta[nodeY * size + nodeX] += water * 0.1f;
             }
 
             if (speed == 0.0f) break;
@@ -102,20 +212,81 @@ void TerrainEngine::ApplyHydraulicErosion(int iterations, const HydraulicParams&
     }
 }
 
+void TerrainEngine::ApplyHydraulicErosion(int iterations, const HydraulicParams& p) {
+    const int size = m_Params.size;
+    if (size < 2 || iterations <= 0) return;
+    const size_t cellCount = static_cast<size_t>(size) * size;
+
+    // Round up to whole batches — part of the determinism contract.
+    const int batchCount = (iterations + kDropletBatch - 1) / kDropletBatch;
+
+    // Per-batch delta buffers for one round.
+    struct BatchDeltas {
+        std::vector<float> sediment, bedrock, flow;
+    };
+    std::vector<BatchDeltas> deltas(kBatchesPerRound);
+    for (auto& b : deltas) {
+        b.sediment.assign(cellCount, 0.0f);
+        b.bedrock.assign(cellCount, 0.0f);
+        b.flow.assign(cellCount, 0.0f);
+    }
+
+    int processed = 0;
+    while (processed < batchCount) {
+        const int inRound = std::min(kBatchesPerRound, batchCount - processed);
+
+        auto runBatch = [&](int b) {
+            auto& d = deltas[b];
+            std::fill(d.sediment.begin(), d.sediment.end(), 0.0f);
+            std::fill(d.bedrock.begin(), d.bedrock.end(), 0.0f);
+            std::fill(d.flow.begin(), d.flow.end(), 0.0f);
+            const uint64_t first = m_DropletCursor
+                + static_cast<uint64_t>(processed + b) * kDropletBatch;
+            RunDropletBatch(first, kDropletBatch, p, d.sediment, d.bedrock, d.flow);
+        };
+
+#if defined(__EMSCRIPTEN__)
+        for (int b = 0; b < inRound; ++b) runBatch(b);
+#else
+        {
+            std::vector<std::future<void>> jobs;
+            jobs.reserve(inRound);
+            for (int b = 0; b < inRound; ++b) {
+                jobs.push_back(std::async(std::launch::async, runBatch, b));
+            }
+            for (auto& j : jobs) j.get();
+        }
+#endif
+
+        // Merge in fixed batch order; clamp layers at zero (two batches can
+        // both take from the same cell against the shared snapshot).
+        for (int b = 0; b < inRound; ++b) {
+            const auto& d = deltas[b];
+            for (size_t i = 0; i < cellCount; ++i) {
+                m_Sediment[i] = std::max(0.0f, m_Sediment[i] + d.sediment[i]);
+                m_Bedrock[i] = std::max(0.0f, m_Bedrock[i] + d.bedrock[i]);
+                m_Flow[i] += d.flow[i];
+            }
+        }
+
+        processed += inRound;
+    }
+
+    m_DropletCursor += static_cast<uint64_t>(batchCount) * kDropletBatch;
+}
+
 // ---------------------------------------------------------------------------
 // Thermal weathering — angle-of-repose talus creep.
 //
 // Double-buffered (Jacobi) update: all moves are computed against the
 // start-of-pass state and accumulated into delta buffers, then applied in one
-// sweep. This removes the scan-order directional bias of in-place updates,
-// and conserves mass exactly by construction (every subtraction has matching
-// additions distributed across neighbours).
+// sweep. This removes scan-order bias and conserves mass exactly by
+// construction.
 // ---------------------------------------------------------------------------
 void TerrainEngine::ApplyThermalWeathering(int passes, const ThermalParams& p) {
     const int size = m_Params.size;
     const size_t count = static_cast<size_t>(size) * size;
 
-    // Talus threshold as a height difference: tan(angle) * horizontal distance.
     const float pi = 3.14159265358979323846f;
     const float talusCardinal = std::tan(p.talusAngleDeg * pi / 180.0f) * m_Params.cellSize;
 
@@ -135,7 +306,6 @@ void TerrainEngine::ApplyThermalWeathering(int passes, const ThermalParams& p) {
                 const int i = Index(x, y);
                 const float h = m_Bedrock[i] + m_Sediment[i];
 
-                // Collect neighbours below the angle of repose.
                 float excess[8];
                 int nIdx[8];
                 int nCount = 0;
@@ -162,15 +332,11 @@ void TerrainEngine::ApplyThermalWeathering(int passes, const ThermalParams& p) {
 
                 if (nCount == 0) continue;
 
-                // Move at most half the steepest excess per pass — moving the
-                // full difference overshoots and oscillates.
                 float toMove = p.rate * 0.5f * maxExcess;
 
-                // Thermal creep moves loose sediment. If there isn't enough,
-                // fracture bedrock into sediment (in place — conserves mass)
-                // at a slower rate, then move what's available. Availability
-                // is judged on start-of-pass state only, so results are
-                // independent of scan order.
+                // Availability is judged on start-of-pass state only, so
+                // results are independent of scan order. Bedrock fractures
+                // into sediment in place (conserves mass), then moves.
                 float available = m_Sediment[i];
                 if (available < toMove) {
                     const float breakdown = std::min((toMove - available) * p.bedrockBreakdownRate,

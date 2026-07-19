@@ -187,6 +187,97 @@ void TestErosionEffectiveness() {
     Check(maxFlow > 0.5f, "fluvial pass produces strong flow channels");
 }
 
+void TestChunkedErosionEquivalence() {
+    std::printf("Chunked erosion equivalence:\n");
+    // One 49152-droplet call vs three 16384-droplet calls (whole rounds)
+    // must be bit-identical — this is what lets the UI stream progress.
+    Titan::TerrainEngine a, b;
+    a.Initialize(MakeParams(31337, 1));
+    a.GenerateHeightmap();
+    b.Initialize(MakeParams(31337, 1));
+    b.GenerateHeightmap();
+
+    a.ApplyHydraulicErosion(Titan::kDropletsPerRound * 3);
+    for (int i = 0; i < 3; ++i) b.ApplyHydraulicErosion(Titan::kDropletsPerRound);
+
+    Check(MapsIdentical(a, b), "3 chunked calls == 1 large call (bit-identical)");
+}
+
+void TestSpawnModes() {
+    std::printf("Spawn modes:\n");
+    Titan::TerrainEngine u, alt;
+    u.Initialize(MakeParams(808, 1));
+    u.GenerateHeightmap();
+    alt.Initialize(MakeParams(808, 1));
+    alt.GenerateHeightmap();
+
+    Titan::HydraulicParams pu;
+    pu.spawnMode = 0;
+    Titan::HydraulicParams pa;
+    pa.spawnMode = 1;
+    u.ApplyHydraulicErosion(20000, pu);
+    alt.ApplyHydraulicErosion(20000, pa);
+
+    Check(MeanAbsDifference(u, alt) > 1e-4, "altitude-weighted spawning changes the outcome");
+    Check(AllFinite(alt.BedrockMap()) && AllFinite(alt.SedimentMap()),
+          "altitude-weighted erosion stays finite");
+}
+
+void TestModifiers() {
+    std::printf("Shaping modifiers:\n");
+    Titan::TerrainEngine e;
+    e.Initialize(MakeParams(99, 1));
+    e.GenerateHeightmap();
+
+    float maxBefore = 0.0f;
+    for (size_t i = 0; i < e.BedrockMap().size(); ++i) {
+        maxBefore = std::max(maxBefore, e.BedrockMap()[i] + e.SedimentMap()[i]);
+    }
+
+    e.ApplyPlateau(maxBefore * 0.6f, 2.0f);
+    float maxAfter = 0.0f;
+    for (size_t i = 0; i < e.BedrockMap().size(); ++i) {
+        maxAfter = std::max(maxAfter, e.BedrockMap()[i] + e.SedimentMap()[i]);
+    }
+    Check(maxAfter <= maxBefore * 0.6f + 1e-3f, "plateau caps peaks at the target height");
+
+    Titan::TerrainEngine t, ref;
+    t.Initialize(MakeParams(99, 1));
+    t.GenerateHeightmap();
+    ref.Initialize(MakeParams(99, 1));
+    ref.GenerateHeightmap();
+    t.ApplyTerrace(8.0f, 1.0f, 2.0f);
+    Check(MeanAbsDifference(t, ref) > 1e-3, "terrace visibly reshapes the terrain");
+    Check(AllFinite(t.BedrockMap()) && AllFinite(t.SedimentMap()), "terrace stays finite");
+}
+
+void TestExporters() {
+    std::printf("Exporters:\n");
+    Titan::TerrainEngine e;
+    e.Initialize(MakeParams(7, 1, 64));
+    e.GenerateHeightmap();
+
+    const size_t pngSize = e.ExportPNG16();
+    const uint8_t* d = e.ExportData();
+    Check(pngSize > 8 && d[0] == 137 && d[1] == 'P' && d[2] == 'N' && d[3] == 'G',
+          "PNG16 has a valid signature");
+
+    const size_t r16 = e.ExportR16();
+    Check(r16 == 64u * 64u * 2u, "R16 is exactly 2 bytes per cell");
+
+    const size_t r32 = e.ExportR32();
+    Check(r32 == 64u * 64u * 4u, "R32 is exactly 4 bytes per cell");
+
+    const size_t exr = e.ExportEXR();
+    const uint8_t* x = e.ExportData();
+    Check(exr > 8 && x[0] == 0x76 && x[1] == 0x2f && x[2] == 0x31 && x[3] == 0x01,
+          "EXR has a valid magic number");
+
+    const size_t obj = e.ExportOBJ();
+    const char* o = reinterpret_cast<const char*>(e.ExportData());
+    Check(obj > 2 && o[0] == '#', "OBJ starts with header comment");
+}
+
 void TestChunkSeams() {
     std::printf("Chunk seamlessness (world-space noise):\n");
     // Tile A centered at origin; tile B shifted exactly one tile east.
@@ -228,6 +319,10 @@ int main() {
     TestThermalMassConservation();
     TestNumericalHealth();
     TestErosionEffectiveness();
+    TestChunkedErosionEquivalence();
+    TestSpawnModes();
+    TestModifiers();
+    TestExporters();
     TestChunkSeams();
 
     std::printf("\n%s (%d failure%s)\n",

@@ -71,8 +71,13 @@ export class TitanCore {
     this.module._titan_generate(this.handle);
   }
 
-  erodeHydraulic(iterations: number): void {
-    this.module._titan_erode_hydraulic(this.handle, iterations);
+  // spawnMode: 0 uniform, 1 altitude-weighted, 2 precipitation map.
+  // Chunk calls in multiples of DROPLETS_PER_ROUND for bit-identical results
+  // to a single large call.
+  static readonly DROPLETS_PER_ROUND = 16384;
+
+  erodeHydraulic(iterations: number, spawnMode = 0): void {
+    this.module._titan_erode_hydraulic(this.handle, iterations, spawnMode);
   }
 
   erodeThermal(passes: number, talusAngleDeg = 33, rate = 0.5): void {
@@ -81,6 +86,29 @@ export class TitanCore {
 
   erodeFluvial(iterations: number, strength = 1.0): void {
     this.module._titan_erode_fluvial(this.handle, iterations, strength);
+  }
+
+  applyTerrace(interval: number, strength: number, sharpness = 2.0): void {
+    this.module._titan_apply_terrace(this.handle, interval, strength, sharpness);
+  }
+
+  applyPlateau(height: number, softness: number): void {
+    this.module._titan_apply_plateau(this.handle, height, softness);
+  }
+
+  // Export via the C++ exporters; returns a copy safe to hand to Blob.
+  exportFile(kind: 'png16' | 'r16' | 'r32' | 'exr' | 'obj'): Uint8Array {
+    const m = this.module;
+    const fn = {
+      png16: m._titan_export_png16,
+      r16: m._titan_export_r16,
+      r32: m._titan_export_r32,
+      exr: m._titan_export_exr,
+      obj: m._titan_export_obj,
+    }[kind];
+    const size = fn(this.handle) as number;
+    const ptr = m._titan_export_data_ptr(this.handle) as number;
+    return new Uint8Array(m.HEAPU8.buffer, ptr, size).slice();
   }
 
   carve(x: number, y: number, radius: number, depth: number): void {

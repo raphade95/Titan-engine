@@ -18,7 +18,11 @@ TITAN_API void titan_destroy(TitanHandle* handle) {
 }
 
 TITAN_API const char* titan_version(void) {
-    return "libTitanCore 0.2.0";
+    return "libTitanCore 0.3.0";
+}
+
+TITAN_API int titan_api_version(void) {
+    return TITAN_C_API_VERSION;
 }
 
 TITAN_API void titan_configure(TitanHandle* handle,
@@ -60,8 +64,52 @@ TITAN_API void titan_generate(TitanHandle* handle) {
     Engine(handle)->GenerateHeightmap();
 }
 
-TITAN_API void titan_erode_hydraulic(TitanHandle* handle, int iterations) {
-    Engine(handle)->ApplyHydraulicErosion(iterations);
+TITAN_API void titan_erode_hydraulic(TitanHandle* handle, int iterations, int spawnMode) {
+    Titan::HydraulicParams p;
+    p.spawnMode = spawnMode;
+    Engine(handle)->ApplyHydraulicErosion(iterations, p);
+}
+
+TITAN_API void titan_apply_terrace(TitanHandle* handle, float interval,
+                                   float strength, float sharpness) {
+    Engine(handle)->ApplyTerrace(interval, strength, sharpness);
+}
+
+TITAN_API void titan_apply_plateau(TitanHandle* handle, float plateauHeight,
+                                   float softness) {
+    Engine(handle)->ApplyPlateau(plateauHeight, softness);
+}
+
+TITAN_API void titan_set_precipitation(TitanHandle* handle, const float* data, int size) {
+    if (data) {
+        Engine(handle)->SetPrecipitationMap(data, size);
+    } else {
+        Engine(handle)->ClearPrecipitationMap();
+    }
+}
+
+TITAN_API int titan_export_png16(TitanHandle* handle) {
+    return static_cast<int>(Engine(handle)->ExportPNG16());
+}
+
+TITAN_API int titan_export_r16(TitanHandle* handle) {
+    return static_cast<int>(Engine(handle)->ExportR16());
+}
+
+TITAN_API int titan_export_r32(TitanHandle* handle) {
+    return static_cast<int>(Engine(handle)->ExportR32());
+}
+
+TITAN_API int titan_export_exr(TitanHandle* handle) {
+    return static_cast<int>(Engine(handle)->ExportEXR());
+}
+
+TITAN_API int titan_export_obj(TitanHandle* handle) {
+    return static_cast<int>(Engine(handle)->ExportOBJ());
+}
+
+TITAN_API const uint8_t* titan_export_data_ptr(TitanHandle* handle) {
+    return Engine(handle)->ExportData();
 }
 
 TITAN_API void titan_erode_thermal(TitanHandle* handle, int passes,

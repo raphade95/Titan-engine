@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  core:
+    name: libTitanCore (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+        working-directory: titan-terrain-engine/cpp
+
+      - name: Build
+        run: cmake --build build --config Release
+        working-directory: titan-terrain-engine/cpp
+
+      - name: Run tests (Unix)
+        if: runner.os != 'Windows'
+        run: ./build/titan_tests
+        working-directory: titan-terrain-engine/cpp
+
+      - name: Run tests (Windows)
+        if: runner.os == 'Windows'
+        run: .\build\Release\titan_tests.exe
+        working-directory: titan-terrain-engine/cpp
+
+  web:
+    name: Web lab typecheck + build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci
+        working-directory: titan-terrain-engine
+      - run: npm run lint
+        working-directory: titan-terrain-engine
+      - run: npm run build
+        working-directory: titan-terrain-engine

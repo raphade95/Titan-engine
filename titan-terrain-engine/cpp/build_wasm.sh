@@ -15,6 +15,7 @@ emcc -O3 -std=c++20 -fno-fast-math \
   libTitanCore/src/TerrainEngine.cpp \
   libTitanCore/src/Erosion.cpp \
   libTitanCore/src/Fluvial.cpp \
+  libTitanCore/src/Export.cpp \
   libTitanCore/src/CAPI.cpp \
   -sMODULARIZE=1 \
   -sEXPORT_ES6=1 \
@@ -23,7 +24,7 @@ emcc -O3 -std=c++20 -fno-fast-math \
   -sALLOW_MEMORY_GROWTH=1 \
   -sSINGLE_FILE=1 \
   -sFILESYSTEM=0 \
-  -sEXPORTED_RUNTIME_METHODS=HEAPF32,HEAPU32,UTF8ToString \
+  -sEXPORTED_RUNTIME_METHODS=HEAPF32,HEAPU32,HEAPU8,UTF8ToString \
   -o "$OUT_DIR/titan_core.js"
 
 echo "OK: $OUT_DIR/titan_core.js"
