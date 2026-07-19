@@ -1,0 +1,6 @@
+{
+  "name": "Titan Terrain Engine",
+  "description": "A high-performance procedural terrain engine featuring hydraulic erosion, thermal weathering, and real-time 3D rendering.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}
