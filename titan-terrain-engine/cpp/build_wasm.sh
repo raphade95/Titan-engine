@@ -15,6 +15,7 @@ emcc -O3 -std=c++20 -fno-fast-math \
   libTitanCore/src/TerrainEngine.cpp \
   libTitanCore/src/Erosion.cpp \
   libTitanCore/src/Fluvial.cpp \
+  libTitanCore/src/Layers.cpp \
   libTitanCore/src/Export.cpp \
   libTitanCore/src/CAPI.cpp \
   -sMODULARIZE=1 \

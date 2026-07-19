@@ -89,7 +89,67 @@ FractalNoise::FractalNoise(uint64_t seed, const FractalParams& params)
     : m_Base(seed),
       m_WarpX(seed ^ 0xA5D39EAB4C1F8E37ull),
       m_WarpY(seed ^ 0x3C6EF372FE94F82Aull),
-      m_Params(params) {}
+      m_Params(params),
+      m_CellSeed(seed ^ 0x94D049BB133111EBull) {}
+
+namespace {
+
+// Deterministic per-cell feature point for cellular noise.
+inline void CellPoint(uint64_t seed, int cx, int cy, float& px, float& py) {
+    uint64_t h = seed;
+    h ^= static_cast<uint64_t>(static_cast<uint32_t>(cx)) * 0x9E3779B97F4A7C15ull;
+    h ^= static_cast<uint64_t>(static_cast<uint32_t>(cy)) * 0xC2B2AE3D27D4EB4Full;
+    h ^= h >> 29;
+    h *= 0xBF58476D1CE4E5B9ull;
+    h ^= h >> 32;
+    px = static_cast<float>(cx) + static_cast<float>(h & 0xFFFFu) / 65535.0f;
+    py = static_cast<float>(cy) + static_cast<float>((h >> 16) & 0xFFFFu) / 65535.0f;
+}
+
+// Single-octave cellular distances F1 <= F2 (euclidean).
+inline void Cellular(uint64_t seed, float x, float y, float& f1, float& f2) {
+    const int ix = static_cast<int>(std::floor(x));
+    const int iy = static_cast<int>(std::floor(y));
+    f1 = 1e9f;
+    f2 = 1e9f;
+    for (int j = -1; j <= 1; ++j) {
+        for (int i = -1; i <= 1; ++i) {
+            float px, py;
+            CellPoint(seed, ix + i, iy + j, px, py);
+            const float dx = px - x;
+            const float dy = py - y;
+            const float d = std::sqrt(dx * dx + dy * dy);
+            if (d < f1) {
+                f2 = f1;
+                f1 = d;
+            } else if (d < f2) {
+                f2 = d;
+            }
+        }
+    }
+}
+
+} // namespace
+
+float FractalNoise::SampleVoronoi(float x, float y, bool ridge) const {
+    float amplitude = 1.0f;
+    float frequency = 1.0f;
+    float sum = 0.0f;
+    float norm = 0.0f;
+    for (int o = 0; o < m_Params.octaves; ++o) {
+        float f1, f2;
+        Cellular(m_CellSeed + static_cast<uint64_t>(o) * 0x632BE59BD9B4E019ull,
+                 x * frequency, y * frequency, f1, f2);
+        // F1 in ~[0, 1.2]: cells rise toward centers. F2-F1: ridged walls.
+        const float v = ridge ? std::clamp((f2 - f1), 0.0f, 1.0f)
+                              : std::clamp(1.0f - f1, 0.0f, 1.0f);
+        sum += v * amplitude;
+        norm += amplitude;
+        amplitude *= m_Params.persistence;
+        frequency *= m_Params.lacunarity;
+    }
+    return norm > 0.0f ? std::clamp(sum / norm, 0.0f, 1.0f) : 0.0f;
+}
 
 float FractalNoise::Fbm(const SimplexNoise& noise, float x, float y, int octaves) const {
     float amplitude = 1.0f;
@@ -167,10 +227,12 @@ float FractalNoise::Sample(float x, float y) const {
     }
 
     switch (m_Params.type) {
-        case NoiseType::Ridged:   return SampleRidged(x, y);
-        case NoiseType::Billow:   return SampleBillow(x, y);
+        case NoiseType::Ridged:       return SampleRidged(x, y);
+        case NoiseType::Billow:       return SampleBillow(x, y);
+        case NoiseType::Voronoi:      return SampleVoronoi(x, y, false);
+        case NoiseType::VoronoiRidge: return SampleVoronoi(x, y, true);
         case NoiseType::Standard:
-        default:                  return SampleStandard(x, y);
+        default:                      return SampleStandard(x, y);
     }
 }
 

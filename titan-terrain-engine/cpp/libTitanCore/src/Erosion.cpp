@@ -174,15 +174,18 @@ void TerrainEngine::RunDropletBatch(uint64_t firstDroplet, int count, const Hydr
             const float capacity = std::max(-deltaHeight * speed * water * p.sedimentCapacityFactor,
                                             p.minSedimentCapacity);
 
+            const float maskHere = SampleMask(oldPosX, oldPosY);
+
             if (sediment > capacity || deltaHeight > 0.0f) {
-                const float amountToDeposit = (deltaHeight > 0.0f)
+                float amountToDeposit = (deltaHeight > 0.0f)
                     ? std::min(deltaHeight, sediment)
                     : (sediment - capacity) * p.depositSpeed;
+                amountToDeposit *= maskHere;
                 sediment -= amountToDeposit;
                 DepositToDelta(sedimentDelta, size, oldPosX, oldPosY, amountToDeposit);
             } else {
-                const float amountToErode = std::min((capacity - sediment) * p.dissolveSpeed,
-                                                     -deltaHeight);
+                const float amountToErode = maskHere
+                    * std::min((capacity - sediment) * p.dissolveSpeed, -deltaHeight);
                 const float sedimentHere = SampleWithDelta(m_Sediment, sedimentDelta,
                                                            size, oldPosX, oldPosY);
 
@@ -332,7 +335,7 @@ void TerrainEngine::ApplyThermalWeathering(int passes, const ThermalParams& p) {
 
                 if (nCount == 0) continue;
 
-                float toMove = p.rate * 0.5f * maxExcess;
+                float toMove = p.rate * 0.5f * maxExcess * MaskAt(i);
 
                 // Availability is judged on start-of-pass state only, so
                 // results are independent of scan order. Bedrock fractures

@@ -131,6 +131,152 @@ TITAN_API void titan_carve(TitanHandle* handle, float x, float y,
     Engine(handle)->Carve(x, y, radius, depth);
 }
 
+TITAN_API void titan_set_mask(TitanHandle* handle, const float* data, int size) {
+    if (data) {
+        Engine(handle)->SetMask(data, size);
+    } else {
+        Engine(handle)->ClearMask();
+    }
+}
+
+TITAN_API void titan_clear_terrain(TitanHandle* handle) {
+    Engine(handle)->ClearTerrain();
+}
+
+TITAN_API void titan_apply_noise(TitanHandle* handle,
+                                 unsigned int seedOffset,
+                                 int noiseType,
+                                 float scale,
+                                 float amplitude,
+                                 int octaves,
+                                 float persistence,
+                                 float lacunarity,
+                                 float exponent,
+                                 float warpStrength,
+                                 int blendMode,
+                                 float blendAlpha) {
+    Titan::NoiseLayerParams p;
+    p.seedOffset = seedOffset;
+    p.noiseType = noiseType;
+    p.scale = scale;
+    p.amplitude = amplitude;
+    p.octaves = octaves;
+    p.persistence = persistence;
+    p.lacunarity = lacunarity;
+    p.exponent = exponent;
+    p.warpStrength = warpStrength;
+    p.blendMode = blendMode;
+    p.blendAlpha = blendAlpha;
+    Engine(handle)->ApplyNoise(p);
+}
+
+TITAN_API void titan_apply_stamp(TitanHandle* handle, int shape,
+                                 float centerX, float centerY,
+                                 float sizeX, float sizeY,
+                                 float rotationDeg, float height,
+                                 float falloff, int op) {
+    Titan::StampParams p;
+    p.shape = shape;
+    p.centerX = centerX;
+    p.centerY = centerY;
+    p.sizeX = sizeX;
+    p.sizeY = sizeY;
+    p.rotationDeg = rotationDeg;
+    p.height = height;
+    p.falloff = falloff;
+    p.op = op;
+    Engine(handle)->ApplyStamp(p);
+}
+
+TITAN_API void titan_stamp_to_mask(TitanHandle* handle, int shape,
+                                   float centerX, float centerY,
+                                   float sizeX, float sizeY,
+                                   float rotationDeg, float falloff) {
+    Titan::StampParams p;
+    p.shape = shape;
+    p.centerX = centerX;
+    p.centerY = centerY;
+    p.sizeX = sizeX;
+    p.sizeY = sizeY;
+    p.rotationDeg = rotationDeg;
+    p.falloff = falloff;
+    Engine(handle)->StampToScratch(p);
+}
+
+TITAN_API float* titan_scratch_ptr(TitanHandle* handle) {
+    return const_cast<float*>(Engine(handle)->ScratchMask().data());
+}
+
+TITAN_API void titan_apply_snow(TitanHandle* handle, float snowLine,
+                                float amount, float maxSlopeDeg,
+                                int settlePasses, float melt) {
+    Titan::SnowParams p;
+    p.snowLine = snowLine;
+    p.amount = amount;
+    p.maxSlopeDeg = maxSlopeDeg;
+    p.settlePasses = settlePasses;
+    p.melt = melt;
+    Engine(handle)->ApplySnow(p);
+}
+
+TITAN_API void titan_compute_water(TitanHandle* handle) {
+    Engine(handle)->ComputeWater();
+}
+
+TITAN_API float* titan_snow_ptr(TitanHandle* handle) {
+    return Engine(handle)->SnowMap().data();
+}
+
+TITAN_API float* titan_water_ptr(TitanHandle* handle) {
+    return Engine(handle)->WaterMap().data();
+}
+
+TITAN_API void titan_erode_hydraulic_ex(TitanHandle* handle, int iterations,
+                                        int spawnMode, float inertia,
+                                        float capacity, float minCapacity,
+                                        float dissolve, float deposit,
+                                        float evaporate, float gravity,
+                                        int lifetime, float radius,
+                                        float bedrockSpeed) {
+    Titan::HydraulicParams p;
+    p.spawnMode = spawnMode;
+    p.inertia = inertia;
+    p.sedimentCapacityFactor = capacity;
+    p.minSedimentCapacity = minCapacity;
+    p.dissolveSpeed = dissolve;
+    p.depositSpeed = deposit;
+    p.evaporateSpeed = evaporate;
+    p.gravity = gravity;
+    p.maxDropletLifetime = lifetime;
+    p.erosionRadius = radius;
+    p.bedrockErosionSpeed = bedrockSpeed;
+    Engine(handle)->ApplyHydraulicErosion(iterations, p);
+}
+
+TITAN_API void titan_erode_thermal_ex(TitanHandle* handle, int passes,
+                                      float talusAngleDeg, float rate,
+                                      float bedrockBreakdownRate) {
+    Titan::ThermalParams p;
+    p.talusAngleDeg = talusAngleDeg;
+    p.rate = rate;
+    p.bedrockBreakdownRate = bedrockBreakdownRate;
+    Engine(handle)->ApplyThermalWeathering(passes, p);
+}
+
+TITAN_API void titan_erode_fluvial_ex(TitanHandle* handle, int iterations,
+                                      float strength, float erodeConstant,
+                                      float areaExponent, float slopeExponent,
+                                      float depositRatio, float maxStep) {
+    Titan::FluvialParams p;
+    p.strength = strength;
+    p.erodeConstant = erodeConstant;
+    p.areaExponent = areaExponent;
+    p.slopeExponent = slopeExponent;
+    p.depositRatio = depositRatio;
+    p.maxStep = maxStep;
+    Engine(handle)->ApplyFluvialErosion(iterations, p);
+}
+
 TITAN_API int titan_size(TitanHandle* handle) {
     return Engine(handle)->Size();
 }
@@ -189,6 +335,10 @@ TITAN_API float* titan_mesh_colors_ptr(TitanHandle* handle) {
 
 TITAN_API float* titan_mesh_uvs_ptr(TitanHandle* handle) {
     return const_cast<float*>(Engine(handle)->MeshUVs().data());
+}
+
+TITAN_API float* titan_mesh_snow_ptr(TitanHandle* handle) {
+    return const_cast<float*>(Engine(handle)->MeshSnow().data());
 }
 
 TITAN_API uint32_t* titan_mesh_indices_ptr(TitanHandle* handle) {

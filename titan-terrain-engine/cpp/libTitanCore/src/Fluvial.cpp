@@ -142,7 +142,7 @@ void TerrainEngine::ApplyFluvialErosion(int iterations, const FluvialParams& p) 
                 ? std::sqrt(area[i]) : std::pow(area[i], p.areaExponent);
             const float slopeTerm = (p.slopeExponent == 1.0f)
                 ? slope : std::pow(slope, p.slopeExponent);
-            float erode = p.strength * p.erodeConstant * areaTerm * slopeTerm;
+            float erode = p.strength * p.erodeConstant * areaTerm * slopeTerm * MaskAt(i);
 
             // Never invert the local gradient, never exceed the step cap.
             erode = std::min(erode, drop * 0.8f);

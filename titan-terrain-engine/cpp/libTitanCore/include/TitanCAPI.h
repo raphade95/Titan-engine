@@ -69,6 +69,74 @@ TITAN_API void titan_apply_plateau(TitanHandle* handle, float plateauHeight,
 // Precipitation map for spawnMode 2 (size*size floats, copied; NULL clears).
 TITAN_API void titan_set_precipitation(TitanHandle* handle, const float* data, int size);
 
+// --- v0.4: masks, noise stacking, stamps, snow, water --------------------
+
+// Active mask (0..1 per cell, copied; NULL clears). Multiplies the effect
+// of every subsequent layer operation until changed.
+TITAN_API void titan_set_mask(TitanHandle* handle, const float* data, int size);
+
+// Reset height/flow/snow/water to a flat empty state (stack rebuild start).
+TITAN_API void titan_clear_terrain(TitanHandle* handle);
+
+// Adds a noise field with a blend mode. noiseType: 0 none, 1 simplex fBm,
+// 2 ridged, 3 billow, 4 voronoi cells, 5 voronoi ridges. blendMode: 0 add,
+// 1 subtract, 2 multiply, 3 max, 4 min, 5 mix (by blendAlpha).
+TITAN_API void titan_apply_noise(TitanHandle* handle,
+                                 unsigned int seedOffset,
+                                 int noiseType,
+                                 float scale,
+                                 float amplitude,
+                                 int octaves,
+                                 float persistence,
+                                 float lacunarity,
+                                 float exponent,
+                                 float warpStrength,
+                                 int blendMode,
+                                 float blendAlpha);
+
+// Primitive stamp. shape: 0 dome, 1 rectangle, 2 ridge, 3 crater.
+// op: 0 raise, 1 lower, 2 flatten, 3 union. Center/size in cells.
+TITAN_API void titan_apply_stamp(TitanHandle* handle, int shape,
+                                 float centerX, float centerY,
+                                 float sizeX, float sizeY,
+                                 float rotationDeg, float height,
+                                 float falloff, int op);
+
+// Rasterize a stamp's 0..1 field into the scratch buffer (no terrain edit);
+// read it via titan_scratch_ptr. Used to build shape masks.
+TITAN_API void titan_stamp_to_mask(TitanHandle* handle, int shape,
+                                   float centerX, float centerY,
+                                   float sizeX, float sizeY,
+                                   float rotationDeg, float falloff);
+TITAN_API float* titan_scratch_ptr(TitanHandle* handle);
+
+// Snow accumulation + settle + melt into the snow field.
+TITAN_API void titan_apply_snow(TitanHandle* handle, float snowLine,
+                                float amount, float maxSlopeDeg,
+                                int settlePasses, float melt);
+
+// Priority-flood lake fill; depths into the water field.
+TITAN_API void titan_compute_water(TitanHandle* handle);
+
+TITAN_API float* titan_snow_ptr(TitanHandle* handle);
+TITAN_API float* titan_water_ptr(TitanHandle* handle);
+
+// Full-parameter erosion variants (the short forms use engine defaults).
+TITAN_API void titan_erode_hydraulic_ex(TitanHandle* handle, int iterations,
+                                        int spawnMode, float inertia,
+                                        float capacity, float minCapacity,
+                                        float dissolve, float deposit,
+                                        float evaporate, float gravity,
+                                        int lifetime, float radius,
+                                        float bedrockSpeed);
+TITAN_API void titan_erode_thermal_ex(TitanHandle* handle, int passes,
+                                      float talusAngleDeg, float rate,
+                                      float bedrockBreakdownRate);
+TITAN_API void titan_erode_fluvial_ex(TitanHandle* handle, int iterations,
+                                      float strength, float erodeConstant,
+                                      float areaExponent, float slopeExponent,
+                                      float depositRatio, float maxStep);
+
 TITAN_API void titan_carve(TitanHandle* handle, float x, float y,
                            float radius, float depth);
 
@@ -105,4 +173,5 @@ TITAN_API float* titan_mesh_positions_ptr(TitanHandle* handle);
 TITAN_API float* titan_mesh_normals_ptr(TitanHandle* handle);
 TITAN_API float* titan_mesh_colors_ptr(TitanHandle* handle);
 TITAN_API float* titan_mesh_uvs_ptr(TitanHandle* handle);
+TITAN_API float* titan_mesh_snow_ptr(TitanHandle* handle); // vertexCount floats
 TITAN_API uint32_t* titan_mesh_indices_ptr(TitanHandle* handle);

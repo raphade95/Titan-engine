@@ -278,6 +278,181 @@ void TestExporters() {
     Check(obj > 2 && o[0] == '#', "OBJ starts with header comment");
 }
 
+void TestMasks() {
+    std::printf("Mask system:\n");
+    const int size = 128;
+    Titan::TerrainEngine a, b;
+    a.Initialize(MakeParams(555, 2, size));
+    a.GenerateHeightmap();
+    b.Initialize(MakeParams(555, 2, size));
+    b.GenerateHeightmap();
+
+    // Mask out the left half on b; erode both identically.
+    std::vector<float> mask(static_cast<size_t>(size) * size, 0.0f);
+    for (int y = 0; y < size; ++y) {
+        for (int x = size / 2; x < size; ++x) mask[static_cast<size_t>(y) * size + x] = 1.0f;
+    }
+    b.SetMask(mask.data(), size);
+    a.ApplyThermalWeathering(10);
+    b.ApplyThermalWeathering(10);
+
+    // Left half of b should be untouched; right half should have changed.
+    double leftDiff = 0.0, rightDiff = 0.0;
+    Titan::TerrainEngine ref;
+    ref.Initialize(MakeParams(555, 2, size));
+    ref.GenerateHeightmap();
+    for (int y = 2; y < size - 2; ++y) {
+        for (int x = 2; x < size - 2; ++x) {
+            const double d = std::fabs(
+                (b.GetBedrock(x, y) + b.GetSediment(x, y)) -
+                (ref.GetBedrock(x, y) + ref.GetSediment(x, y)));
+            if (x < size / 2 - 2) leftDiff += d;
+            if (x >= size / 2 + 2) rightDiff += d;
+        }
+    }
+    Check(leftDiff < 1e-4, "masked-out region is untouched by erosion");
+    Check(rightDiff > 0.01, "unmasked region erodes normally");
+    b.ClearMask();
+}
+
+void TestNoiseStacking() {
+    std::printf("Noise stacking:\n");
+    const int size = 96;
+    Titan::TerrainEngine e;
+    Titan::TerrainParams tp = MakeParams(777, 0, size);
+    e.Initialize(tp);
+    e.ClearTerrain();
+
+    Titan::NoiseLayerParams n1;
+    n1.noiseType = 1;
+    n1.amplitude = 30.0f;
+    n1.scale = 2.0f;
+    e.ApplyNoise(n1);
+
+    double mass1 = TotalMass(e);
+    Check(mass1 > 0.0, "first noise layer adds material");
+
+    Titan::NoiseLayerParams n2;
+    n2.noiseType = 4; // voronoi cells
+    n2.seedOffset = 7;
+    n2.amplitude = 20.0f;
+    n2.blendMode = 3; // max
+    e.ApplyNoise(n2);
+    Check(TotalMass(e) >= mass1 - 1e-3, "max-blend never lowers terrain");
+    Check(AllFinite(e.BedrockMap()), "stacked noise stays finite");
+
+    Titan::TerrainEngine v;
+    v.Initialize(tp);
+    v.ClearTerrain();
+    Titan::NoiseLayerParams nv;
+    nv.noiseType = 5; // voronoi ridge
+    nv.amplitude = 25.0f;
+    v.ApplyNoise(nv);
+    Check(TotalMass(v) > 0.0, "voronoi-ridge noise generates terrain");
+}
+
+void TestStamps() {
+    std::printf("Shape stamps:\n");
+    const int size = 128;
+    Titan::TerrainEngine e;
+    e.Initialize(MakeParams(1, 0, size));
+    e.ClearTerrain();
+
+    Titan::StampParams dome;
+    dome.shape = 0;
+    dome.centerX = 64.0f;
+    dome.centerY = 64.0f;
+    dome.sizeX = 30.0f;
+    dome.sizeY = 30.0f;
+    dome.height = 25.0f;
+    dome.falloff = 0.5f;
+    dome.op = 0;
+    e.ApplyStamp(dome);
+
+    Check(std::fabs(e.GetHeight(64, 64) - 25.0f) < 0.5f, "dome peak reaches stamp height");
+    Check(e.GetHeight(5, 5) == 0.0f, "terrain outside the stamp is untouched");
+
+    Titan::StampParams rect;
+    rect.shape = 1;
+    rect.centerX = 64.0f;
+    rect.centerY = 64.0f;
+    rect.sizeX = 40.0f;
+    rect.sizeY = 20.0f;
+    rect.rotationDeg = 30.0f;
+    rect.height = 10.0f;
+    rect.op = 2; // flatten toward 10
+    e.ApplyStamp(rect);
+    Check(std::fabs(e.GetHeight(64, 64) - 10.0f) < 0.5f, "flatten pulls center to target height");
+
+    e.StampToScratch(dome);
+    float maxField = 0.0f;
+    for (float v : e.ScratchMask()) maxField = std::max(maxField, v);
+    Check(maxField > 0.99f, "stamp-to-mask rasterizes a full-strength field");
+}
+
+void TestSnowAndWater() {
+    std::printf("Snow & water:\n");
+    Titan::TerrainEngine e;
+    e.Initialize(MakeParams(4242, 2, 128));
+    e.GenerateHeightmap();
+
+    Titan::SnowParams sp;
+    e.ApplySnow(sp);
+
+    float maxSnow = 0.0f;
+    double lowSnow = 0.0;
+    const int size = 128;
+    const float heightRef = e.Params().heightMultiplier;
+    for (int y = 0; y < size; ++y) {
+        for (int x = 0; x < size; ++x) {
+            const float snow = e.SnowMap()[static_cast<size_t>(y) * size + x];
+            maxSnow = std::max(maxSnow, snow);
+            if ((e.GetBedrock(x, y) + e.GetSediment(x, y)) / heightRef < 0.2f) {
+                lowSnow += snow;
+            }
+        }
+    }
+    Check(maxSnow > 0.5f, "snow accumulates on high terrain");
+    Check(lowSnow < 1.0, "lowlands stay essentially snow-free");
+    Check(AllFinite(e.SnowMap()), "snow field finite");
+
+    e.BuildMesh();
+    Check(e.MeshSnow().size() == static_cast<size_t>(size) * size, "mesh snow channel present");
+
+    e.ComputeWater();
+    Check(AllFinite(e.WaterMap()), "water field finite");
+    float maxWater = 0.0f;
+    for (float w : e.WaterMap()) maxWater = std::max(maxWater, w);
+    Check(maxWater >= 0.0f, "water depths non-negative");
+
+    // A crater must fill with water.
+    Titan::TerrainEngine c;
+    c.Initialize(MakeParams(1, 0, 96));
+    c.ClearTerrain();
+    Titan::StampParams rim;
+    rim.shape = 0;
+    rim.centerX = 48;
+    rim.centerY = 48;
+    rim.sizeX = 30;
+    rim.sizeY = 30;
+    rim.height = 20;
+    rim.op = 0;
+    c.ApplyStamp(rim);
+    Titan::StampParams bowl;
+    bowl.shape = 0;
+    bowl.centerX = 48;
+    bowl.centerY = 48;
+    bowl.sizeX = 15;
+    bowl.sizeY = 15;
+    bowl.height = 15;
+    bowl.op = 1; // dig the middle out
+    c.ApplyStamp(bowl);
+    c.ComputeWater();
+    float craterWater = 0.0f;
+    for (float w : c.WaterMap()) craterWater = std::max(craterWater, w);
+    Check(craterWater > 1.0f, "carved basin fills with water");
+}
+
 void TestChunkSeams() {
     std::printf("Chunk seamlessness (world-space noise):\n");
     // Tile A centered at origin; tile B shifted exactly one tile east.
@@ -323,6 +498,10 @@ int main() {
     TestSpawnModes();
     TestModifiers();
     TestExporters();
+    TestMasks();
+    TestNoiseStacking();
+    TestStamps();
+    TestSnowAndWater();
     TestChunkSeams();
 
     std::printf("\n%s (%d failure%s)\n",

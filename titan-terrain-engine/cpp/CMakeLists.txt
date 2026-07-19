@@ -25,6 +25,7 @@ set(TITAN_SOURCES
     libTitanCore/src/TerrainEngine.cpp
     libTitanCore/src/Erosion.cpp
     libTitanCore/src/Fluvial.cpp
+    libTitanCore/src/Layers.cpp
     libTitanCore/src/Export.cpp
     libTitanCore/src/CAPI.cpp
 )

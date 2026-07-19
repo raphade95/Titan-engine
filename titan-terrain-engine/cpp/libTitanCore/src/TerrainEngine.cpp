@@ -17,13 +17,20 @@ void TerrainEngine::Initialize(const TerrainParams& params) {
     m_Bedrock.assign(count, 0.0f);
     m_Sediment.assign(count, 0.0f);
     m_Flow.assign(count, 0.0f);
+    m_Snow.assign(count, 0.0f);
+    m_Water.assign(count, 0.0f);
+    m_Scratch.assign(count, 0.0f);
     m_DropletCursor = 0;
+    m_Mask.clear();
     if (m_Precipitation.size() != count) m_Precipitation.clear();
 }
 
 void TerrainEngine::GenerateHeightmap() {
     const int size = m_Params.size;
     m_DropletCursor = 0;
+
+    std::fill(m_Snow.begin(), m_Snow.end(), 0.0f);
+    std::fill(m_Water.begin(), m_Water.end(), 0.0f);
 
     if (m_Params.noiseType == static_cast<int>(NoiseType::None)) {
         std::fill(m_Bedrock.begin(), m_Bedrock.end(), 0.0f);
@@ -200,7 +207,7 @@ void TerrainEngine::ApplyTerrace(float interval, float strength, float sharpness
         frac = frac * frac * (3.0f - 2.0f * frac);
         const float terraced = (level + frac) * interval;
 
-        const float target = h + (terraced - h) * strength;
+        const float target = h + (terraced - h) * strength * MaskAt(static_cast<int>(i));
         const float ratio = target / h;
         m_Bedrock[i] *= ratio;
         m_Sediment[i] *= ratio;
@@ -220,7 +227,8 @@ void TerrainEngine::ApplyPlateau(float plateauHeight, float softness) {
         // Rounded shoulder: heights above (plateau - softness) compress
         // asymptotically toward the plateau height.
         const float over = h - shoulder;
-        const float target = shoulder + softness * std::tanh(over / softness);
+        const float capped = shoulder + softness * std::tanh(over / softness);
+        const float target = h + (capped - h) * MaskAt(static_cast<int>(i));
         const float ratio = target / h;
         m_Bedrock[i] *= ratio;
         m_Sediment[i] *= ratio;
@@ -261,9 +269,20 @@ void TerrainEngine::BuildMesh() {
     m_MeshNormals.resize(vertexCount * 3);
     m_MeshColors.resize(vertexCount * 4);
     m_MeshUVs.resize(vertexCount * 2);
+    m_MeshSnow.resize(vertexCount);
     m_MeshIndices.resize(indexCount);
 
     const float c2 = 2.0f * m_Params.cellSize;
+    const bool hasSnow = m_Snow.size() == vertexCount;
+
+    // Total surface height including the snowpack.
+    auto totalAt = [&](int x, int y) -> float {
+        const float ground = GetHeight(x, y);
+        if (!hasSnow) return ground;
+        const int cx = std::clamp(x, 0, size - 1);
+        const int cy = std::clamp(y, 0, size - 1);
+        return ground + m_Snow[static_cast<size_t>(cy) * size + cx];
+    };
 
     // Rock mask by slope *angle*: bare rock above ~40 deg, none below ~20 deg.
     const float rockLo = 0.36f; // tan(20 deg)
@@ -274,14 +293,17 @@ void TerrainEngine::BuildMesh() {
             const size_t i = static_cast<size_t>(Index(x, y));
             const float b = m_Bedrock[i];
             const float s = m_Sediment[i];
-            const float h = b + s;
+            const float snow = hasSnow ? m_Snow[i] : 0.0f;
+            const float h = b + s + snow;
 
             m_MeshPositions[i * 3 + 0] = (static_cast<float>(x) - size * 0.5f) * m_Params.cellSize;
             m_MeshPositions[i * 3 + 1] = h;
             m_MeshPositions[i * 3 + 2] = (static_cast<float>(y) - size * 0.5f) * m_Params.cellSize;
 
-            const float dhdx = (GetHeight(x + 1, y) - GetHeight(x - 1, y)) / c2;
-            const float dhdy = (GetHeight(x, y + 1) - GetHeight(x, y - 1)) / c2;
+            m_MeshSnow[i] = snow;
+
+            const float dhdx = (totalAt(x + 1, y) - totalAt(x - 1, y)) / c2;
+            const float dhdy = (totalAt(x, y + 1) - totalAt(x, y - 1)) / c2;
             float nx = -dhdx, ny = 1.0f, nz = -dhdy;
             const float invLen = 1.0f / std::sqrt(nx * nx + ny * ny + nz * nz);
             m_MeshNormals[i * 3 + 0] = nx * invLen;
