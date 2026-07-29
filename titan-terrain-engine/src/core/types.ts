@@ -12,7 +12,18 @@ export type NoiseType =
 export type BiomeType = 'arctic' | 'temperate' | 'volcanic' | 'desert';
 
 export interface TerrainParams {
+  /** Samples per edge. Pure detail density — see worldSize. */
   size: number;
+  /**
+   * Edge length of the terrain in world units.
+   *
+   * Split from `size` in .titan v2. The hosts used to hardcode the engine's
+   * cellSize to 1.0, which made the world extent equal to the pixel count:
+   * raising Resolution widened the map while Height stayed absolute, so the
+   * same seed came out dramatically flatter at higher settings. Resolution is
+   * now sample density and this is the world.
+   */
+  worldSize: number;
   scale: number;
   heightMultiplier: number;
   seed: string;

@@ -14,7 +14,8 @@
     "test:core": "cd cpp && cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build && ./build/titan_tests",
     "test:golden": "cd cpp && cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build && ./build/titan_golden",
     "test:mutation": "cpp/tools/mutation_test.sh",
-    "test:wasm": "node cpp/tools/wasm_golden.mjs"
+    "test:wasm": "node cpp/tools/wasm_golden.mjs",
+    "test:project": "vite-node tools/project_format_test.mts"
   },
   "dependencies": {
     "@base-ui/react": "^1.4.0",
@@ -40,6 +41,7 @@
     "autoprefixer": "^10.4.21",
     "tailwindcss": "^4.1.14",
     "typescript": "~5.8.2",
-    "vite": "^6.2.0"
+    "vite": "^6.2.0",
+    "vite-node": "^3.2.4"
   }
 }

@@ -65,8 +65,20 @@ export interface ImportedField {
   name?: string;
 }
 
+/**
+ * Project file version.
+ *
+ * 1 — world extent was implicitly the sample count (engine cellSize 1.0).
+ * 2 — `worldSize` is explicit and `size` is pure sample density.
+ *
+ * v1 files still load and still reproduce their original terrain: the loader
+ * sets worldSize = size, which is exactly what the old model computed.
+ */
+export const TITAN_PROJECT_VERSION = 2;
+export type TitanProjectVersion = 1 | 2;
+
 export interface TitanProject {
-  version: 1;
+  version: TitanProjectVersion;
   params: TerrainParams;
   stack: Layer[];
   imported?: ImportedField;
@@ -680,7 +692,7 @@ function b64ToF32(s: string): Float32Array {
 
 export function serializeProject(project: TitanProject): string {
   const { imported, ...rest } = project;
-  const out: any = { ...rest };
+  const out: any = { ...rest, version: TITAN_PROJECT_VERSION };
   if (imported && imported.data.length > 0) {
     out.imported = { size: imported.size, name: imported.name, dataB64: f32ToB64(imported.data) };
   }
@@ -695,7 +707,12 @@ export function serializeProject(project: TitanProject): string {
 // TitanLab has always validated these (EngineModel.swift), so this is also a
 // parity fix.
 const PARAM_BOUNDS = {
-  size: { min: 64, max: 512, fallback: 128 },
+  // Must match the Resolution slider's range. This capped at 512 while the
+  // slider went to 2048, so a project saved at 1024 silently reloaded at 512 —
+  // and since TitanLab already allowed 2048, the same file reproduced two
+  // different terrains depending on which app opened it.
+  size: { min: 64, max: 2048, fallback: 128 },
+  worldSize: { min: 64, max: 8192, fallback: 128 },
   scale: { min: 0.1, max: 20, fallback: 2 },
   heightMultiplier: { min: 1, max: 500, fallback: 40 },
   octaves: { min: 1, max: 12, fallback: 6 },
@@ -711,7 +728,7 @@ const NOISE_TYPES: NoiseType[] = [
 ];
 const BIOMES: BiomeType[] = ['arctic', 'temperate', 'volcanic', 'desert'];
 
-function sanitizeParams(raw: any): TerrainParams {
+function sanitizeParams(raw: any, version: number): TerrainParams {
   const num = (key: keyof typeof PARAM_BOUNDS) => {
     const { min, max, fallback } = PARAM_BOUNDS[key];
     const value = raw?.[key];
@@ -726,9 +743,22 @@ function sanitizeParams(raw: any): TerrainParams {
 
   const seed = typeof raw?.seed === 'string' ? raw.seed : String(raw?.seed ?? '');
 
+  const size = Math.round(num('size') / 64) * 64;
+
+  // A v1 project predates the world/detail split: its extent *was* its sample
+  // count, so worldSize = size reproduces it exactly. Anything without a
+  // usable worldSize gets the same treatment, which is the conservative
+  // reading — it can only ever preserve the terrain the file described.
+  const rawWorld = Number(raw?.worldSize);
+  const worldSize = version >= 2 && Number.isFinite(rawWorld) && rawWorld > 0
+    ? Math.min(PARAM_BOUNDS.worldSize.max,
+               Math.max(PARAM_BOUNDS.worldSize.min, rawWorld))
+    : size;
+
   return {
     // Resolution must land on the slider's 64-step grid.
-    size: Math.round(num('size') / 64) * 64,
+    size,
+    worldSize,
     scale: num('scale'),
     heightMultiplier: num('heightMultiplier'),
     seed: seed.slice(0, 128),
@@ -744,7 +774,14 @@ function sanitizeParams(raw: any): TerrainParams {
 
 export function deserializeProject(json: string): TitanProject {
   const raw = JSON.parse(json);
-  if (raw?.version !== 1 || !raw.params || !Array.isArray(raw.stack)) {
+  const version = Number(raw?.version);
+  if (version !== 1 && version !== 2) {
+    throw new Error(
+      Number.isFinite(version)
+        ? `.titan version ${version} is newer than this build understands`
+        : 'Not a valid .titan project file');
+  }
+  if (!raw.params || !Array.isArray(raw.stack)) {
     throw new Error('Not a valid .titan project file');
   }
   const stack: Layer[] = raw.stack
@@ -779,7 +816,14 @@ export function deserializeProject(json: string): TitanProject {
     }
   }
 
-  return { version: 1, params: sanitizeParams(raw.params), stack, imported };
+  // Loaded projects are normalized to the current version; a v1 file that
+  // gets re-saved carries its original world extent forward explicitly.
+  return {
+    version: TITAN_PROJECT_VERSION,
+    params: sanitizeParams(raw.params, version),
+    stack,
+    imported,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -790,6 +834,10 @@ export function deserializeProject(json: string): TitanProject {
 export interface Preset {
   name: string;
   tagline: string;
+  // Everything but the seed and the sample density. A preset pins worldSize
+  // because its Height values are only meaningful relative to the extent they
+  // were authored against — 62 units of volcano reads as a cone across 128
+  // world units and as a pimple across 4096.
   params: Omit<TerrainParams, 'seed' | 'size'>;
   stack: Array<{ type: LayerType; params?: Record<string, number>; mask?: LayerMask }>;
 }
@@ -799,6 +847,7 @@ export const PRESETS: Preset[] = [
     name: 'Alpine Peaks',
     tagline: 'Ridged ranges with carved drainages and talus',
     params: {
+      worldSize: 128,
       scale: 2.5, heightMultiplier: 70, octaves: 8, persistence: 0.5,
       lacunarity: 2.0, exponent: 1.1, warpStrength: 0.6,
       noiseType: 'ridged', biome: 'temperate',
@@ -813,6 +862,7 @@ export const PRESETS: Preset[] = [
     name: 'Island Chain',
     tagline: 'Soft archipelago rising from the sea',
     params: {
+      worldSize: 128,
       scale: 1.8, heightMultiplier: 45, octaves: 6, persistence: 0.5,
       lacunarity: 2.0, exponent: 1.9, warpStrength: 0.9,
       noiseType: 'standard', biome: 'temperate',
@@ -826,6 +876,7 @@ export const PRESETS: Preset[] = [
     name: 'Canyonlands',
     tagline: 'Terraced mesas cut by deep river channels',
     params: {
+      worldSize: 128,
       scale: 1.5, heightMultiplier: 60, octaves: 6, persistence: 0.5,
       lacunarity: 2.0, exponent: 1.4, warpStrength: 0.3,
       noiseType: 'standard', biome: 'desert',
@@ -840,6 +891,7 @@ export const PRESETS: Preset[] = [
     name: 'Rolling Dunes',
     tagline: 'Wind-settled billows of soft sand',
     params: {
+      worldSize: 128,
       scale: 3.0, heightMultiplier: 25, octaves: 4, persistence: 0.45,
       lacunarity: 2.0, exponent: 1.0, warpStrength: 0.4,
       noiseType: 'billow', biome: 'desert',
@@ -852,6 +904,7 @@ export const PRESETS: Preset[] = [
     name: 'Worley Plateaus',
     tagline: 'Cellular mesas remapped by curves, cut by rivers',
     params: {
+      worldSize: 128,
       scale: 1.6, heightMultiplier: 55, octaves: 5, persistence: 0.5,
       lacunarity: 2.0, exponent: 1.0, warpStrength: 0.3,
       noiseType: 'voronoi', biome: 'desert',
@@ -871,6 +924,7 @@ export const PRESETS: Preset[] = [
     name: 'Erupting Stratovolcano',
     tagline: 'A breached cone pouring lava down to the sea',
     params: {
+      worldSize: 128,
       scale: 2.2, heightMultiplier: 30, octaves: 6, persistence: 0.5,
       lacunarity: 2.0, exponent: 1.3, warpStrength: 0.5,
       noiseType: 'standard', biome: 'volcanic',
@@ -891,6 +945,7 @@ export const PRESETS: Preset[] = [
     name: 'Volcanic Twins',
     tagline: 'Two vents whose flows collide and divert each other',
     params: {
+      worldSize: 128,
       scale: 2.0, heightMultiplier: 26, octaves: 6, persistence: 0.5,
       lacunarity: 2.0, exponent: 1.2, warpStrength: 0.6,
       noiseType: 'standard', biome: 'volcanic',
@@ -906,6 +961,7 @@ export const PRESETS: Preset[] = [
     name: 'Volcanic Shield',
     tagline: 'A flattened caldera dome with radial gullies',
     params: {
+      worldSize: 128,
       scale: 1.2, heightMultiplier: 90, octaves: 7, persistence: 0.5,
       lacunarity: 2.0, exponent: 1.6, warpStrength: 0.5,
       noiseType: 'ridged', biome: 'volcanic',

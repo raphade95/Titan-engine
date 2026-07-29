@@ -18,6 +18,20 @@ caveat.)
 | AO `.png` | 8-bit grayscale horizon occlusion | Baked shadowing, cavity masks |
 | `.titan` | JSON project (seed + params + stack) | Reproducing/sharing the terrain itself |
 
+### Terrain size vs. resolution
+
+A terrain's real-world extent is **World Size**, not Resolution. Resolution only
+sets how many samples span it, so a 1024-sample export and a 128-sample export of
+the same project describe the same landscape at different fidelities. One world
+unit is `worldSize / size` — the apps show this as the cell size under the
+Resolution slider, and it is what an Unreal or Unity import needs for horizontal
+scale.
+
+This split arrived with `.titan` **version 2**. Version 1 files predate it and
+load unchanged: their extent was implicitly their sample count, so the loader
+sets `worldSize = size`, reproducing exactly the terrain the file described. Both
+apps read v1 and v2 and write v2.
+
 ### Normalized formats and the real height range
 
 `.r16` and 16-bit `.png` are **normalized**: they stretch the terrain's actual

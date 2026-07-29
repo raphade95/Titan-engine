@@ -393,8 +393,16 @@ struct ContentView: View {
                     .help("Randomize the seed")
                 }
 
+                paramSlider("World Size", $model.worldSize, 64...8192, "%.0f u", step: 64)
+                Text("How far the terrain spans, in the same units as Height. This is the terrain's actual size — Resolution only controls how finely it is sampled.")
+                    .font(.system(size: 8.5)).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
                 paramSlider("Resolution", $model.size, 64...2048, "%.0f", step: 64,
                             detail: "\(Int(model.size))×\(Int(model.size))")
+                Text(String(format: "Samples per edge — detail only. Cell size %.3f u.",
+                            model.worldSize / max(1, model.size)))
+                    .font(.system(size: 8.5)).foregroundStyle(.secondary)
                 paramSlider("Scale", $model.scale, 0.1...10, "%.1f")
                 paramSlider("Height", $model.heightMultiplier, 10...500, "%.0f")
                 paramSlider("Octaves", $model.octaves, 1...12, "%.0f", step: 1)

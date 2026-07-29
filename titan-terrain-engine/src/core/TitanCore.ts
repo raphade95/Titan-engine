@@ -63,10 +63,15 @@ export class TitanCore {
 
   configure(params: TerrainParams): void {
     this.size = params.size;
+    // Sample spacing, so `size` is detail density and `worldSize` is the world.
+    // Noise is sampled in world space at a frequency of scale/extent, so with
+    // the extent pinned, refining the grid resolves more detail on the same
+    // landform instead of stretching it into a larger, flatter one.
+    const cellSize = params.worldSize / Math.max(1, params.size);
     this.module._titan_configure(
       this.handle,
       params.size,
-      1.0, // cellSize
+      cellSize,
       params.scale,
       params.heightMultiplier,
       hashSeed(this.module, params.seed),

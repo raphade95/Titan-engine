@@ -27,6 +27,15 @@ func randomSeed() -> String {
     return String((0..<7).map { _ in chars.randomElement()! })
 }
 
+/// Project file version, shared with the web lab (src/core/pipeline.ts).
+///
+/// 1 — world extent was implicitly the sample count (engine cellSize 1.0).
+/// 2 — `worldSize` is explicit and `size` is pure sample density.
+///
+/// v1 files still load and still reproduce their original terrain: the loader
+/// sets worldSize = size, which is exactly what the old model computed.
+let titanProjectVersion = 2
+
 // Names shared with the web lab's .titan format.
 let noiseTypeNames = ["none", "standard", "ridged", "billow", "voronoi",
                       "voronoiRidge", "worleyManhattan", "worleyChebyshev", "hybrid"]
@@ -43,7 +52,10 @@ struct MeshSnapshot {
     var indices: [UInt32]
     var vertexCount: Int
     var heightMax: Float
+    /// Edge length in world units (size * cellSize).
     var terrainExtent: Float
+    /// Samples per edge, for world <-> cell conversion in the picker.
+    var gridSize: Int
 }
 
 struct FloraInstance {
@@ -331,6 +343,15 @@ struct ProbeData: Equatable {
 final class EngineModel: ObservableObject {
     // Base parameters (mirror the web lab defaults; flat start, fresh seed).
     @Published var size: Double = 128       // 64...2048, step 64 — matches web slider
+    /// Edge length of the terrain in world units.
+    ///
+    /// Split from `size` in .titan v2. Both apps used to hardcode the engine's
+    /// cellSize to 1.0, which made the world extent equal to the sample count:
+    /// raising Resolution widened the map while Height stayed absolute, so the
+    /// same seed came out dramatically flatter at higher settings. Resolution
+    /// is now detail density and this is the world. The default matches the
+    /// historical extent so existing sessions look unchanged.
+    @Published var worldSize: Double = 128  // 64...8192, step 64
 
     // Preview mesh cap: the engine simulates and exports at full resolution;
     // the mesh handed to Metal is decimated to this many vertices per edge.
@@ -518,7 +539,7 @@ final class EngineModel: ObservableObject {
     static func presets() -> [Preset] {
         [
             Preset(name: "Alpine Peaks", tagline: "Ridged ranges, drainage, talus") { m in
-                m.scale = 2.5; m.heightMultiplier = 70; m.octaves = 8; m.persistence = 0.5
+                m.worldSize = 128; m.scale = 2.5; m.heightMultiplier = 70; m.octaves = 8; m.persistence = 0.5
                 m.exponent = 1.1; m.warpStrength = 0.6; m.noiseType = 2; m.biome = 1
                 m.stack = [
                     presetLayer(.fluvial, ["passes": 3, "strength": 1.2]),
@@ -527,7 +548,7 @@ final class EngineModel: ObservableObject {
                 ]
             },
             Preset(name: "Island Chain", tagline: "Soft archipelago rising from the sea") { m in
-                m.scale = 1.8; m.heightMultiplier = 45; m.octaves = 6; m.persistence = 0.5
+                m.worldSize = 128; m.scale = 1.8; m.heightMultiplier = 45; m.octaves = 6; m.persistence = 0.5
                 m.exponent = 1.9; m.warpStrength = 0.9; m.noiseType = 1; m.biome = 1
                 m.stack = [
                     presetLayer(.hydraulic, ["iterations": 49152, "spawnMode": 0]),
@@ -535,7 +556,7 @@ final class EngineModel: ObservableObject {
                 ]
             },
             Preset(name: "Canyonlands", tagline: "Terraced mesas cut by deep river channels") { m in
-                m.scale = 1.5; m.heightMultiplier = 60; m.octaves = 6; m.persistence = 0.5
+                m.worldSize = 128; m.scale = 1.5; m.heightMultiplier = 60; m.octaves = 6; m.persistence = 0.5
                 m.exponent = 1.4; m.warpStrength = 0.3; m.noiseType = 1; m.biome = 3
                 m.stack = [
                     presetLayer(.terrace, ["interval": 12, "strength": 0.85, "sharpness": 3]),
@@ -544,14 +565,14 @@ final class EngineModel: ObservableObject {
                 ]
             },
             Preset(name: "Rolling Dunes", tagline: "Wind-settled billows of soft sand") { m in
-                m.scale = 3.0; m.heightMultiplier = 25; m.octaves = 4; m.persistence = 0.45
+                m.worldSize = 128; m.scale = 3.0; m.heightMultiplier = 25; m.octaves = 4; m.persistence = 0.45
                 m.exponent = 1.0; m.warpStrength = 0.4; m.noiseType = 3; m.biome = 3
                 m.stack = [
                     presetLayer(.thermal, ["passes": 20, "talusAngle": 30, "rate": 0.7]),
                 ]
             },
             Preset(name: "Worley Plateaus", tagline: "Cellular mesas remapped by curves, cut by rivers") { m in
-                m.scale = 1.6; m.heightMultiplier = 55; m.octaves = 5; m.persistence = 0.5
+                m.worldSize = 128; m.scale = 1.6; m.heightMultiplier = 55; m.octaves = 5; m.persistence = 0.5
                 m.exponent = 1.0; m.warpStrength = 0.3; m.noiseType = 4; m.biome = 3
                 m.stack = [
                     presetLayer(.curve, ["y0": 0, "y1": 0.15, "y2": 0.55, "y3": 0.85, "y4": 1]),
@@ -564,7 +585,7 @@ final class EngineModel: ObservableObject {
                 ]
             },
             Preset(name: "Erupting Stratovolcano", tagline: "A breached cone pouring lava down to the sea") { m in
-                m.scale = 2.2; m.heightMultiplier = 30; m.octaves = 6; m.persistence = 0.5
+                m.worldSize = 128; m.scale = 2.2; m.heightMultiplier = 30; m.octaves = 6; m.persistence = 0.5
                 m.exponent = 1.3; m.warpStrength = 0.5; m.noiseType = 1; m.biome = 2
                 m.stack = [
                     // A radial ramp first: the island drains outward, which is
@@ -579,7 +600,7 @@ final class EngineModel: ObservableObject {
                 ]
             },
             Preset(name: "Volcanic Twins", tagline: "Two vents whose flows collide and divert each other") { m in
-                m.scale = 2.0; m.heightMultiplier = 26; m.octaves = 6; m.persistence = 0.5
+                m.worldSize = 128; m.scale = 2.0; m.heightMultiplier = 26; m.octaves = 6; m.persistence = 0.5
                 m.exponent = 1.2; m.warpStrength = 0.6; m.noiseType = 1; m.biome = 2
                 m.stack = [
                     presetLayer(.gradient, ["kind": 1, "op": 0, "angle": 0, "height": 28]),
@@ -591,7 +612,7 @@ final class EngineModel: ObservableObject {
                 ]
             },
             Preset(name: "Volcanic Shield", tagline: "A flattened caldera dome with radial gullies") { m in
-                m.scale = 1.2; m.heightMultiplier = 90; m.octaves = 7; m.persistence = 0.5
+                m.worldSize = 128; m.scale = 1.2; m.heightMultiplier = 90; m.octaves = 7; m.persistence = 0.5
                 m.exponent = 1.6; m.warpStrength = 0.5; m.noiseType = 2; m.biome = 2
                 m.stack = [
                     presetLayer(.plateau, ["height": 70, "softness": 12]),
@@ -626,7 +647,9 @@ final class EngineModel: ObservableObject {
         let p = (size: Int32(size), scale: Float(scale), height: Float(heightMultiplier),
                  seed: hashSeed(seed), octaves: Int32(octaves), persistence: Float(persistence),
                  lacunarity: Float(lacunarity), exponent: Float(exponent),
-                 noise: Int32(noiseType), warp: Float(warpStrength))
+                 noise: Int32(noiseType), warp: Float(warpStrength),
+                 // Sample spacing: `size` is detail density, `worldSize` the world.
+                 cell: Float(worldSize / max(1, size)))
         let imported = importedField.isEmpty ? nil : (data: importedField, size: Int32(importedSize))
         let layers = stack.filter { $0.enabled }
         let wantTopDown = showTopDown || topDownFullscreen
@@ -636,7 +659,7 @@ final class EngineModel: ObservableObject {
         queue.async { [weak self] in
             let started = Date()
 
-            titan_configure(engine, p.size, 1.0, p.scale, p.height, p.seed, p.octaves,
+            titan_configure(engine, p.size, p.cell, p.scale, p.height, p.seed, p.octaves,
                             p.persistence, p.lacunarity, p.exponent, p.noise, p.warp,
                             1.0, 2.0, 0.0, 0.0)
             titan_generate(engine)
@@ -677,7 +700,8 @@ final class EngineModel: ObservableObject {
             var rangeHi: Float = 0
             titan_height_range(engine, &rangeLo, &rangeHi)
 
-            let snapshot = Self.snapshotMesh(engine, heightMax: p.height, extent: Float(p.size))
+            let snapshot = Self.snapshotMesh(engine, heightMax: p.height,
+                                             extent: Float(p.size) * p.cell)
             let topDown = wantTopDown
                 ? Self.makeTopDownImage(engine, size: Int(p.size), seaLevel: water) : nil
             let elapsed = Int(Date().timeIntervalSince(started) * 1000)
@@ -823,6 +847,7 @@ final class EngineModel: ObservableObject {
 
     nonisolated private static func snapshotMesh(_ engine: OpaquePointer?, heightMax: Float,
                                                  extent: Float) -> MeshSnapshot? {
+        let grid = Int(titan_size(engine))
         titan_build_mesh_lod(engine, EngineModel.previewMaxEdgeVertices)
         let vertexCount = Int(titan_mesh_vertex_count(engine))
         let indexCount = Int(titan_mesh_index_count(engine))
@@ -865,7 +890,7 @@ final class EngineModel: ObservableObject {
         let indices = Array(UnsafeBufferPointer(start: indexPtr, count: indexCount))
         return MeshSnapshot(interleaved: interleaved, indices: indices,
                             vertexCount: vertexCount, heightMax: heightMax,
-                            terrainExtent: extent)
+                            terrainExtent: extent, gridSize: grid)
     }
 
     // MARK: - Inspector probe & manual carver
@@ -895,7 +920,7 @@ final class EngineModel: ObservableObject {
         let radius = Float(carveRadius)
         let depth = Float(carveDepth)
         let heightMax = Float(heightMultiplier)
-        let extent = Float(size)
+        let extent = Float(worldSize)
         queue.async { [weak self] in
             titan_carve(engine, Float(gridX), Float(gridY), radius, depth)
             let snapshot = Self.snapshotMesh(engine, heightMax: heightMax, extent: extent)
@@ -916,6 +941,8 @@ final class EngineModel: ObservableObject {
               let flow = titan_flow_ptr(engine) else { return }
 
         let size = Int(self.size)
+        // Flora is placed by cell index but drawn in world space.
+        let cell = Float(worldSize / max(1, self.size))
         let heightRef = Float(heightMultiplier)
         let water = Float(seaLevel)
         var instances: [FloraInstance] = []
@@ -953,7 +980,8 @@ final class EngineModel: ObservableObject {
                 scale = SIMD4<Float>(0.2, Float.random(in: 0.8...2.3), 0.2, 0)
             }
             instances.append(FloraInstance(
-                posRot: SIMD4<Float>(Float(x - size / 2), h, Float(y - size / 2),
+                posRot: SIMD4<Float>(Float(x - size / 2) * cell, h,
+                                     Float(y - size / 2) * cell,
                                      Float.random(in: 0...(2 * .pi))),
                 scale: scale))
         }
@@ -1134,7 +1162,8 @@ final class EngineModel: ObservableObject {
 
     func serializeProject() -> Data? {
         var params: [String: Any] = [
-            "size": Int(size), "scale": scale, "heightMultiplier": heightMultiplier,
+            "size": Int(size), "worldSize": Int(worldSize),
+            "scale": scale, "heightMultiplier": heightMultiplier,
             "seed": seed, "octaves": Int(octaves), "persistence": persistence,
             "lacunarity": lacunarity, "exponent": exponent, "warpStrength": warpStrength,
             "noiseType": noiseTypeNames[min(max(noiseType, 0), noiseTypeNames.count - 1)],
@@ -1153,7 +1182,8 @@ final class EngineModel: ObservableObject {
             ]
         }
 
-        var dict: [String: Any] = ["version": 1, "params": params, "stack": stackJSON]
+        var dict: [String: Any] = ["version": titanProjectVersion,
+                                   "params": params, "stack": stackJSON]
         if !importedField.isEmpty {
             let bytes = importedField.withUnsafeBufferPointer { Data(buffer: $0) }
             var imp: [String: Any] = ["size": importedSize, "dataB64": bytes.base64EncodedString()]
@@ -1165,7 +1195,8 @@ final class EngineModel: ObservableObject {
 
     func loadProject(from data: Data) -> Bool {
         guard let raw = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              raw["version"] as? Int == 1,
+              let fileVersion = raw["version"] as? Int,
+              fileVersion >= 1, fileVersion <= titanProjectVersion,
               let p = raw["params"] as? [String: Any],
               let rawStack = raw["stack"] as? [[String: Any]] else { return false }
 
@@ -1173,6 +1204,13 @@ final class EngineModel: ObservableObject {
             (p[key] as? NSNumber)?.doubleValue ?? fallback
         }
         size = min(2048, max(64, num("size", 128)))
+        // A v1 project predates the world/detail split: its extent *was* its
+        // sample count, so worldSize = size reproduces it exactly.
+        if fileVersion >= 2, let w = (p["worldSize"] as? NSNumber)?.doubleValue, w > 0 {
+            worldSize = min(8192, max(64, w))
+        } else {
+            worldSize = size
+        }
         scale = num("scale", 2.0)
         heightMultiplier = num("heightMultiplier", 40)
         octaves = num("octaves", 6)

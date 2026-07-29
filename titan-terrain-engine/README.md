@@ -49,6 +49,12 @@ only marshals parameters in and copies buffers out across the C API
   it finds the breach, piles into lobes, freezes levees along its chilled
   margins, and self-channelizes into streams that run to the map edge. Chilled
   lava becomes bedrock, so it diverts later flows and lands in every export.
+- **World size and resolution are separate.** `worldSize` is how far the terrain
+  spans; `size` is how finely it is sampled. Both apps used to pin the engine's
+  `cellSize` to 1.0, which made the extent equal to the pixel count — the same
+  seed came out 6.7x flatter at 1024 than at 128 because raising "Resolution"
+  silently widened the world while Height stayed absolute. Refining the grid now
+  resolves more detail on the same landform.
 - World-space noise sampling: adjacent tiles are seamless (chunking-ready).
 - **Cellular noise family**: voronoi F1/F2-F1 plus Worley manhattan/chebyshev
   metrics, and a Musgrave hybrid multifractal "terrain" mode.

@@ -80,6 +80,9 @@ const PREVIEW_MAX_EDGE_VERTS = 512;
 // noise structure or tweaks a slider. Every session starts with a fresh seed.
 const DEFAULT_PARAMS: TerrainParams = {
   size: 128,
+  // Matches the historical extent (the old model made it equal to `size`), so
+  // a default session looks exactly as it did before world size was split out.
+  worldSize: 128,
   scale: 2.0,
   heightMultiplier: 40,
   seed: randomSeed(),
@@ -302,7 +305,7 @@ export default function App() {
       existing.uniforms.uBiome.value =
         ['arctic', 'temperate', 'volcanic', 'desert'].indexOf(params.biome);
       existing.uniforms.uHeightScale.value = Math.max(1, params.heightMultiplier);
-      existing.uniforms.uTerrainExtent.value = params.size;
+      existing.uniforms.uTerrainExtent.value = params.worldSize;
     }
 
     if (meshRef.current) {
@@ -345,7 +348,7 @@ export default function App() {
         uSkyColor: { value: new THREE.Color(0x87CEEB) },
         uSunIntensity: { value: sunIntensity },
         uExposure: { value: 1.0 },
-        uTerrainExtent: { value: params.size },
+        uTerrainExtent: { value: params.worldSize },
       },
       vertexShader: `
         attribute vec4 lava;
@@ -1004,9 +1007,13 @@ export default function App() {
       if (intersects.length > 0) {
         const point = intersects[0].point;
         const size = params.size;
+        // Mesh positions are in world units, so a hit has to be divided by the
+        // sample spacing to land on a cell. This used to add size/2 directly,
+        // which is only correct while one cell happens to be one world unit.
+        const cell = params.worldSize / Math.max(1, size);
 
-        const x = Math.round(point.x + size / 2);
-        const y = Math.round(point.z + size / 2);
+        const x = Math.round(point.x / cell + size / 2);
+        const y = Math.round(point.z / cell + size / 2);
 
         if (x >= 0 && x < size && y >= 0 && y < size) {
           if (isInspectMode) {
@@ -1052,9 +1059,10 @@ export default function App() {
         const hits = raycaster.intersectObject(mesh);
         if (hits.length === 0) return;
 
-        const size = params.size;
-        const gx = (hits[0].point.x + size / 2) / size;
-        const gy = (hits[0].point.z + size / 2) / size;
+        // Normalized 0..1 position across the map, straight from world units.
+        const half = params.worldSize * 0.5;
+        const gx = (hits[0].point.x + half) / params.worldSize;
+        const gy = (hits[0].point.z + half) / params.worldSize;
         if (gx < 0 || gx > 1 || gy < 0 || gy > 1) return;
 
         isMouseDown.current = true;
@@ -1079,7 +1087,7 @@ export default function App() {
       window.removeEventListener('pointerup', handlePointerUp);
     };
   }, [isInspectMode, isCarveMode, isVolcanoMode, carveRadius, carveDepth,
-      params.size, updateMesh, placeVolcano, moveVolcano]);
+      params.size, params.worldSize, updateMesh, placeVolcano, moveVolcano]);
 
   const floraRef = useRef<THREE.InstancedMesh | null>(null);
 
@@ -1095,6 +1103,8 @@ export default function App() {
     }
 
     const size = params.size;
+    // Flora is placed by cell index but drawn in world space.
+    const cell = params.worldSize / Math.max(1, size);
     const maxFlora = floraDensity;
     const instances: THREE.Matrix4[] = [];
     const dummy = new THREE.Object3D();
@@ -1133,7 +1143,7 @@ export default function App() {
       const probability = (s / 5.0) * 0.5 + (f * 0.5);
       if (Math.random() > probability && i > 500) continue; 
       
-      dummy.position.set(x - size / 2, h, y - size / 2);
+      dummy.position.set((x - size / 2) * cell, h, (y - size / 2) * cell);
       dummy.scale.setScalar(0.5 + Math.random() * 0.5);
       
       // Variation for desert (cactus-like)
@@ -1176,7 +1186,7 @@ export default function App() {
     floraRef.current = imesh;
     
     setStats(prev => ({ ...prev, flora: instances.length }));
-  }, [params.size, params.heightMultiplier, params.biome, floraDensity]);
+  }, [params.size, params.worldSize, params.heightMultiplier, params.biome, floraDensity]);
 
   // Runs the whole layer stack, chunked so the viewport updates live and the
   // UI never freezes. A newer run (or Cancel) simply invalidates this one.
@@ -1424,8 +1434,8 @@ export default function App() {
 
   // Reframe the camera when the terrain extent changes.
   useEffect(() => {
-    frameTerrain(params.size);
-  }, [params.size, frameTerrain]);
+    frameTerrain(params.worldSize);
+  }, [params.worldSize, frameTerrain]);
 
   // Resize the reference grid with the terrain. It spans the map plus a
   // margin, with one division per 1/16th, so it reads as a scale reference at
@@ -1433,7 +1443,7 @@ export default function App() {
   useEffect(() => {
     const scene = sceneRef.current;
     if (!scene) return;
-    const extent = Math.max(64, params.size) * 1.5;
+    const extent = Math.max(64, params.worldSize) * 1.5;
     const old = gridRef.current;
     if (old) {
       scene.remove(old);
@@ -1445,7 +1455,7 @@ export default function App() {
     grid.visible = old ? old.visible : true;
     scene.add(grid);
     gridRef.current = grid;
-  }, [params.size]);
+  }, [params.worldSize]);
 
   useEffect(() => {
     updateAtmosphere();
@@ -1731,18 +1741,44 @@ export default function App() {
 
                   <div className="space-y-4">
                     <div className="flex items-center justify-between">
+                      <Label className="text-[11px] uppercase tracking-widest text-zinc-400">World Size</Label>
+                      <span className="text-xs font-mono">{params.worldSize} u</span>
+                    </div>
+                    <Slider
+                      value={[params.worldSize || 128]}
+                      min={64}
+                      max={8192}
+                      step={64}
+                      onValueChange={(v: number[]) => {
+                        if (v && v.length > 0) updateParam('worldSize', v[0]);
+                      }}
+                    />
+                    <p className="text-[9px] text-zinc-600 leading-relaxed -mt-2">
+                      How far the terrain spans, in the same units as Height. This is the
+                      terrain's actual size — Resolution below only controls how finely it
+                      is sampled.
+                    </p>
+                  </div>
+
+                  <div className="space-y-4">
+                    <div className="flex items-center justify-between">
                       <Label className="text-[11px] uppercase tracking-widest text-zinc-400">Resolution</Label>
                       <span className="text-xs font-mono">{params.size}x{params.size}</span>
                     </div>
-                    <Slider 
-                      value={[params.size || 128]} 
-                      min={64} 
-                      max={2048} 
-                      step={64} 
+                    <Slider
+                      value={[params.size || 128]}
+                      min={64}
+                      max={2048}
+                      step={64}
                       onValueChange={(v: number[]) => {
                         if (v && v.length > 0) updateParam('size', v[0]);
                       }}
                     />
+                    <p className="text-[9px] text-zinc-600 leading-relaxed -mt-2">
+                      Samples per edge — detail only. Raising it resolves finer features on
+                      the same landform; it no longer stretches the world.
+                      {' '}Cell size {(params.worldSize / Math.max(1, params.size)).toFixed(3)} u.
+                    </p>
                   </div>
 
                   <div className="space-y-4">

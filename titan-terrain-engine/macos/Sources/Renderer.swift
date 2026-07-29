@@ -47,8 +47,13 @@ final class OrbitCamera {
         elevation = min(max(elevation + dy * 0.008, 0.05), 1.5)
     }
 
+    /// Orbit limits scale with the terrain — a fixed 20..1500 range could not
+    /// frame a large world at all.
+    var minDistance: Float = 20
+    var maxDistance: Float = 1500
+
     func zoom(_ delta: Float) {
-        distance = min(max(distance * (1.0 - delta * 0.05), 20), 1500)
+        distance = min(max(distance * (1.0 - delta * 0.05), minDistance), maxDistance)
     }
 
     func viewProjection(aspect: Float) -> float4x4 {
@@ -67,6 +72,9 @@ final class TerrainMTKView: MTKView {
     var carveEnabled = false
     var volcanoPlaceEnabled = false
     var terrainSize = 128
+    /// World units per cell. Picking works in world space and has to divide by
+    /// this to land on a cell — it used to assume one cell was one world unit.
+    var cellSize: Float = 1
     var heightAt: ((Int, Int) -> Float)?
     var onProbe: ((Int, Int) -> Void)?
     var onProbeMiss: (() -> Void)?
@@ -157,19 +165,24 @@ final class TerrainMTKView: MTKView {
         let origin = unproject(0)
         let dir = simd_normalize(unproject(1) - origin)
 
-        let half = Float(terrainSize) * 0.5
+        let cell = max(cellSize, 1e-4)
+        let half = Float(terrainSize) * 0.5 * cell
+        let extent = Float(terrainSize) * cell
         var t: Float = 0
-        while t < 2000 {
+        // Step in world units scaled to the sample spacing, so a fine grid over
+        // a small world is not marched straight through.
+        let fineStep = max(cell * 0.75, 1e-3)
+        while t < extent * 8 {
             let p = origin + dir * t
-            let gx = p.x + half
-            let gy = p.z + half
+            let gx = (p.x + half) / cell
+            let gy = (p.z + half) / cell
             if gx >= 0, gx < Float(terrainSize), gy >= 0, gy < Float(terrainSize) {
                 if p.y <= heightAt(Int(gx), Int(gy)) {
                     return (Int(gx), Int(gy))
                 }
             }
             // Coarse march far away, fine near the surface band.
-            t += p.y > 200 ? 4.0 : 0.75
+            t += p.y > 200 ? fineStep * 5 : fineStep
         }
         return nil
     }
@@ -196,6 +209,7 @@ final class TerrainRenderer: NSObject, MTKViewDelegate {
 
     private var gridBuffer: MTLBuffer?
     private var gridVertexCount = 0
+    private var gridExtent: Float = 0
     private var waterBuffer: MTLBuffer?
     private var waterVertexCount = 0
     private var floraVertexBuffer: MTLBuffer?
@@ -279,9 +293,28 @@ final class TerrainRenderer: NSObject, MTKViewDelegate {
                                         options: .storageModeShared)
         indexCount = mesh.indices.count
         terrainHeightMax = max(1, mesh.heightMax)
-        terrainExtent = max(1, mesh.terrainExtent)
+        let newExtent = max(1, mesh.terrainExtent)
+        if let camera = view?.camera {
+            camera.minDistance = newExtent * 0.05
+            camera.maxDistance = newExtent * 8
+            // Reframe when the world itself resizes, not merely when the mesh
+            // is rebuilt — otherwise raising World Size leaves the camera at
+            // its old distance and buries it inside the terrain. A pure
+            // Resolution change leaves the extent alone and must not disturb
+            // whatever view the user has set up.
+            if abs(newExtent - terrainExtent) > terrainExtent * 0.01 {
+                camera.distance = newExtent * 1.3
+            }
+            camera.distance = min(max(camera.distance, camera.minDistance), camera.maxDistance)
+        }
+        terrainExtent = newExtent
+        if abs(newExtent - gridExtent) > gridExtent * 0.01 {
+            buildGrid(extent: newExtent)
+        }
         view?.camera.target = SIMD3<Float>(0, mesh.heightMax * 0.25, 0)
-        view?.terrainSize = Int(mesh.terrainExtent)
+        // terrainExtent is in world units; the picker needs cells plus spacing.
+        view?.cellSize = mesh.terrainExtent / Float(max(1, mesh.gridSize))
+        view?.terrainSize = mesh.gridSize
     }
 
     // Flora colors per biome: arctic, temperate, volcanic, desert.
@@ -307,13 +340,16 @@ final class TerrainRenderer: NSObject, MTKViewDelegate {
 
     // MARK: - Static geometry
 
-    private func buildGrid() {
-        // 200x200 world units, 20 divisions — same as the web grid helper.
+    /// Reference grid spanning the terrain plus a margin, 24 divisions.
+    ///
+    /// This was a fixed 200 world units, which is a postage stamp under a large
+    /// world and stops reading as a scale reference at all.
+    private func buildGrid(extent: Float = 128) {
         var verts: [Float] = []
-        let half: Float = 100
-        let step: Float = 10
+        let half = max(32, extent * 0.75)
+        let step = half * 2 / 24
         var x = -half
-        while x <= half {
+        while x <= half + step * 0.5 {
             verts += [x, -0.1, -half, x, -0.1, half]
             verts += [-half, -0.1, x, half, -0.1, x]
             x += step
@@ -321,6 +357,7 @@ final class TerrainRenderer: NSObject, MTKViewDelegate {
         gridVertexCount = verts.count / 3
         gridBuffer = device.makeBuffer(bytes: verts, length: verts.count * 4,
                                        options: .storageModeShared)
+        gridExtent = extent
     }
 
     private func buildWaterPlane() {

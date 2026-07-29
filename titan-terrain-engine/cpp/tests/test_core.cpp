@@ -1246,6 +1246,92 @@ void TestBandScratchSharedWithHosts() {
 // Surface shading data: AO, and the splat height channel's normalization.
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Resolution is sample density, not world size.
+// ---------------------------------------------------------------------------
+
+void TestResolutionIndependence() {
+    std::printf("Resolution independence\n");
+
+    // The hosts used to hardcode cellSize = 1.0, which made the world extent
+    // equal to the pixel count: raising Resolution widened the map while the
+    // Height slider stayed absolute, so the same seed at 1024 came out 6.7x
+    // flatter than at 128. "Resolution" read as a detail control and silently
+    // reshaped the terrain.
+    //
+    // With a fixed world extent, refining the grid must resolve *more detail on
+    // the same landform* — same silhouette, same relief, finer sampling.
+    const float worldSize = 128.0f;
+
+    struct Sample { int size; float peak; double meanSlope; };
+    Sample samples[3];
+    int n = 0;
+
+    for (int size : {128, 256, 512}) {
+        Titan::TerrainEngine e;
+        Titan::TerrainParams p = MakeParams(12345, 1, size);
+        p.cellSize = worldSize / static_cast<float>(size);
+        e.Initialize(p);
+        e.GenerateHeightmap();
+
+        float lo = 0, hi = 0;
+        e.HeightRange(lo, hi);
+
+        // Slope is rise/run in world units, so it is directly comparable
+        // across sampling densities.
+        double slope = 0.0;
+        int count = 0;
+        for (int y = 1; y < size - 1; y += 2) {
+            for (int x = 1; x < size - 1; x += 2) {
+                slope += e.GetSlope(x, y);
+                ++count;
+            }
+        }
+        samples[n++] = { size, hi, slope / count };
+    }
+
+    for (int i = 0; i < n; ++i) {
+        std::printf("        size %4d: peak %6.2f  mean slope %.3f\n",
+                    samples[i].size, samples[i].peak, samples[i].meanSlope);
+    }
+
+    const float peakDrift = std::fabs(samples[2].peak - samples[0].peak)
+                          / std::max(1.0f, samples[0].peak);
+    Check(peakDrift < 0.05f, "peak height is stable as the grid is refined");
+
+    // Finer sampling resolves a little more high-frequency slope, which is
+    // real. What must not happen is the 6.7x collapse the old model produced.
+    const double slopeRatio = samples[2].meanSlope / samples[0].meanSlope;
+    std::printf("        mean-slope ratio 512/128 = %.2f\n", slopeRatio);
+    Check(slopeRatio > 0.8 && slopeRatio < 1.6,
+          "relief is stable as the grid is refined (not rescaled by it)");
+
+    // And the guard has teeth: the old fixed-cellSize model must fail it.
+    double legacy[2];
+    for (int i = 0; i < 2; ++i) {
+        const int size = (i == 0) ? 128 : 512;
+        Titan::TerrainEngine e;
+        Titan::TerrainParams p = MakeParams(12345, 1, size);
+        p.cellSize = 1.0f; // what the hosts used to pass
+        e.Initialize(p);
+        e.GenerateHeightmap();
+        double slope = 0.0;
+        int count = 0;
+        for (int y = 1; y < size - 1; y += 2) {
+            for (int x = 1; x < size - 1; x += 2) {
+                slope += e.GetSlope(x, y);
+                ++count;
+            }
+        }
+        legacy[i] = slope / count;
+    }
+    std::printf("        legacy cellSize=1.0 ratio 512/128 = %.2f\n",
+                legacy[1] / legacy[0]);
+    Check(legacy[1] / legacy[0] < 0.5,
+          "the old fixed-cellSize model really did flatten with resolution");
+    std::printf("\n");
+}
+
 void TestAmbientOcclusion() {
     std::printf("Ambient occlusion\n");
 
@@ -1734,6 +1820,7 @@ int main() {
     TestMeshLod();
     TestSplatMatchesMesh();
     TestBandScratchSharedWithHosts();
+    TestResolutionIndependence();
     TestAmbientOcclusion();
     TestSplatHeightUsesRealRange();
     TestSnowAndLakesReachTheMesh();
