@@ -4,6 +4,11 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <vector>
+
+#if !defined(__EMSCRIPTEN__)
+#include <future>
+#endif
 
 // Dependency-free exporters. PNG uses a valid zlib stream built from
 // *stored* (uncompressed) deflate blocks — every PNG reader accepts it, and
@@ -152,6 +157,193 @@ size_t TerrainEngine::ExportPNG16() {
     PngChunk(m_ExportBuffer, "IDAT", idat);
     PngChunk(m_ExportBuffer, "IEND", {});
 
+    return m_ExportBuffer.size();
+}
+
+namespace {
+
+// Assemble a complete PNG (bit depth 8) from filtered scanlines.
+// colorType: 0 = grayscale (1 byte/px), 2 = truecolor RGB (3 bytes/px),
+// 6 = RGBA (4 bytes/px).
+void WritePNG8(std::vector<uint8_t>& out, int size, int colorType,
+               const std::vector<uint8_t>& raw) {
+    out.clear();
+    static const uint8_t sig[8] = {137, 80, 78, 71, 13, 10, 26, 10};
+    PutBytes(out, sig, 8);
+
+    std::vector<uint8_t> ihdr;
+    PutU32BE(ihdr, static_cast<uint32_t>(size));
+    PutU32BE(ihdr, static_cast<uint32_t>(size));
+    PutU8(ihdr, 8);  // bit depth
+    PutU8(ihdr, static_cast<uint8_t>(colorType));
+    PutU8(ihdr, 0);  // compression
+    PutU8(ihdr, 0);  // filter
+    PutU8(ihdr, 0);  // no interlace
+    PngChunk(out, "IHDR", ihdr);
+
+    std::vector<uint8_t> idat;
+    ZlibStored(idat, raw);
+    PngChunk(out, "IDAT", idat);
+    PngChunk(out, "IEND", {});
+}
+
+} // namespace
+
+// --- Normal map, 8-bit RGB PNG -------------------------------------------------
+// World-space normals: R = +X (east), G = +Y (south / +row), B = +Z (up).
+
+size_t TerrainEngine::ExportNormalPNG() {
+    const int size = m_Params.size;
+    const float c2 = 2.0f * m_Params.cellSize;
+
+    std::vector<uint8_t> raw;
+    raw.reserve(static_cast<size_t>(size) * (size * 3 + 1));
+    for (int y = 0; y < size; ++y) {
+        raw.push_back(0); // filter byte
+        for (int x = 0; x < size; ++x) {
+            const float dhdx = (GetHeight(x + 1, y) - GetHeight(x - 1, y)) / c2;
+            const float dhdy = (GetHeight(x, y + 1) - GetHeight(x, y - 1)) / c2;
+            float nx = -dhdx, ny = -dhdy, nz = 1.0f;
+            const float invLen = 1.0f / std::sqrt(nx * nx + ny * ny + nz * nz);
+            nx *= invLen; ny *= invLen; nz *= invLen;
+            raw.push_back(static_cast<uint8_t>(std::lround((nx * 0.5f + 0.5f) * 255.0f)));
+            raw.push_back(static_cast<uint8_t>(std::lround((ny * 0.5f + 0.5f) * 255.0f)));
+            raw.push_back(static_cast<uint8_t>(std::lround((nz * 0.5f + 0.5f) * 255.0f)));
+        }
+    }
+
+    WritePNG8(m_ExportBuffer, size, 2, raw);
+    return m_ExportBuffer.size();
+}
+
+// --- Ambient occlusion, 8-bit grayscale PNG ------------------------------------
+// Horizon-based: sky openness averaged over 8 directions.
+
+size_t TerrainEngine::ExportAOPNG() {
+    const int size = m_Params.size;
+    ComputeAOField();
+
+    std::vector<uint8_t> raw;
+    raw.reserve(static_cast<size_t>(size) * (size + 1));
+    for (int y = 0; y < size; ++y) {
+        raw.push_back(0); // filter byte
+        for (int x = 0; x < size; ++x) {
+            const float ao = m_AO[static_cast<size_t>(y) * size + x];
+            raw.push_back(static_cast<uint8_t>(std::lround(
+                std::clamp(ao, 0.0f, 1.0f) * 255.0f)));
+        }
+    }
+
+    WritePNG8(m_ExportBuffer, size, 0, raw);
+    return m_ExportBuffer.size();
+}
+
+// Horizon-based ambient occlusion.
+//
+// For each cell, march eight compass directions and record the highest horizon
+// angle each one reaches; openness is the mean of the unoccluded fraction. This
+// is what gives terrain its readability — valleys darken, ridges catch light —
+// and it used to exist only inside the AO exporter, so the viewport shaded
+// everything as though it sat on an open plain.
+//
+// Steps grow geometrically rather than one cell at a time. A linear march
+// needed 48 samples per direction to reach any distance worth sampling, which
+// is ~100M height lookups on a 512 grid — fine once, in an export the user
+// waits for, but far too slow to share with a mesh build. Distant occluders
+// subtend small angles and need no fine sampling, so a geometric ladder covers
+// the same reach in about a dozen samples with no visible difference.
+void TerrainEngine::ComputeAOField() {
+    const int size = m_Params.size;
+    const size_t count = static_cast<size_t>(size) * size;
+    m_AO.assign(count, 1.0f);
+    if (size < 2) return;
+
+    const float pi = 3.14159265358979323846f;
+    static const int dx8[8] = {-1, 1, 0, 0, -1, 1, -1, 1};
+    static const int dy8[8] = {0, 0, -1, 1, -1, -1, 1, 1};
+
+    // Geometric ladder out to a reach that is a fraction of the grid rather
+    // than a fixed cell count.
+    //
+    // What AO should sample is a fixed *world* distance. The terrain spans
+    // size * cellSize world units, so a fixed world reach is by definition a
+    // fixed fraction of the grid — resolving the same terrain more finely then
+    // sweeps the same ground rather than a shrinking sliver of it. The ladder
+    // is geometric, so widening the reach eightfold costs about two extra
+    // samples per direction.
+    const int reach = std::clamp(size / 8, 8, 256);
+    std::vector<int> steps;
+    for (int s = 1; s < size; s = std::max(s + 1, static_cast<int>(s * 1.45f))) {
+        steps.push_back(s);
+        if (s >= reach) break;
+    }
+
+    auto rows = [&](int yBegin, int yEnd) {
+        for (int y = yBegin; y < yEnd; ++y) {
+            for (int x = 0; x < size; ++x) {
+                const float h0 = GetHeight(x, y);
+                float openness = 0.0f;
+                for (int d = 0; d < 8; ++d) {
+                    const float stepLen = (d < 4 ? 1.0f : 1.41421356f) * m_Params.cellSize;
+                    float maxAngle = 0.0f;
+                    for (int s : steps) {
+                        const int px = x + dx8[d] * s;
+                        const int py = y + dy8[d] * s;
+                        if (px < 0 || px >= size || py < 0 || py >= size) break;
+                        const float rise = GetHeight(px, py) - h0;
+                        if (rise <= 0.0f) continue;
+                        maxAngle = std::max(maxAngle, std::atan(rise / (stepLen * s)));
+                    }
+                    openness += 1.0f - maxAngle / (pi * 0.5f);
+                }
+                m_AO[static_cast<size_t>(y) * size + x] =
+                    std::clamp(openness / 8.0f, 0.0f, 1.0f);
+            }
+        }
+    };
+
+#if defined(__EMSCRIPTEN__)
+    rows(0, size);
+#else
+    // Rows are independent and read-only against the heightfield, so the split
+    // cannot change the result.
+    const int bands = std::min(8, size);
+    std::vector<std::future<void>> jobs;
+    jobs.reserve(bands);
+    for (int b = 0; b < bands; ++b) {
+        jobs.push_back(std::async(std::launch::async, rows,
+                                  size * b / bands, size * (b + 1) / bands));
+    }
+    for (auto& j : jobs) j.get();
+#endif
+}
+
+// --- Splatmap, 8-bit RGBA PNG ---------------------------------------------
+// R rock (slope), G normalized height, B flow/wetness, A sediment depth.
+// Channels come from SplatAt, the same function that fills the mesh's vertex
+// colours, so an exported splatmap always matches the shaded viewport.
+
+size_t TerrainEngine::ExportSplatPNG() {
+    const int size = m_Params.size;
+    // Same height span the mesh measures against, so the exported masks still
+    // match the viewport exactly.
+    RefreshSplatRange();
+
+    std::vector<uint8_t> raw;
+    raw.reserve(static_cast<size_t>(size) * (static_cast<size_t>(size) * 4 + 1));
+    for (int y = 0; y < size; ++y) {
+        raw.push_back(0); // filter byte
+        for (int x = 0; x < size; ++x) {
+            float rock, height, flow, sediment;
+            SplatAt(x, y, rock, height, flow, sediment);
+            raw.push_back(static_cast<uint8_t>(std::lround(rock * 255.0f)));
+            raw.push_back(static_cast<uint8_t>(std::lround(height * 255.0f)));
+            raw.push_back(static_cast<uint8_t>(std::lround(flow * 255.0f)));
+            raw.push_back(static_cast<uint8_t>(std::lround(sediment * 255.0f)));
+        }
+    }
+
+    WritePNG8(m_ExportBuffer, size, 6, raw); // colour type 6 = RGBA
     return m_ExportBuffer.size();
 }
 

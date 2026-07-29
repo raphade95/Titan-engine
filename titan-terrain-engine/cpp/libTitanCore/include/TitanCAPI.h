@@ -31,8 +31,27 @@ TITAN_API void titan_destroy(TitanHandle* handle);
 TITAN_API const char* titan_version(void);
 TITAN_API int titan_api_version(void);
 
+// Last error on this thread, or NULL if none. Every entry point catches C++
+// exceptions rather than letting them cross the extern "C" boundary (which is
+// undefined behaviour), records the message here, and returns a benign value.
+// Out-of-memory on a large grid is the common real case.
+TITAN_API const char* titan_last_error(void);
+TITAN_API void titan_clear_error(void);
+
+// Canonical seed-string hash: FNV-1a over UTF-8 bytes.
+//
+// Every host must route user-typed seeds through this rather than
+// reimplementing the hash, so that one seed string means one terrain in the
+// web lab, TitanLab, and the Unreal plugin alike. Pass UTF-8; a NULL pointer
+// returns the FNV offset basis.
+TITAN_API uint32_t titan_hash_seed(const char* utf8);
+
 // Reallocates the terrain and stores generation parameters.
 // noiseType: 0 = none/flat, 1 = standard fBm, 2 = ridged multifractal, 3 = billow.
+//
+// Every parameter is clamped into a safe range before anything is allocated:
+// size to [2, 8192], octaves to [1, 16], non-finite floats to their defaults,
+// and so on. Read them back with titan_size() to see what was actually used.
 TITAN_API void titan_configure(TitanHandle* handle,
                                int size,
                                float cellSize,
@@ -53,8 +72,13 @@ TITAN_API void titan_configure(TitanHandle* handle,
 TITAN_API void titan_generate(TitanHandle* handle);
 
 // spawnMode: 0 = uniform, 1 = altitude-weighted, 2 = precipitation map.
-// Iteration counts round up to whole batches of 2048 droplets; chunked calls
-// with multiples of 16384 are bit-identical to one large call.
+//
+// Iteration counts round up to a whole number of 16384-droplet rounds, so a
+// request for 20000 droplets simulates 32768. A round is the unit that
+// composes: any sequence of calls is now bit-identical to one large call for
+// the same total, whatever the chunking. (This previously rounded to
+// 2048-droplet batches, which made the result depend on how a host sliced the
+// work — the web lab and the desktop apps disagreed for non-multiples.)
 TITAN_API void titan_erode_hydraulic(TitanHandle* handle, int iterations, int spawnMode);
 TITAN_API void titan_erode_thermal(TitanHandle* handle, int passes,
                                    float talusAngleDeg, float rate);
@@ -121,6 +145,65 @@ TITAN_API void titan_compute_water(TitanHandle* handle);
 TITAN_API float* titan_snow_ptr(TitanHandle* handle);
 TITAN_API float* titan_water_ptr(TitanHandle* handle);
 
+// --- v0.7: volcanism ------------------------------------------------------
+
+// Stamps a volcanic edifice and registers its eruption vent. Center and radius
+// are in cells; height is the summit above the local ground in world units.
+//
+// This is not a Dome stamp with different numbers. The profile is concave-up
+// (steepest at the summit, flaring at the base), it carries a jagged summit
+// crater, radial barranca gullies, and a spillway notch cut through the rim —
+// and the flanks union with the terrain while the crater cuts into it, so a
+// volcano dropped on a mountainside merges with it instead of shaving it flat.
+//
+// coneExponent: >1 concave-up (1.75 is a stratovolcano, 1.1 a shield).
+// craterRadius/craterDepth: fractions of radius/height.
+// rimJaggedness, roughness: 0..1.
+// breachAngleDeg: rim spillway bearing; pass < 0 to derive one from the seed.
+//
+// Call it once per volcano. Every vent registered erupts in the next
+// titan_simulate_lava call, so their flows meet and divert each other.
+TITAN_API void titan_apply_volcano(TitanHandle* handle,
+                                   float centerX, float centerY,
+                                   float radius, float height,
+                                   float coneExponent,
+                                   float craterRadius, float craterDepth,
+                                   float rimJaggedness, float roughness,
+                                   float breachAngleDeg, float breachWidthDeg,
+                                   unsigned int seedOffset);
+
+// Runs the cellular lava flow from every registered vent.
+//
+// Lava is modelled as a fluid with a yield strength that rises as it cools:
+// it only moves where its thickness beats a critical value. That is what makes
+// it lava and not water — it piles into lobes, freezes levees along its
+// chilled margins, and self-channelizes into streams that run to the map edge.
+// Chilled lava is folded into the bedrock, so it is real terrain that diverts
+// later flows and appears in every export.
+//
+// viscosity 0..1 (higher = stubbier, thicker flows), sustain non-zero keeps the
+// vent erupting for the whole run rather than releasing one pulse.
+// Iteration is bounded to the region lava has actually reached, so a short flow
+// on a large grid costs what the flow covers, not what the grid holds.
+TITAN_API void titan_simulate_lava(TitanHandle* handle, int steps,
+                                   float eruptionRate, float viscosity,
+                                   float solidifyRate, float coolRate,
+                                   float ventRadius, int sustain);
+
+// Drops molten lava, the chilled-lava record, and every registered vent.
+TITAN_API void titan_clear_lava(TitanHandle* handle);
+
+// Number of vents registered by titan_apply_volcano since the last configure/
+// generate/clear. titan_simulate_lava is a no-op at zero.
+TITAN_API int titan_vent_count(TitanHandle* handle);
+
+// Lava layer buffers (size * size floats). NULL until something erupts —
+// terrain with no volcanism never allocates them.
+TITAN_API float* titan_lava_ptr(TitanHandle* handle);       // molten depth
+TITAN_API float* titan_lava_rock_ptr(TitanHandle* handle);  // chilled record
+TITAN_API float* titan_lava_heat_ptr(TitanHandle* handle);  // 0..1 temperature
+TITAN_API float* titan_lava_glow_ptr(TitanHandle* handle);  // blurred emission
+
 // Full-parameter erosion variants (the short forms use engine defaults).
 TITAN_API void titan_erode_hydraulic_ex(TitanHandle* handle, int iterations,
                                         int spawnMode, float inertia,
@@ -140,19 +223,111 @@ TITAN_API void titan_erode_fluvial_ex(TitanHandle* handle, int iterations,
 TITAN_API void titan_carve(TitanHandle* handle, float x, float y,
                            float radius, float depth);
 
+// --- v0.5: filters, combiner/import, feature masks, derived maps ----------
+// All filters respect the active mask.
+
+// Clamp total height into [minH, maxH].
+TITAN_API void titan_apply_clamp(TitanHandle* handle, float minH, float maxH);
+
+// Vertical scale + offset; invert (non-zero) flips the terrain within its
+// current height range first.
+TITAN_API void titan_apply_transform(TitanHandle* handle, float scaleV,
+                                     float offset, int invert);
+
+// Separable box blur (~gaussian), lerped in by strength 0..1.
+TITAN_API void titan_apply_blur(TitanHandle* handle, float radius, float strength);
+
+// Unsharp mask: h + (h - blur(h)) * strength.
+TITAN_API void titan_apply_sharpen(TitanHandle* handle, float radius, float strength);
+
+// Custom transfer curve over the terrain's own height range. xs/ys are
+// `count` control points in [0,1], sorted by x (monotone cubic).
+TITAN_API void titan_apply_curve(TitanHandle* handle, const float* xs,
+                                 const float* ys, int count);
+
+// General combiner / heightfield import: resamples a srcSize x srcSize
+// float field to the terrain grid, scales samples by heightScale, and
+// blends (blendMode as titan_apply_noise; alpha for Mix). Import = clear
+// terrain, then apply with blendMode 0 (add).
+TITAN_API void titan_apply_heightfield(TitanHandle* handle, const float* data,
+                                       int srcSize, float heightScale,
+                                       int blendMode, float alpha);
+
+// Derived maps rasterized into scratch (read via titan_scratch_ptr).
+TITAN_API void titan_compute_slope_map(TitanHandle* handle);     // rise/run
+TITAN_API void titan_compute_curvature_map(TitanHandle* handle); // Laplacian
+
+// Horizon-based ambient occlusion into a persistent field (0 = fully occluded,
+// 1 = open sky), read via titan_ao_ptr and carried into the mesh's surface
+// attribute. The AO exporter uses the same field, so a viewport and an export
+// agree.
+//
+// This is the engine's most expensive derived map, so it is explicit rather
+// than automatic: call it once after the layer stack settles, then rebuild the
+// mesh. Without it the mesh's AO channel is 1.0 everywhere and the terrain
+// shades as though it sat on an open plain.
+TITAN_API void titan_compute_ao(TitanHandle* handle);
+TITAN_API float* titan_ao_ptr(TitanHandle* handle); // NULL until computed
+
+// Feature mask into scratch. feature: 0 height (normalized), 1 slope
+// (angle/90), 2 curvature (0.5 = flat, >0.5 concave). Soft band
+// [rangeLo, rangeHi] with `softness` edge width; invert flips.
+TITAN_API void titan_mask_by_feature(TitanHandle* handle, int feature,
+                                     float rangeLo, float rangeHi,
+                                     float softness, int invert);
+
+// Fractal noise field (0..1) into scratch — for noise-driven masks.
+TITAN_API void titan_noise_to_mask(TitanHandle* handle, unsigned int seedOffset,
+                                   int noiseType, float scale, int octaves,
+                                   float persistence, float lacunarity,
+                                   float warpStrength);
+
+// Promote the scratch buffer (clamped 0..1) to the active mask.
+// Applies MaskByFeature's soft band to whatever is in scratch. Hosts use this
+// after titan_noise_to_mask instead of reimplementing the curve — it used to
+// exist in C++, TypeScript and Swift simultaneously.
+TITAN_API void titan_band_scratch(TitanHandle* handle, float lo, float hi,
+                                  float softness, int invert);
+
+TITAN_API void titan_set_mask_from_scratch(TitanHandle* handle);
+
 // Exporters: each returns the byte size and fills an internal buffer read
 // via titan_export_data_ptr. Formats: png16 (16-bit grayscale PNG), r16
 // (RAW uint16 LE, normalized), r32 (RAW float32 LE, absolute), exr
 // (uncompressed float RGB), obj (Wavefront mesh).
-TITAN_API int titan_export_png16(TitanHandle* handle);
-TITAN_API int titan_export_r16(TitanHandle* handle);
-TITAN_API int titan_export_r32(TitanHandle* handle);
-TITAN_API int titan_export_exr(TitanHandle* handle);
-TITAN_API int titan_export_obj(TitanHandle* handle);
+// Exports return the byte length of the buffer at titan_export_data_ptr, or 0
+// on failure (check titan_last_error). int64 because a full-resolution OBJ of
+// a large grid exceeds 2 GB.
+TITAN_API int64_t titan_export_png16(TitanHandle* handle);
+TITAN_API int64_t titan_export_r16(TitanHandle* handle);
+TITAN_API int64_t titan_export_r32(TitanHandle* handle);
+TITAN_API int64_t titan_export_exr(TitanHandle* handle);
+TITAN_API int64_t titan_export_obj(TitanHandle* handle);
+// normal_png: 8-bit RGB world-space normals (R=+X east, G=+Y south, B=+Z up).
+// ao_png: 8-bit grayscale horizon-based ambient occlusion.
+TITAN_API int64_t titan_export_normal_png(TitanHandle* handle);
+TITAN_API int64_t titan_export_ao_png(TitanHandle* handle);
 TITAN_API const uint8_t* titan_export_data_ptr(TitanHandle* handle);
 
 // Raw layer buffers (size * size floats, row-major).
 TITAN_API int titan_size(TitanHandle* handle);
+
+// Actual min/max of the current surface, in world height units.
+//
+// This is NOT [0, heightMultiplier] once a layer stack has run — erosion
+// lowers peaks, fluvial carries material off the map, and clamp/plateau/
+// transform move both ends. The normalizing exporters (PNG16, R16) stretch to
+// exactly this range, so a host must report it for users to set a correct Z
+// scale on import. Either pointer may be NULL.
+TITAN_API void titan_height_range(TitanHandle* handle, float* outMin, float* outMax);
+
+// Mass accounting for hydraulic erosion, summed over cells in world height
+// units. `exported` is material droplets carried off the map (a real export to
+// the sea, not a leak); `created` is the small amount conjured when two
+// droplet batches in a round over-draw the same cell against the shared
+// snapshot and the sediment floor clips the result. Reset by configure/
+// generate/clear. Either pointer may be NULL.
+TITAN_API void titan_mass_balance(TitanHandle* handle, double* exported, double* created);
 TITAN_API float* titan_bedrock_ptr(TitanHandle* handle);
 TITAN_API float* titan_sediment_ptr(TitanHandle* handle);
 TITAN_API float* titan_flow_ptr(TitanHandle* handle);
@@ -167,6 +342,17 @@ TITAN_API float titan_slope_at(TitanHandle* handle, int x, int y);
 // positions/normals: vertexCount * 3 floats. colors: vertexCount * 4.
 // uvs: vertexCount * 2. indices: indexCount uint32.
 TITAN_API void titan_build_mesh(TitanHandle* handle);
+
+// Builds a decimated preview mesh with at most `maxEdgeVertices` vertices per
+// edge, so simulation resolution and preview cost are independent. Pass 0 for
+// full resolution. Exports always use the full-resolution field regardless.
+TITAN_API void titan_build_mesh_lod(TitanHandle* handle, int maxEdgeVertices);
+TITAN_API int titan_mesh_stride(TitanHandle* handle);
+TITAN_API int titan_mesh_edge_vertices(TitanHandle* handle);
+
+// 8-bit RGBA splatmap PNG: R rock, G height, B flow, A sediment. Uses the same
+// channel computation as the mesh vertex colours, so it matches the viewport.
+TITAN_API int64_t titan_export_splat_png(TitanHandle* handle);
 TITAN_API int titan_mesh_vertex_count(TitanHandle* handle);
 TITAN_API int titan_mesh_index_count(TitanHandle* handle);
 TITAN_API float* titan_mesh_positions_ptr(TitanHandle* handle);
@@ -174,4 +360,13 @@ TITAN_API float* titan_mesh_normals_ptr(TitanHandle* handle);
 TITAN_API float* titan_mesh_colors_ptr(TitanHandle* handle);
 TITAN_API float* titan_mesh_uvs_ptr(TitanHandle* handle);
 TITAN_API float* titan_mesh_snow_ptr(TitanHandle* handle); // vertexCount floats
+// vertexCount * 4 floats: molten depth, heat 0..1, chilled-rock depth, glow.
+// All zero when the terrain has no volcanism, so hosts can bind it
+// unconditionally.
+TITAN_API float* titan_mesh_lava_ptr(TitanHandle* handle);
+// vertexCount * 4 floats: ambient occlusion, curvature (0.5 = flat, >0.5
+// concave), snow depth, water depth. The engine simulates all four; before
+// this existed the viewports faked snow from a height threshold and could not
+// show lakes at all.
+TITAN_API float* titan_mesh_surface_ptr(TitanHandle* handle);
 TITAN_API uint32_t* titan_mesh_indices_ptr(TitanHandle* handle);

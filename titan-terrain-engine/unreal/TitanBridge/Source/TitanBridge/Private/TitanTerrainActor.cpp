@@ -2,20 +2,23 @@
 
 #include "Async/Async.h"
 #include "ProceduralMeshComponent.h"
+#include "TitanBridgeModule.h"
 #include "TitanCAPI.h"
 
 namespace
 {
-// FNV-1a — identical to TitanLab and the web lab, so seeds are portable.
+// Seed-string hash, computed by libTitanCore.
+//
+// Deliberately delegates to the engine rather than reimplementing FNV-1a.
+// This plugin used to hash TCHARs truncated to their low byte, TitanLab
+// hashed UTF-8 bytes, and the web lab hashed UTF-16 code units — three
+// "identical" hashes that agreed only on ASCII, so a seed containing an
+// accent or an emoji produced three different terrains across the three
+// products. titan_hash_seed is the single definition; feed it UTF-8.
 uint32 HashSeed(const FString& Seed)
 {
-    uint32 H = 0x811c9dc5u;
-    for (TCHAR C : Seed)
-    {
-        H ^= static_cast<uint32>(C) & 0xFFu;
-        H *= 0x01000193u;
-    }
-    return H;
+    const FTCHARToUTF8 Utf8(*Seed);
+    return titan_hash_seed(Utf8.Get());
 }
 } // namespace
 
@@ -61,6 +64,13 @@ void ATitanTerrainActor::FinalizeCollision()
 
 void ATitanTerrainActor::RunGeneration(bool bWithCollision)
 {
+    // Refuse to generate against a mismatched engine binary rather than emit
+    // terrain from an ABI we cannot trust. StartupModule logs the detail.
+    if (!FTitanBridgeModule::IsEngineUsable())
+    {
+        return;
+    }
+
     const int32 MyGeneration = ++GenerationCounter;
 
     // Snapshot all settings; the worker touches no UObject state.

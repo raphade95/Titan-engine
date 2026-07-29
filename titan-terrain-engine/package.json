@@ -11,7 +11,10 @@
     "clean": "rm -rf dist",
     "lint": "tsc --noEmit",
     "build:wasm": "cpp/build_wasm.sh",
-    "test:core": "cd cpp && cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build && ./build/titan_tests"
+    "test:core": "cd cpp && cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build && ./build/titan_tests",
+    "test:golden": "cd cpp && cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build && ./build/titan_golden",
+    "test:mutation": "cpp/tools/mutation_test.sh",
+    "test:wasm": "node cpp/tools/wasm_golden.mjs"
   },
   "dependencies": {
     "@base-ui/react": "^1.4.0",

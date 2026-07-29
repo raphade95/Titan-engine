@@ -25,10 +25,17 @@ namespace Titan {
 
 namespace {
 
-// Removes up to `amount` from base+delta with a linear-falloff brush,
-// clamped so base+delta never goes negative. Returns the amount taken.
+// Removes up to `amount` from base+delta with a linear-falloff brush.
+// Returns the amount actually taken.
+//
+// `floorAtZero` distinguishes the two layers: sediment is a deposit, so a
+// brush can take no more than is there, while bedrock is an elevation that
+// may legitimately be cut below the zero datum (a river carving a gorge below
+// sea level). The erosion amount is separately bounded by the local drop, so
+// unfloored bedrock removal is still self-limiting.
 float BrushTake(const std::vector<float>& base, std::vector<float>& delta,
-                int size, float x, float y, float amount, float radius) {
+                int size, float x, float y, float amount, float radius,
+                bool floorAtZero) {
     radius = std::min(radius, 15.0f);
     const int centerX = static_cast<int>(std::floor(x));
     const int centerY = static_cast<int>(std::floor(y));
@@ -58,8 +65,9 @@ float BrushTake(const std::vector<float>& base, std::vector<float>& delta,
     float taken = 0.0f;
     for (int k = 0; k < count; ++k) {
         const float want = amount * (samples[k].w / weightSum);
-        const float have = std::max(0.0f, base[samples[k].idx] + delta[samples[k].idx]);
-        const float take = std::min(want, have);
+        const float take = floorAtZero
+            ? std::min(want, std::max(0.0f, base[samples[k].idx] + delta[samples[k].idx]))
+            : want;
         delta[samples[k].idx] -= take;
         taken += take;
     }
@@ -106,7 +114,8 @@ float SampleWithDelta(const std::vector<float>& base, const std::vector<float>& 
 void TerrainEngine::RunDropletBatch(uint64_t firstDroplet, int count, const HydraulicParams& p,
                                     std::vector<float>& sedimentDelta,
                                     std::vector<float>& bedrockDelta,
-                                    std::vector<float>& flowDelta) const {
+                                    std::vector<float>& flowDelta,
+                                    double& exported) const {
     const int size = m_Params.size;
     const float maxCoord = static_cast<float>(size) - 1.001f;
     const auto spawnMode = static_cast<SpawnMode>(p.spawnMode);
@@ -114,8 +123,8 @@ void TerrainEngine::RunDropletBatch(uint64_t firstDroplet, int count, const Hydr
 
     for (int d = 0; d < count; ++d) {
         // Per-droplet RNG stream: depends only on seed + global index.
-        uint64_t state = (static_cast<uint64_t>(m_Params.seed) << 20) ^ (firstDroplet + d);
-        Pcg32 rng(SplitMix64(state), SplitMix64(state));
+        // MakeRng pins down the seeding order; see TitanRandom.h.
+        Pcg32 rng = MakeRng((static_cast<uint64_t>(m_Params.seed) << 20) ^ (firstDroplet + d));
 
         float posX = rng.NextFloat() * maxCoord;
         float posY = rng.NextFloat() * maxCoord;
@@ -165,7 +174,15 @@ void TerrainEngine::RunDropletBatch(uint64_t firstDroplet, int count, const Hydr
             posX += dirX;
             posY += dirY;
 
-            if (posX < 0.0f || posX >= maxCoord || posY < 0.0f || posY >= maxCoord) break;
+            if (posX < 0.0f || posX >= maxCoord || posY < 0.0f || posY >= maxCoord) {
+                // The droplet leaves the map still carrying its load. That
+                // material has genuinely left the system (transported to the
+                // sea), so it is recorded rather than silently vanishing —
+                // the mass-conservation test balances against it.
+                exported += static_cast<double>(sediment);
+                sediment = 0.0f;
+                break;
+            }
 
             const float newHeight = SampleHeight(posX, posY);
             const float oldHeight = SampleHeight(oldPosX, oldPosY);
@@ -191,15 +208,18 @@ void TerrainEngine::RunDropletBatch(uint64_t firstDroplet, int count, const Hydr
 
                 if (sedimentHere >= amountToErode) {
                     sediment += BrushTake(m_Sediment, sedimentDelta, size,
-                                          oldPosX, oldPosY, amountToErode, p.erosionRadius);
+                                          oldPosX, oldPosY, amountToErode,
+                                          p.erosionRadius, true);
                 } else {
                     const float hardness = HardnessAt(oldHeight);
                     const float bedrockDemand = (amountToErode - sedimentHere)
                         * (p.bedrockErosionSpeed / hardness);
                     sediment += BrushTake(m_Sediment, sedimentDelta, size,
-                                          oldPosX, oldPosY, sedimentHere, p.erosionRadius);
+                                          oldPosX, oldPosY, sedimentHere,
+                                          p.erosionRadius, true);
                     sediment += BrushTake(m_Bedrock, bedrockDelta, size,
-                                          oldPosX, oldPosY, bedrockDemand, p.erosionRadius);
+                                          oldPosX, oldPosY, bedrockDemand,
+                                          p.erosionRadius, false);
                 }
             }
 
@@ -212,6 +232,9 @@ void TerrainEngine::RunDropletBatch(uint64_t firstDroplet, int count, const Hydr
 
             if (speed == 0.0f) break;
         }
+        // Whatever a droplet still carries when it stalls or times out also
+        // leaves the system.
+        exported += static_cast<double>(sediment);
     }
 }
 
@@ -220,12 +243,23 @@ void TerrainEngine::ApplyHydraulicErosion(int iterations, const HydraulicParams&
     if (size < 2 || iterations <= 0) return;
     const size_t cellCount = static_cast<size_t>(size) * size;
 
-    // Round up to whole batches — part of the determinism contract.
-    const int batchCount = (iterations + kDropletBatch - 1) / kDropletBatch;
+    // Round up to a whole number of *rounds*, not merely whole batches.
+    //
+    // Batches inside a round share one terrain snapshot, so a round is the
+    // real unit of work: only a whole number of rounds composes. Rounding to
+    // batches instead made the outcome depend on how the caller happened to
+    // slice the work — the web lab streams progress in 16384-droplet rounds
+    // while TitanLab and the Unreal plugin pass the count in one call, so a
+    // request for 20000 droplets simulated 32768 on the web and 20480 on the
+    // desktop. Same project file, different terrain. Rounding here makes any
+    // sequence of calls equivalent to one large call, unconditionally.
+    const int rounds = (iterations + kDropletsPerRound - 1) / kDropletsPerRound;
+    const int batchCount = rounds * kBatchesPerRound;
 
     // Per-batch delta buffers for one round.
     struct BatchDeltas {
         std::vector<float> sediment, bedrock, flow;
+        double exported = 0.0;
     };
     std::vector<BatchDeltas> deltas(kBatchesPerRound);
     for (auto& b : deltas) {
@@ -243,9 +277,11 @@ void TerrainEngine::ApplyHydraulicErosion(int iterations, const HydraulicParams&
             std::fill(d.sediment.begin(), d.sediment.end(), 0.0f);
             std::fill(d.bedrock.begin(), d.bedrock.end(), 0.0f);
             std::fill(d.flow.begin(), d.flow.end(), 0.0f);
+            d.exported = 0.0;
             const uint64_t first = m_DropletCursor
                 + static_cast<uint64_t>(processed + b) * kDropletBatch;
-            RunDropletBatch(first, kDropletBatch, p, d.sediment, d.bedrock, d.flow);
+            RunDropletBatch(first, kDropletBatch, p, d.sediment, d.bedrock, d.flow,
+                            d.exported);
         };
 
 #if defined(__EMSCRIPTEN__)
@@ -261,13 +297,21 @@ void TerrainEngine::ApplyHydraulicErosion(int iterations, const HydraulicParams&
         }
 #endif
 
-        // Merge in fixed batch order; clamp layers at zero (two batches can
-        // both take from the same cell against the shared snapshot).
+        // Merge in fixed batch order.
         for (int b = 0; b < inRound; ++b) {
             const auto& d = deltas[b];
+            m_MassExported += d.exported;
             for (size_t i = 0; i < cellCount; ++i) {
-                m_Sediment[i] = std::max(0.0f, m_Sediment[i] + d.sediment[i]);
-                m_Bedrock[i] = std::max(0.0f, m_Bedrock[i] + d.bedrock[i]);
+                // Sediment is a deposit and floors at zero. That floor is the
+                // one place hydraulic erosion can create mass: two batches in
+                // a round can both draw from the same cell against the shared
+                // snapshot, between them asking for more than was there. The
+                // excess is recorded so the conservation test can bound it
+                // rather than have it silently inflate the terrain.
+                const float wantSed = m_Sediment[i] + d.sediment[i];
+                if (wantSed < 0.0f) m_MassCreated += -static_cast<double>(wantSed);
+                m_Sediment[i] = std::max(0.0f, wantSed);
+                m_Bedrock[i] += d.bedrock[i];
                 m_Flow[i] += d.flow[i];
             }
         }
@@ -360,7 +404,11 @@ void TerrainEngine::ApplyThermalWeathering(int passes, const ThermalParams& p) {
 
         for (size_t i = 0; i < count; ++i) {
             m_Bedrock[i] += bedrockDelta[i];
-            m_Sediment[i] += sedimentDelta[i];
+            // toMove never exceeds the sediment present, but the delta also
+            // carries incoming material and the bedrock breakdown, and summing
+            // those in float can land a cell a few 1e-9 below zero. Sediment
+            // is a deposit; hold the invariant rather than leave dust behind.
+            m_Sediment[i] = std::max(0.0f, m_Sediment[i] + sedimentDelta[i]);
         }
     }
 }

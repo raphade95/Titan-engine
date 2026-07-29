@@ -6,9 +6,14 @@ namespace Titan {
 
 enum class NoiseType : int {
     None = 0,
-    Standard = 1, // fBm simplex
-    Ridged = 2,   // Musgrave ridged multifractal
-    Billow = 3
+    Standard = 1,        // fBm simplex
+    Ridged = 2,          // Musgrave ridged multifractal
+    Billow = 3,
+    Voronoi = 4,         // fractal cellular F1 (plateau cells), euclidean
+    VoronoiRidge = 5,    // fractal cellular F2-F1 (ridged cell walls)
+    WorleyManhattan = 6, // cellular F1 with manhattan distance (blocky cells)
+    WorleyChebyshev = 7, // cellular F1 with chebyshev distance (square cells)
+    HybridMulti = 8      // Musgrave hybrid multifractal (smooth valleys, rough peaks)
 };
 
 // 2D simplex noise (Gustavson variant) with a permutation table shuffled by a
@@ -54,11 +59,14 @@ private:
     float SampleStandard(float x, float y) const;
     float SampleBillow(float x, float y) const;
     float SampleRidged(float x, float y) const;
+    float SampleVoronoi(float x, float y, bool ridge, int metric) const;
+    float SampleHybrid(float x, float y) const;
 
     SimplexNoise m_Base;
     SimplexNoise m_WarpX;
     SimplexNoise m_WarpY;
     FractalParams m_Params;
+    uint64_t m_CellSeed;
 };
 
 } // namespace Titan

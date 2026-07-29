@@ -1,7 +1,8 @@
-// Metal renderer: MTKView with orbit/zoom input, plus the MTKViewDelegate
-// that owns pipeline state and mesh buffers. Triple-buffer-safe by
-// replacing buffers wholesale on mesh updates (small meshes; simplicity
-// beats cleverness at this stage).
+// Metal renderer: MTKView with orbit/zoom/picking input, plus the
+// MTKViewDelegate that owns pipeline state and mesh buffers. Draw order:
+// terrain (opaque, optional wireframe) -> flora (instanced) -> grid lines ->
+// water plane (translucent). Buffers are replaced wholesale on updates —
+// small meshes; simplicity beats cleverness at this stage.
 
 import AppKit
 import Metal
@@ -13,6 +14,19 @@ struct Uniforms {
     var sunDirAndIntensity: SIMD4<Float>
     var cameraPosAndFog: SIMD4<Float>
     var skyColorAndTime: SIMD4<Float>
+    var misc: SIMD4<Float> // x biome, y sea level, z height scale
+}
+
+// Viewer-side settings pushed from the SwiftUI model on every update.
+struct RenderSettings {
+    var sunElevation: Float = 45
+    var sunAzimuth: Float = 45
+    var sunIntensity: Float = 1.4
+    var fogDensity: Float = 0.002
+    var seaLevel: Float = -10
+    var biome: Int = 1
+    var wireframe = false
+    var showGrid = true
 }
 
 final class OrbitCamera {
@@ -48,26 +62,149 @@ final class OrbitCamera {
 final class TerrainMTKView: MTKView {
     let camera = OrbitCamera()
 
+    // Picking state — set by the SwiftUI layer.
+    var inspectEnabled = false
+    var carveEnabled = false
+    var volcanoPlaceEnabled = false
+    var terrainSize = 128
+    var heightAt: ((Int, Int) -> Float)?
+    var onProbe: ((Int, Int) -> Void)?
+    var onProbeMiss: (() -> Void)?
+    var onCarve: ((Int, Int) -> Void)?
+    var onPlaceVolcano: ((Int, Int) -> Void)?
+    var onDragVolcano: ((Int, Int) -> Void)?
+
+    // Last cell a drag reported, so moving the mouse within one cell does not
+    // re-run the whole layer stack.
+    private var lastVolcanoCell: (Int, Int)?
+
+    private var trackingArea: NSTrackingArea?
+
     override var acceptsFirstResponder: Bool { true }
 
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let trackingArea { removeTrackingArea(trackingArea) }
+        let area = NSTrackingArea(rect: bounds,
+                                  options: [.mouseMoved, .activeInKeyWindow, .inVisibleRect],
+                                  owner: self, userInfo: nil)
+        addTrackingArea(area)
+        trackingArea = area
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        guard inspectEnabled || carveEnabled else { return }
+        if let hit = raycastTerrain(event) {
+            onProbe?(hit.0, hit.1)
+        } else {
+            onProbeMiss?()
+        }
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        if volcanoPlaceEnabled {
+            if let hit = raycastTerrain(event) {
+                lastVolcanoCell = hit
+                onPlaceVolcano?(hit.0, hit.1)
+            }
+            return
+        }
+        if carveEnabled, let hit = raycastTerrain(event) {
+            onCarve?(hit.0, hit.1)
+        }
+    }
+
     override func mouseDragged(with event: NSEvent) {
+        if volcanoPlaceEnabled {
+            // Dragging repositions the cone just dropped rather than orbiting.
+            guard let hit = raycastTerrain(event) else { return }
+            if let last = lastVolcanoCell, last == hit { return }
+            lastVolcanoCell = hit
+            onDragVolcano?(hit.0, hit.1)
+            return
+        }
+        if carveEnabled {
+            if let hit = raycastTerrain(event) { onCarve?(hit.0, hit.1) }
+            return
+        }
         camera.orbit(dx: Float(event.deltaX), dy: Float(event.deltaY))
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        lastVolcanoCell = nil
     }
 
     override func scrollWheel(with event: NSEvent) {
         camera.zoom(Float(event.scrollingDeltaY) * 0.1)
+    }
+
+    // Ray-march from the camera through the mouse position until the ray dips
+    // below the heightfield. Grid coordinates on hit; nil on miss.
+    private func raycastTerrain(_ event: NSEvent) -> (Int, Int)? {
+        guard let heightAt, bounds.width > 1, bounds.height > 1 else { return nil }
+        let loc = convert(event.locationInWindow, from: nil)
+        let ndcX = Float(loc.x / bounds.width) * 2 - 1
+        let ndcY = Float(loc.y / bounds.height) * 2 - 1
+
+        let aspect = Float(bounds.width / max(bounds.height, 1))
+        let invVP = camera.viewProjection(aspect: aspect).inverse
+
+        func unproject(_ z: Float) -> SIMD3<Float> {
+            let clip = SIMD4<Float>(ndcX, ndcY, z, 1)
+            let world = invVP * clip
+            return SIMD3<Float>(world.x, world.y, world.z) / world.w
+        }
+        let origin = unproject(0)
+        let dir = simd_normalize(unproject(1) - origin)
+
+        let half = Float(terrainSize) * 0.5
+        var t: Float = 0
+        while t < 2000 {
+            let p = origin + dir * t
+            let gx = p.x + half
+            let gy = p.z + half
+            if gx >= 0, gx < Float(terrainSize), gy >= 0, gy < Float(terrainSize) {
+                if p.y <= heightAt(Int(gx), Int(gy)) {
+                    return (Int(gx), Int(gy))
+                }
+            }
+            // Coarse march far away, fine near the surface band.
+            t += p.y > 200 ? 4.0 : 0.75
+        }
+        return nil
     }
 }
 
 final class TerrainRenderer: NSObject, MTKViewDelegate {
     private let device: MTLDevice
     private let commandQueue: MTLCommandQueue
-    private var pipeline: MTLRenderPipelineState?
+    private var terrainPipeline: MTLRenderPipelineState?
+    private var flatPipeline: MTLRenderPipelineState?
+    private var waterPipeline: MTLRenderPipelineState?
+    private var floraPipeline: MTLRenderPipelineState?
     private var depthState: MTLDepthStencilState?
+    private var depthStateNoWrite: MTLDepthStencilState?
 
     private var vertexBuffer: MTLBuffer?
     private var indexBuffer: MTLBuffer?
     private var indexCount = 0
+    // Height scale of the current mesh, pushed to the shader so strata
+    // banding keeps a constant band count at any Height setting.
+    private var terrainHeightMax: Float = 1
+    // World extent of the terrain, so haze reads the same at any resolution.
+    private var terrainExtent: Float = 128
+
+    private var gridBuffer: MTLBuffer?
+    private var gridVertexCount = 0
+    private var waterBuffer: MTLBuffer?
+    private var waterVertexCount = 0
+    private var floraVertexBuffer: MTLBuffer?
+    private var floraVertexCount = 0
+    private var floraInstanceBuffer: MTLBuffer?
+    private var floraInstanceCount = 0
+    private var floraColor = SIMD4<Float>(0.10, 0.20, 0.0, 1)
+
+    var settings = RenderSettings()
 
     private let skyColor = SIMD3<Float>(0.53, 0.81, 0.92)
     private let startTime = Date()
@@ -90,12 +227,31 @@ final class TerrainRenderer: NSObject, MTKViewDelegate {
 
         do {
             let library = try device.makeLibrary(source: titanShaderSource, options: nil)
-            let desc = MTLRenderPipelineDescriptor()
-            desc.vertexFunction = library.makeFunction(name: "terrain_vertex")
-            desc.fragmentFunction = library.makeFunction(name: "terrain_fragment")
-            desc.colorAttachments[0].pixelFormat = view.colorPixelFormat
-            desc.depthAttachmentPixelFormat = view.depthStencilPixelFormat
-            pipeline = try device.makeRenderPipelineState(descriptor: desc)
+
+            func pipeline(_ vertexFn: String, _ fragmentFn: String,
+                          blending: Bool = false) throws -> MTLRenderPipelineState {
+                let desc = MTLRenderPipelineDescriptor()
+                desc.vertexFunction = library.makeFunction(name: vertexFn)
+                desc.fragmentFunction = library.makeFunction(name: fragmentFn)
+                desc.colorAttachments[0].pixelFormat = view.colorPixelFormat
+                desc.depthAttachmentPixelFormat = view.depthStencilPixelFormat
+                if blending {
+                    let att = desc.colorAttachments[0]!
+                    att.isBlendingEnabled = true
+                    att.rgbBlendOperation = .add
+                    att.alphaBlendOperation = .add
+                    att.sourceRGBBlendFactor = .sourceAlpha
+                    att.destinationRGBBlendFactor = .oneMinusSourceAlpha
+                    att.sourceAlphaBlendFactor = .one
+                    att.destinationAlphaBlendFactor = .oneMinusSourceAlpha
+                }
+                return try device.makeRenderPipelineState(descriptor: desc)
+            }
+
+            terrainPipeline = try pipeline("terrain_vertex", "terrain_fragment")
+            flatPipeline = try pipeline("flat_vertex", "flat_fragment")
+            waterPipeline = try pipeline("water_vertex", "water_fragment", blending: true)
+            floraPipeline = try pipeline("flora_vertex", "flora_fragment")
         } catch {
             NSLog("TitanLab: shader compilation failed: \(error)")
             return nil
@@ -105,6 +261,12 @@ final class TerrainRenderer: NSObject, MTKViewDelegate {
         depthDesc.depthCompareFunction = .less
         depthDesc.isDepthWriteEnabled = true
         depthState = device.makeDepthStencilState(descriptor: depthDesc)
+        depthDesc.isDepthWriteEnabled = false
+        depthStateNoWrite = device.makeDepthStencilState(descriptor: depthDesc)
+
+        buildGrid()
+        buildWaterPlane()
+        buildFloraMesh()
     }
 
     func setMesh(_ mesh: MeshSnapshot) {
@@ -116,37 +278,186 @@ final class TerrainRenderer: NSObject, MTKViewDelegate {
                                         length: mesh.indices.count * MemoryLayout<UInt32>.size,
                                         options: .storageModeShared)
         indexCount = mesh.indices.count
+        terrainHeightMax = max(1, mesh.heightMax)
+        terrainExtent = max(1, mesh.terrainExtent)
         view?.camera.target = SIMD3<Float>(0, mesh.heightMax * 0.25, 0)
+        view?.terrainSize = Int(mesh.terrainExtent)
     }
+
+    // Flora colors per biome: arctic, temperate, volcanic, desert.
+    private static let floraColors: [SIMD4<Float>] = [
+        SIMD4<Float>(0.18, 0.31, 0.31, 1),
+        SIMD4<Float>(0.10, 0.20, 0.00, 1),
+        SIMD4<Float>(0.20, 0.13, 0.07, 1),
+        SIMD4<Float>(0.18, 0.35, 0.15, 1),
+    ]
+
+    func setFlora(_ instances: [FloraInstance], biome: Int) {
+        floraColor = Self.floraColors[min(max(biome, 0), 3)]
+        floraInstanceCount = instances.count
+        guard !instances.isEmpty else {
+            floraInstanceBuffer = nil
+            return
+        }
+        floraInstanceBuffer = device.makeBuffer(
+            bytes: instances,
+            length: instances.count * MemoryLayout<FloraInstance>.stride,
+            options: .storageModeShared)
+    }
+
+    // MARK: - Static geometry
+
+    private func buildGrid() {
+        // 200x200 world units, 20 divisions — same as the web grid helper.
+        var verts: [Float] = []
+        let half: Float = 100
+        let step: Float = 10
+        var x = -half
+        while x <= half {
+            verts += [x, -0.1, -half, x, -0.1, half]
+            verts += [-half, -0.1, x, half, -0.1, x]
+            x += step
+        }
+        gridVertexCount = verts.count / 3
+        gridBuffer = device.makeBuffer(bytes: verts, length: verts.count * 4,
+                                       options: .storageModeShared)
+    }
+
+    private func buildWaterPlane() {
+        // Tessellated grid centred on the origin; the shader lifts it to sea
+        // level and displaces it into swell.
+        //
+        // This used to be two triangles. The vertex shader has always computed
+        // a wave displacement, but with only the four corners to displace,
+        // every ripple was interpolated flat across the entire ocean and none
+        // of it was ever visible.
+        let half: Float = 2000
+        let segments = 160
+        let step = (half * 2) / Float(segments)
+        var verts: [Float] = []
+        verts.reserveCapacity(segments * segments * 18)
+        for j in 0..<segments {
+            for i in 0..<segments {
+                let x0 = -half + Float(i) * step, x1 = x0 + step
+                let z0 = -half + Float(j) * step, z1 = z0 + step
+                verts += [x0, 0, z0,  x1, 0, z0,  x1, 0, z1]
+                verts += [x0, 0, z0,  x1, 0, z1,  x0, 0, z1]
+            }
+        }
+        waterVertexCount = verts.count / 3
+        waterBuffer = device.makeBuffer(bytes: verts, length: verts.count * 4,
+                                        options: .storageModeShared)
+    }
+
+    private func buildFloraMesh() {
+        // Unit cone: base ring at y=0 (radius 0.4), apex at y=1.5 — roughly
+        // the web lab's conifer proportions before per-instance scaling.
+        let segments = 6
+        let radius: Float = 0.4
+        let height: Float = 1.5
+        var verts: [Float] = [] // pos3 + normal3
+
+        let slopeY = radius / height
+        for s in 0..<segments {
+            let a0 = Float(s) / Float(segments) * 2 * .pi
+            let a1 = Float(s + 1) / Float(segments) * 2 * .pi
+            let p0 = SIMD3<Float>(cos(a0) * radius, 0, sin(a0) * radius)
+            let p1 = SIMD3<Float>(cos(a1) * radius, 0, sin(a1) * radius)
+            let apex = SIMD3<Float>(0, height, 0)
+            let n0 = simd_normalize(SIMD3<Float>(cos(a0), slopeY, sin(a0)))
+            let n1 = simd_normalize(SIMD3<Float>(cos(a1), slopeY, sin(a1)))
+            let na = simd_normalize(n0 + n1)
+            verts += [p0.x, p0.y, p0.z, n0.x, n0.y, n0.z]
+            verts += [apex.x, apex.y, apex.z, na.x, na.y, na.z]
+            verts += [p1.x, p1.y, p1.z, n1.x, n1.y, n1.z]
+        }
+        floraVertexCount = verts.count / 6
+        floraVertexBuffer = device.makeBuffer(bytes: verts, length: verts.count * 4,
+                                              options: .storageModeShared)
+    }
+
+    // MARK: - Frame
 
     func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {}
 
     func draw(in view: MTKView) {
         guard let terrainView = view as? TerrainMTKView,
-              let pipeline,
+              let terrainPipeline,
               let descriptor = view.currentRenderPassDescriptor,
               let drawable = view.currentDrawable,
-              let commandBuffer = commandQueue.makeCommandBuffer(),
-              let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: descriptor) else { return }
+              let commandBuffer = commandQueue.makeCommandBuffer() else { return }
 
+        // Sun + sky from settings (same spherical mapping as the web lab).
+        let phi = (90 - settings.sunElevation) * .pi / 180
+        let theta = settings.sunAzimuth * .pi / 180
+        let sunDir = SIMD3<Float>(sin(phi) * sin(theta), cos(phi), sin(phi) * cos(theta))
+        let skyFactor = max(0.1, settings.sunElevation / 90)
+        let sky = skyColor * skyFactor
+        view.clearColor = MTLClearColor(red: Double(sky.x), green: Double(sky.y),
+                                        blue: Double(sky.z), alpha: 1)
+
+        guard let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: descriptor) else { return }
+
+        let aspect = Float(view.drawableSize.width / max(view.drawableSize.height, 1))
+        let camera = terrainView.camera
+        var uniforms = Uniforms(
+            mvp: camera.viewProjection(aspect: aspect),
+            sunDirAndIntensity: SIMD4<Float>(sunDir, settings.sunIntensity),
+            cameraPosAndFog: SIMD4<Float>(camera.position, settings.fogDensity),
+            skyColorAndTime: SIMD4<Float>(sky, Float(Date().timeIntervalSince(startTime))),
+            misc: SIMD4<Float>(Float(settings.biome), settings.seaLevel,
+                               terrainHeightMax, terrainExtent)
+        )
+
+        // Terrain.
         if let vertexBuffer, let indexBuffer, indexCount > 0 {
-            let aspect = Float(view.drawableSize.width / max(view.drawableSize.height, 1))
-            let camera = terrainView.camera
-            var uniforms = Uniforms(
-                mvp: camera.viewProjection(aspect: aspect),
-                sunDirAndIntensity: SIMD4<Float>(0.45, 0.7, 0.35, 1.3),
-                cameraPosAndFog: SIMD4<Float>(camera.position, 0.002),
-                skyColorAndTime: SIMD4<Float>(skyColor, Float(Date().timeIntervalSince(startTime)))
-            )
-
-            encoder.setRenderPipelineState(pipeline)
+            encoder.setRenderPipelineState(terrainPipeline)
             encoder.setDepthStencilState(depthState)
+            encoder.setTriangleFillMode(settings.wireframe ? .lines : .fill)
             encoder.setVertexBuffer(vertexBuffer, offset: 0, index: 0)
             encoder.setVertexBytes(&uniforms, length: MemoryLayout<Uniforms>.size, index: 1)
             encoder.setFragmentBytes(&uniforms, length: MemoryLayout<Uniforms>.size, index: 1)
             encoder.drawIndexedPrimitives(type: .triangle, indexCount: indexCount,
                                           indexType: .uint32, indexBuffer: indexBuffer,
                                           indexBufferOffset: 0)
+            encoder.setTriangleFillMode(.fill)
+        }
+
+        // Flora (instanced cones).
+        if let floraPipeline, let floraVertexBuffer, let floraInstanceBuffer,
+           floraInstanceCount > 0 {
+            var color = floraColor
+            encoder.setRenderPipelineState(floraPipeline)
+            encoder.setDepthStencilState(depthState)
+            encoder.setVertexBuffer(floraVertexBuffer, offset: 0, index: 0)
+            encoder.setVertexBytes(&uniforms, length: MemoryLayout<Uniforms>.size, index: 1)
+            encoder.setVertexBuffer(floraInstanceBuffer, offset: 0, index: 2)
+            encoder.setFragmentBytes(&uniforms, length: MemoryLayout<Uniforms>.size, index: 1)
+            encoder.setFragmentBytes(&color, length: MemoryLayout<SIMD4<Float>>.size, index: 0)
+            encoder.drawPrimitives(type: .triangle, vertexStart: 0,
+                                   vertexCount: floraVertexCount,
+                                   instanceCount: floraInstanceCount)
+        }
+
+        // Grid helper.
+        if settings.showGrid, let flatPipeline, let gridBuffer, gridVertexCount > 0 {
+            var color = SIMD4<Float>(0.15, 0.15, 0.16, 1)
+            encoder.setRenderPipelineState(flatPipeline)
+            encoder.setDepthStencilState(depthState)
+            encoder.setVertexBuffer(gridBuffer, offset: 0, index: 0)
+            encoder.setVertexBytes(&uniforms, length: MemoryLayout<Uniforms>.size, index: 1)
+            encoder.setFragmentBytes(&color, length: MemoryLayout<SIMD4<Float>>.size, index: 0)
+            encoder.drawPrimitives(type: .line, vertexStart: 0, vertexCount: gridVertexCount)
+        }
+
+        // Water plane (translucent — depth test on, write off).
+        if let waterPipeline, let waterBuffer {
+            encoder.setRenderPipelineState(waterPipeline)
+            encoder.setDepthStencilState(depthStateNoWrite)
+            encoder.setVertexBuffer(waterBuffer, offset: 0, index: 0)
+            encoder.setVertexBytes(&uniforms, length: MemoryLayout<Uniforms>.size, index: 1)
+            encoder.setFragmentBytes(&uniforms, length: MemoryLayout<Uniforms>.size, index: 1)
+            encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: waterVertexCount)
         }
 
         encoder.endEncoding()

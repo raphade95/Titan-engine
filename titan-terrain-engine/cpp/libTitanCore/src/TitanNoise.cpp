@@ -8,10 +8,25 @@ namespace Titan {
 
 namespace {
 
-const float kGrad2[12][2] = {
-    {1, 1}, {-1, 1}, {1, -1}, {-1, -1},
-    {1, 0}, {-1, 0}, {1, 0},  {-1, 0},
-    {0, 1}, {0, -1}, {0, 1},  {0, -1}
+// Eight unit gradients at 45-degree increments.
+//
+// This replaces the classic 12-entry table, which is the *3D* gradient set
+// flattened to 2D and is directionally biased as a result: {1,0} and {-1,0}
+// each appear twice, as do {0,1} and {0,-1}, while the four diagonals appear
+// once, so axis-aligned directions are drawn twice as often. That bias shows
+// up as faint grid-aligned N/S/E/W structure in ridged and high-octave output
+// — exactly the artefact a terrain tool gets judged on. Twelve entries also
+// meant `% 12` over a 0..255 permutation value, which skews the first four
+// entries a little further.
+//
+// Eight equal-length, evenly spaced directions have no preferred axis, and
+// indexing with `& 7` is unbiased and cheaper than a modulo.
+constexpr float kR2 = 0.70710678f; // sqrt(2)/2
+const float kGrad2[8][2] = {
+    { 1.0f,  0.0f}, { kR2,   kR2},
+    { 0.0f,  1.0f}, {-kR2,   kR2},
+    {-1.0f,  0.0f}, {-kR2,  -kR2},
+    { 0.0f, -1.0f}, { kR2,  -kR2}
 };
 
 inline float Dot2(const float g[2], float x, float y) {
@@ -28,9 +43,9 @@ SimplexNoise::SimplexNoise(uint64_t seed) {
     for (int i = 0; i < 256; ++i) table[i] = static_cast<uint8_t>(i);
 
     // Fisher-Yates with PCG32 — this is the fix for the degenerate
-    // permutation tables the old prototype produced.
-    uint64_t state = seed;
-    Pcg32 rng(SplitMix64(state), SplitMix64(state));
+    // permutation tables the old prototype produced. MakeRng pins down the
+    // seeding order; see TitanRandom.h.
+    Pcg32 rng = MakeRng(seed);
     for (int i = 255; i > 0; --i) {
         uint32_t j = rng.NextRange(static_cast<uint32_t>(i + 1));
         std::swap(table[i], table[j]);
@@ -59,9 +74,9 @@ float SimplexNoise::Sample(float x, float y) const {
 
     int ii = i & 255;
     int jj = j & 255;
-    int gi0 = m_Perm[ii + m_Perm[jj]] % 12;
-    int gi1 = m_Perm[ii + i1 + m_Perm[jj + j1]] % 12;
-    int gi2 = m_Perm[ii + 1 + m_Perm[jj + 1]] % 12;
+    int gi0 = m_Perm[ii + m_Perm[jj]] & 7;
+    int gi1 = m_Perm[ii + i1 + m_Perm[jj + j1]] & 7;
+    int gi2 = m_Perm[ii + 1 + m_Perm[jj + 1]] & 7;
 
     float n0 = 0.0f, n1 = 0.0f, n2 = 0.0f;
 
@@ -81,8 +96,16 @@ float SimplexNoise::Sample(float x, float y) const {
         n2 = t2 * t2 * Dot2(kGrad2[gi2], x2, y2);
     }
 
-    // Scale to roughly [-1, 1].
-    return 70.0f * (n0 + n1 + n2);
+    // Scale to roughly [-1, 1]. The constant is tied to the gradient set and
+    // must be re-measured whenever that changes — cpp/tools/calibrate_noise.cpp.
+    //
+    // Calibrated to match the *standard deviation* of the previous mixed-length
+    // table (0.441), not its peak. Matching the peak instead put sd 22% high,
+    // which pushed ridged terrain's mean down and turned the Alpine Peaks
+    // preset into spikes: peaks are rare outliers, sd is what governs how the
+    // terrain actually reads, and existing seeds and presets should keep their
+    // character across a bias fix.
+    return 81.4f * (n0 + n1 + n2);
 }
 
 FractalNoise::FractalNoise(uint64_t seed, const FractalParams& params)
@@ -106,8 +129,9 @@ inline void CellPoint(uint64_t seed, int cx, int cy, float& px, float& py) {
     py = static_cast<float>(cy) + static_cast<float>((h >> 16) & 0xFFFFu) / 65535.0f;
 }
 
-// Single-octave cellular distances F1 <= F2 (euclidean).
-inline void Cellular(uint64_t seed, float x, float y, float& f1, float& f2) {
+// Single-octave cellular distances F1 <= F2.
+// metric: 0 = euclidean, 1 = manhattan, 2 = chebyshev.
+inline void Cellular(uint64_t seed, float x, float y, int metric, float& f1, float& f2) {
     const int ix = static_cast<int>(std::floor(x));
     const int iy = static_cast<int>(std::floor(y));
     f1 = 1e9f;
@@ -116,9 +140,14 @@ inline void Cellular(uint64_t seed, float x, float y, float& f1, float& f2) {
         for (int i = -1; i <= 1; ++i) {
             float px, py;
             CellPoint(seed, ix + i, iy + j, px, py);
-            const float dx = px - x;
-            const float dy = py - y;
-            const float d = std::sqrt(dx * dx + dy * dy);
+            const float ax = std::fabs(px - x);
+            const float ay = std::fabs(py - y);
+            float d;
+            switch (metric) {
+                case 1:  d = ax + ay; break;
+                case 2:  d = std::max(ax, ay); break;
+                default: d = std::sqrt(ax * ax + ay * ay); break;
+            }
             if (d < f1) {
                 f2 = f1;
                 f1 = d;
@@ -131,7 +160,7 @@ inline void Cellular(uint64_t seed, float x, float y, float& f1, float& f2) {
 
 } // namespace
 
-float FractalNoise::SampleVoronoi(float x, float y, bool ridge) const {
+float FractalNoise::SampleVoronoi(float x, float y, bool ridge, int metric) const {
     float amplitude = 1.0f;
     float frequency = 1.0f;
     float sum = 0.0f;
@@ -139,7 +168,7 @@ float FractalNoise::SampleVoronoi(float x, float y, bool ridge) const {
     for (int o = 0; o < m_Params.octaves; ++o) {
         float f1, f2;
         Cellular(m_CellSeed + static_cast<uint64_t>(o) * 0x632BE59BD9B4E019ull,
-                 x * frequency, y * frequency, f1, f2);
+                 x * frequency, y * frequency, metric, f1, f2);
         // F1 in ~[0, 1.2]: cells rise toward centers. F2-F1: ridged walls.
         const float v = ridge ? std::clamp((f2 - f1), 0.0f, 1.0f)
                               : std::clamp(1.0f - f1, 0.0f, 1.0f);
@@ -214,6 +243,28 @@ float FractalNoise::SampleRidged(float x, float y) const {
     return 0.0f;
 }
 
+float FractalNoise::SampleHybrid(float x, float y) const {
+    // Musgrave hybrid multifractal ("terrain" mode): the running product
+    // weight suppresses detail in valleys while peaks accumulate roughness.
+    const float offset = 0.7f;
+    float amplitude = 1.0f;
+    float frequency = 1.0f;
+    float weight = 1.0f;
+    float sum = 0.0f;
+    float norm = 0.0f;
+
+    for (int o = 0; o < m_Params.octaves; ++o) {
+        weight = std::clamp(weight, 0.0f, 1.0f);
+        const float signal = (m_Base.Sample(x * frequency, y * frequency) + offset) * amplitude;
+        sum += weight * signal;
+        norm += weight * amplitude * (1.0f + offset);
+        weight *= signal;
+        amplitude *= m_Params.persistence;
+        frequency *= m_Params.lacunarity;
+    }
+    return norm > 0.0f ? std::clamp(sum / norm, 0.0f, 1.0f) : 0.0f;
+}
+
 float FractalNoise::Sample(float x, float y) const {
     if (m_Params.type == NoiseType::None) return 0.0f;
 
@@ -227,12 +278,15 @@ float FractalNoise::Sample(float x, float y) const {
     }
 
     switch (m_Params.type) {
-        case NoiseType::Ridged:       return SampleRidged(x, y);
-        case NoiseType::Billow:       return SampleBillow(x, y);
-        case NoiseType::Voronoi:      return SampleVoronoi(x, y, false);
-        case NoiseType::VoronoiRidge: return SampleVoronoi(x, y, true);
+        case NoiseType::Ridged:          return SampleRidged(x, y);
+        case NoiseType::Billow:          return SampleBillow(x, y);
+        case NoiseType::Voronoi:         return SampleVoronoi(x, y, false, 0);
+        case NoiseType::VoronoiRidge:    return SampleVoronoi(x, y, true, 0);
+        case NoiseType::WorleyManhattan: return SampleVoronoi(x, y, false, 1);
+        case NoiseType::WorleyChebyshev: return SampleVoronoi(x, y, false, 2);
+        case NoiseType::HybridMulti:     return SampleHybrid(x, y);
         case NoiseType::Standard:
-        default:                      return SampleStandard(x, y);
+        default:                         return SampleStandard(x, y);
     }
 }
 

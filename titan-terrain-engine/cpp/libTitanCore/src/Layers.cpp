@@ -46,12 +46,49 @@ float TerrainEngine::SampleMask(float x, float y) const {
            at(nx + 1, ny + 1) * u * v;
 }
 
+// Writes a new total height back into the two-layer model.
+//
+// The ground model is: total = bedrock + sediment, where sediment is a
+// deposit and therefore never negative, while bedrock is an elevation and may
+// go below the zero datum (ocean floors, sub-sea-level basins, canyons cut
+// below the reference plane).
+//
+// Where a cell already has material, the existing bedrock/sediment ratio is
+// *preserved* rather than reset. This used to force a flat 80/20 split, which
+// silently destroyed erosion stratigraphy: a Blur at strength 0.05 after a
+// hydraulic pass threw away the entire sediment distribution that pass had
+// just computed, changed how the next erosion layer behaved (HardnessAt reads
+// bedrock elevation), and zeroed the mesh's sediment splat channel. In a
+// layer stack whose passes users freely reorder, that was silent,
+// order-dependent data loss.
+//
+// 80/20 remains the fallback for cells that had nothing to preserve.
 void TerrainEngine::ResplitHeight(const std::vector<float>& newTotal) {
     const size_t count = m_Bedrock.size();
     for (size_t i = 0; i < count; ++i) {
-        const float h = std::max(0.0f, newTotal[i]);
-        m_Bedrock[i] = h * 0.8f;
-        m_Sediment[i] = h * 0.2f;
+        const float h = newTotal[i];
+        const float oldTotal = m_Bedrock[i] + m_Sediment[i];
+
+        if (h <= 0.0f) {
+            // At or below the datum there is no room for a deposit.
+            m_Bedrock[i] = h;
+            m_Sediment[i] = 0.0f;
+            continue;
+        }
+        if (oldTotal > 0.0f) {
+            const float ratio = h / oldTotal;
+            m_Bedrock[i] *= ratio;
+            m_Sediment[i] *= ratio;
+            // A negative bedrock scaled by a positive ratio stays negative,
+            // which would put sediment above a total it cannot support.
+            if (m_Sediment[i] < 0.0f) {
+                m_Bedrock[i] = h;
+                m_Sediment[i] = 0.0f;
+            }
+        } else {
+            m_Bedrock[i] = h * 0.8f;
+            m_Sediment[i] = h * 0.2f;
+        }
     }
 }
 
@@ -61,7 +98,10 @@ void TerrainEngine::ClearTerrain() {
     std::fill(m_Flow.begin(), m_Flow.end(), 0.0f);
     std::fill(m_Snow.begin(), m_Snow.end(), 0.0f);
     std::fill(m_Water.begin(), m_Water.end(), 0.0f);
+    ClearLava();
     m_DropletCursor = 0;
+    m_MassExported = 0.0;
+    m_MassCreated = 0.0;
 }
 
 // ---------------------------------------------------------------------------
@@ -103,7 +143,7 @@ void TerrainEngine::ApplyNoise(const NoiseLayerParams& p) {
             const float h = m_Bedrock[i] + m_Sediment[i];
             float combined;
             switch (mode) {
-                case BlendMode::Subtract: combined = std::max(0.0f, h - field); break;
+                case BlendMode::Subtract: combined = h - field; break;
                 case BlendMode::Multiply: combined = h * n; break;
                 case BlendMode::Max:      combined = std::max(h, field); break;
                 case BlendMode::Min:      combined = std::min(h, field); break;
@@ -151,9 +191,34 @@ float StampField(StampShape shape, float u, float v, float falloff) {
             if (r >= 1.0f) return 0.0f;
             // Rim peaks at r=0.72, bowl dips below zero in the middle —
             // remapped to [0,1] with the bowl at 0 and the rim at 1.
-            const float rim = std::exp(-std::pow((r - 0.72f) / (0.18f + 0.3f * f), 2.0f));
-            const float bowl = std::exp(-std::pow(r / 0.45f, 2.0f));
+            //
+            // Squared explicitly rather than via pow(x, 2.0f): compilers
+            // strength-reduce that call at -O2 and up but not at -O0, and
+            // powf(x, 2) is not always bit-identical to x * x, which made the
+            // stamp field depend on the optimization level.
+            const float rimT = (r - 0.72f) / (0.18f + 0.3f * f);
+            const float bowlT = r / 0.45f;
+            const float rim = std::exp(-(rimT * rimT));
+            const float bowl = std::exp(-(bowlT * bowlT));
             return std::clamp(rim - bowl * 0.9f + 0.15f * (1.0f - r), 0.0f, 1.0f);
+        }
+        case StampShape::Gradient: {
+            // Linear ramp along +u; v unbounded so a rotated gradient can
+            // cover the whole map. Falloff eases the ends of the ramp,
+            // continuously: 0 is a straight linear ramp, 1 is a full
+            // smoothstep, values between blend the two.
+            //
+            // This used to read `f < 0.999f ? t : smoothstep(t)`, which is
+            // backwards from the documented meaning of falloff and is a binary
+            // switch rather than a control — and since both UIs hard-code
+            // falloff to 0.5, the parameter did nothing at all for gradients.
+            const float t = std::clamp((u + 1.0f) * 0.5f, 0.0f, 1.0f);
+            const float eased = t * t * (3.0f - 2.0f * t);
+            return t + (eased - t) * f;
+        }
+        case StampShape::RadialGradient: {
+            const float r = std::sqrt(u * u + v * v);
+            return std::max(0.0f, 1.0f - r);
         }
         case StampShape::Dome:
         default: {
@@ -205,7 +270,7 @@ void TerrainEngine::ApplyStamp(const StampParams& p) {
         const float h = m_Bedrock[i] + m_Sediment[i];
         float combined;
         switch (op) {
-            case StampOp::Lower:   combined = std::max(0.0f, h - s * p.height); break;
+            case StampOp::Lower:   combined = h - s * p.height; break;
             case StampOp::Flatten: combined = h + (p.height - h) * s; break;
             case StampOp::Union:   combined = std::max(h, s * p.height); break;
             case StampOp::Raise:
@@ -243,7 +308,13 @@ void TerrainEngine::ApplySnow(const SnowParams& p) {
             const float slope = GetSlope(x, y);
             const float shed = std::clamp(1.0f - slope / std::max(0.1f, maxSlope), 0.0f, 1.0f);
 
-            m_Snow[static_cast<size_t>(i)] += p.amount * band * shed * MaskAt(i);
+            // Assign toward the target rather than accumulate: running the
+            // layer twice used to double the snowpack, which is wrong for a
+            // stack that re-evaluates. The mask still gates the change, so a
+            // masked-out cell keeps whatever it already had.
+            const float target = p.amount * band * shed;
+            const size_t si = static_cast<size_t>(i);
+            m_Snow[si] += (target - m_Snow[si]) * MaskAt(i);
         }
     }
 
@@ -329,10 +400,16 @@ void TerrainEngine::ComputeWater() {
     std::vector<float> height(count);
     for (size_t i = 0; i < count; ++i) height[i] = m_Bedrock[i] + m_Sediment[i];
 
+    // Index tie-break keeps the pop order a total order — see the longer note
+    // in Fluvial.cpp. Lakes are flat by construction so equal keys are the
+    // rule here, but as there the fill value depends only on the popped
+    // height, so this is hardening rather than a fix (mutation test M4).
     struct Cell {
         float h;
         int idx;
-        bool operator>(const Cell& o) const { return h > o.h; }
+        bool operator>(const Cell& o) const {
+            return h != o.h ? h > o.h : idx > o.idx;
+        }
     };
     std::priority_queue<Cell, std::vector<Cell>, std::greater<Cell>> pq;
     std::vector<uint8_t> visited(count, 0);

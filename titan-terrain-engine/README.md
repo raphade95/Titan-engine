@@ -21,8 +21,15 @@ only marshals parameters in and copies buffers out across the C API
 
 ## Engine features
 
-- **Deterministic by contract**: same seed → bit-identical terrain, on every
-  platform, including after all erosion passes (PCG32 streams, no fast-math).
+- **Deterministic by contract**: same seed → the same terrain, including after
+  all erosion passes. Bit-identical for a given platform and architecture,
+  regardless of thread count, chunking, or optimization level; visually
+  identical across platforms, to within a fraction of a rendering pixel on base
+  terrain. The one caveat is that `libm` (`pow`, `sin`, `exp`, …) is not
+  bit-portable, so exports are not byte-identical across architectures —
+  [docs/determinism.md](docs/determinism.md) states exactly what holds, how it
+  is measured, and what it would take to close the gap. Enforced in CI by
+  `titan_golden`, which is itself mutation-tested.
 - Seeded 2D simplex noise with fBm, billow, and true Musgrave **ridged
   multifractal** (octave feedback weighting).
 - **Domain warping** for tectonic-looking landforms.
@@ -32,8 +39,33 @@ only marshals parameters in and copies buffers out across the C API
   exactly mass-conserving.
 - **Fluvial erosion** — priority-flood sink filling, D8 flow accumulation,
   stream-power law (`E = K·Aᵐ·Sⁿ`) for connected river networks.
+- **Volcanoes** — a stratovolcano edifice with concave-up flanks, a jagged
+  summit crater, radial barranca gullies, and a rim breached on one bearing.
+  Flanks union with the terrain while the crater cuts into it, so a cone
+  dropped on a mountainside merges with it. Place as many as you like; each
+  registers an eruption vent.
+- **Lava flow** — a cellular flow whose yield strength rises as it cools. That
+  one rule is what makes it lava rather than water: it pools in craters until
+  it finds the breach, piles into lobes, freezes levees along its chilled
+  margins, and self-channelizes into streams that run to the map edge. Chilled
+  lava becomes bedrock, so it diverts later flows and lands in every export.
 - World-space noise sampling: adjacent tiles are seamless (chunking-ready).
-- Exports: 16-bit RAW heightmap (`.r16`), 8-bit PNG, RGBA splatmap PNG.
+- **Cellular noise family**: voronoi F1/F2-F1 plus Worley manhattan/chebyshev
+  metrics, and a Musgrave hybrid multifractal "terrain" mode.
+- **Filters**: clamp, curves (monotone-cubic height remap), blur, sharpen,
+  vertical transform (scale/offset/invert) — all mask-aware.
+- **Masking**: per-operation masks generated from height/slope/curvature bands
+  or fractal noise (`titan_mask_by_feature`, `titan_noise_to_mask`).
+- **Combiner / import**: blend an external heightfield (add/sub/mul/max/min/mix)
+  with engine-side resampling — also powers .png/.r16/.r32 heightmap import.
+- Gradient generators (linear/radial stamps), full slope & curvature maps.
+- Exports: 16-bit RAW heightmap (`.r16`), 16-bit PNG, float32 RAW/EXR, OBJ
+  mesh, RGBA splatmap PNG, world-space normal map PNG, ambient-occlusion PNG.
+- 2D top-down hypsometric map view in both the web lab and TitanLab (macOS).
+- Drop-a-volcano placement in both viewports: press on the terrain to place a
+  cone, drag to position it. Lava is rendered from a per-vertex attribute the
+  engine fills — incandescence by temperature, a flow-aligned crust that drifts
+  downhill, and emission that lights the rock the stream runs past.
 
 ## Running the web lab
 
@@ -49,9 +81,17 @@ npm run dev        # http://localhost:3000
 Prerequisites: CMake + a C++20 compiler; Emscripten for the WASM target.
 
 ```bash
-npm run test:core    # native build + test harness (determinism, mass conservation, seams)
-npm run build:wasm   # rebuild src/wasm/titan_core.js for the viewer
+npm run test:core     # behavioural harness (determinism, mass conservation, seams)
+npm run test:golden   # checked-in golden hashes — the cross-platform contract
+npm run test:mutation # proves the golden harness can still catch regressions
+npm run build:wasm    # rebuild src/wasm/titan_core.js for the viewer
+npm run test:wasm     # golden checks against the WASM the web lab ships
 ```
 
-Run the native tests before shipping any engine change — determinism and
-mass conservation are product guarantees, not implementation details.
+Run the native tests before shipping any engine change — determinism and mass
+conservation are product guarantees, not implementation details.
+
+If `titan_golden` fails after an intentional engine change, that is the signal
+working. Confirm the change is what you meant, then regenerate the constants
+on the reference configuration (macOS arm64) with `./build/titan_golden
+--print`. See [docs/determinism.md](docs/determinism.md).

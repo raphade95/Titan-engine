@@ -47,10 +47,22 @@ void TerrainEngine::ApplyFluvialErosion(int iterations, const FluvialParams& p) 
         for (int i = 0; i < count; ++i) height[i] = m_Bedrock[i] + m_Sediment[i];
 
         // -- 1. Priority-flood depression filling ---------------------------
+        // Ties break on cell index so the pop order is a total order rather
+        // than whatever the standard library's sift happens to produce.
+        //
+        // This is defensive, not a correctness fix: the value propagated to a
+        // neighbour is max(height[n], popped.h + epsilon), which depends only
+        // on the popped cell's height, so tied cells produce identical fills
+        // in either order. Mutation testing (tools/mutation_test.sh, M3)
+        // asserts that invariant still holds. Keep the tie-break anyway — it
+        // costs one comparison and it stops the invariant from being load-
+        // bearing if the fill rule ever becomes parent-dependent.
         struct Cell {
             float h;
             int idx;
-            bool operator>(const Cell& o) const { return h > o.h; }
+            bool operator>(const Cell& o) const {
+                return h != o.h ? h > o.h : idx > o.idx;
+            }
         };
         std::priority_queue<Cell, std::vector<Cell>, std::greater<Cell>> pq;
         std::fill(visited.begin(), visited.end(), 0);
@@ -66,7 +78,12 @@ void TerrainEngine::ApplyFluvialErosion(int iterations, const FluvialParams& p) 
             if (!visited[right]) { visited[right] = 1; pq.push({height[right], right}); }
         }
 
-        const float epsilon = 1e-4f; // tiny gradient across filled lakes
+        // Tiny gradient across filled lakes, relative to the terrain's own
+        // height scale — a fixed 1e-4 is invisible at a 5000 m range and
+        // dominant at a 0.1 range. 2.5e-6 * heightRef reproduces the original
+        // 1e-4 at the default heightMultiplier of 40.
+        const float epsilon =
+            2.5e-6f * std::max(1.0f, m_Params.heightMultiplier);
 
         std::copy(height.begin(), height.end(), filled.begin());
         while (!pq.empty()) {
@@ -110,8 +127,12 @@ void TerrainEngine::ApplyFluvialErosion(int iterations, const FluvialParams& p) 
 
         // -- 3. Flow accumulation, highest cell first -----------------------
         std::iota(order.begin(), order.end(), 0);
-        std::sort(order.begin(), order.end(),
-                  [&filled](int a, int b) { return filled[a] > filled[b]; });
+        // std::sort is not stable, so equal keys would be permuted differently
+        // by different standard libraries. The index tie-break makes the
+        // comparator a total order and the traversal platform-independent.
+        std::sort(order.begin(), order.end(), [&filled](int a, int b) {
+            return filled[a] != filled[b] ? filled[a] > filled[b] : a < b;
+        });
 
         std::fill(area.begin(), area.end(), 1.0f); // each cell contributes one unit of rain
         for (int oi = 0; oi < count; ++oi) {
@@ -158,7 +179,9 @@ void TerrainEngine::ApplyFluvialErosion(int iterations, const FluvialParams& p) 
             } else {
                 m_Sediment[i] = 0.0f;
                 const float hardness = HardnessAt(height[i]);
-                const float bedrockCut = std::min((erode - sed) / hardness, m_Bedrock[i]);
+                // Bedrock is an elevation, not a stock: a river may cut it
+                // below the datum. The per-step cap above already bounds this.
+                const float bedrockCut = (erode - sed) / hardness;
                 m_Bedrock[i] -= bedrockCut;
                 removed = sed + bedrockCut;
             }

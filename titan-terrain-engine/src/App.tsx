@@ -31,15 +31,24 @@ import {
   ArrowDown,
   Save,
   FolderOpen,
-  X
+  X,
+  Hexagon,
+  Grid3X3,
+  Grid2X2,
+  Map as MapIcon,
+  Upload,
+  Flame
 } from 'lucide-react';
 
 import { TitanCore } from './core/TitanCore';
-import { TerrainParams } from './core/types';
+import { TerrainParams, ExportKind } from './core/types';
 import {
+  ImportedField,
   Layer,
   LAYER_DEFS,
+  LayerMask,
   LayerType,
+  MASK_MODE_LABELS,
   PRESETS,
   TitanProject,
   deserializeProject,
@@ -58,6 +67,14 @@ import { Label } from '@/components/ui/label';
 import { Separator } from '@/components/ui/separator';
 
 const randomSeed = () => Math.random().toString(36).substring(2, 9);
+
+// Preview mesh cap. The engine simulates and exports at full resolution; the
+// mesh copied into JS for Three.js is decimated to this many vertices per
+// edge. A 2048 terrain at full mesh resolution is 4.2M vertices — roughly
+// 300 MB of typed arrays once positions, normals, colours, UVs and indices are
+// copied out of the WASM heap, and 4096 would not fit a 32-bit heap at all.
+// Decoupling the two is what lets the resolution slider go past 512.
+const PREVIEW_MAX_EDGE_VERTS = 512;
 
 // The app opens as a clean, flat canvas: no terrain until the user picks a
 // noise structure or tweaks a slider. Every session starts with a fresh seed.
@@ -79,6 +96,13 @@ export default function App() {
   const containerRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [params, setParams] = useState<TerrainParams>(DEFAULT_PARAMS);
+  // The real post-stack height range. Normalizing exports (.png16/.r16) stretch
+  // to exactly this, so a user needs it to set a correct Z scale on import — it
+  // is NOT [0, Height slider] once erosion and deposition have run, which is
+  // what the export docs used to tell people to assume.
+  const [heightRange, setHeightRange] = useState<{ min: number; max: number } | null>(null);
+  // Which layers have their advanced physics panel open, keyed by layer id.
+  const [expandedAdvanced, setExpandedAdvanced] = useState<Record<string, boolean>>({});
   const [isSidebarOpen, setIsSidebarOpen] = useState(true);
   const [isGenerating, setIsGenerating] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -99,7 +123,16 @@ export default function App() {
   const [isCarveMode, setIsCarveMode] = useState(false);
   const [carveRadius, setCarveRadius] = useState(4);
   const [carveDepth, setCarveDepth] = useState(2);
+  // Drop-a-volcano mode: press on the terrain to place one, drag to position
+  // it. The layer that is being dragged is held here so pointer-move can keep
+  // rewriting its coordinates instead of adding a cone per frame.
+  const [isVolcanoMode, setIsVolcanoMode] = useState(false);
+  const draggingVolcanoRef = useRef<string | null>(null);
   const [waterLevel, setWaterLevel] = useState(-10);
+  const [imported, setImported] = useState<ImportedField | undefined>(undefined);
+  const [showMinimap, setShowMinimap] = useState(false);
+  const minimapRef = useRef<HTMLCanvasElement | null>(null);
+  const importFileRef = useRef<HTMLInputElement | null>(null);
   const [sunIntensity, setSunIntensity] = useState(1.4);
   const [sunElevation, setSunElevation] = useState(45);
   const [sunAzimuth, setSunAzimuth] = useState(45);
@@ -112,9 +145,13 @@ export default function App() {
   const rendererRef = useRef<THREE.WebGLRenderer | null>(null);
   const controlsRef = useRef<OrbitControls | null>(null);
   const meshRef = useRef<THREE.Mesh | null>(null);
+  // Kept across mesh rebuilds so the terrain shader is compiled once, not
+  // once per pipeline chunk.
+  const materialRef = useRef<THREE.ShaderMaterial | null>(null);
   const engineRef = useRef<TitanCore | null>(null);
   const waterRef = useRef<THREE.Mesh | null>(null);
   const sunLightRef = useRef<THREE.DirectionalLight | null>(null);
+  const gridRef = useRef<THREE.GridHelper | null>(null);
 
   const updateAtmosphere = React.useCallback(() => {
     if (!sceneRef.current || !sunLightRef.current) return;
@@ -140,18 +177,138 @@ export default function App() {
         mat.uniforms.uSunPos.value.copy(sunPos);
         mat.uniforms.uFogColor.value.copy(skyColor);
         mat.uniforms.uFogDensity.value = fogDensity;
+        mat.uniforms.uSunIntensity.value = sunIntensity;
+        mat.uniforms.uSkyColor.value.copy(skyColor);
     }
   }, [sunElevation, sunAzimuth, sunIntensity, fogDensity]);
+
+  // 2D top-down map: hypsometric tint + hillshade + sea-level water, drawn
+  // straight from the engine's height data (viewer-side presentation only).
+  const updateMinimap = React.useCallback(() => {
+    const canvas = minimapRef.current;
+    const engine = engineRef.current;
+    if (!canvas || !engine) return;
+    const size = params.size;
+    const bedrock = engine.getBedrockMap();
+    const sediment = engine.getSedimentMap();
+    if (bedrock.length !== size * size) return;
+
+    canvas.width = size;
+    canvas.height = size;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+    const img = ctx.createImageData(size, size);
+
+    let minH = Infinity, maxH = -Infinity;
+    const h = new Float32Array(size * size);
+    for (let i = 0; i < h.length; i++) {
+      h[i] = bedrock[i] + sediment[i];
+      if (h[i] < minH) minH = h[i];
+      if (h[i] > maxH) maxH = h[i];
+    }
+    const range = maxH - minH || 1;
+
+    // Hypsometric ramp stops (lowlands green -> tan -> rock -> snow).
+    const stops = [
+      [46, 102, 60], [110, 139, 61], [190, 171, 110],
+      [139, 105, 74], [120, 115, 110], [245, 248, 250],
+    ];
+    const ramp = (t: number) => {
+      const f = Math.min(0.9999, Math.max(0, t)) * (stops.length - 1);
+      const i = Math.floor(f);
+      const u = f - i;
+      return [
+        stops[i][0] + (stops[i + 1][0] - stops[i][0]) * u,
+        stops[i][1] + (stops[i + 1][1] - stops[i][1]) * u,
+        stops[i][2] + (stops[i + 1][2] - stops[i][2]) * u,
+      ];
+    };
+
+    for (let y = 0; y < size; y++) {
+      for (let x = 0; x < size; x++) {
+        const i = y * size + x;
+        const xm = x > 0 ? h[i - 1] : h[i];
+        const xp = x < size - 1 ? h[i + 1] : h[i];
+        const ym = y > 0 ? h[i - size] : h[i];
+        const yp = y < size - 1 ? h[i + size] : h[i];
+        // NW-lit hillshade.
+        const shade = 0.7 + Math.max(-0.6, Math.min(0.6, ((xm - xp) + (ym - yp)) * 0.12));
+
+        let r: number, g: number, b: number;
+        if (h[i] < waterLevel) {
+          const depth = Math.min(1, (waterLevel - h[i]) / 20);
+          r = 30 - 15 * depth; g = 90 - 45 * depth; b = 160 - 60 * depth;
+        } else {
+          const c = ramp((h[i] - minH) / range);
+          r = c[0] * shade; g = c[1] * shade; b = c[2] * shade;
+        }
+        img.data[i * 4 + 0] = Math.max(0, Math.min(255, r));
+        img.data[i * 4 + 1] = Math.max(0, Math.min(255, g));
+        img.data[i * 4 + 2] = Math.max(0, Math.min(255, b));
+        img.data[i * 4 + 3] = 255;
+      }
+    }
+    ctx.putImageData(img, 0, 0);
+  }, [params.size, waterLevel]);
+
+  // Terrain spans size * cellSize world units, so a 2048 grid is 16x the
+  // extent of a 128 one. Without reframing, raising the resolution drops the
+  // camera inside the terrain.
+  const frameTerrain = React.useCallback((extent: number) => {
+    const camera = cameraRef.current;
+    const controls = controlsRef.current;
+    if (!camera || !controls) return;
+    const d = extent * 0.8;
+    camera.position.set(d, d * 0.75, d);
+    controls.target.set(0, 0, 0);
+    controls.maxDistance = extent * 4;
+    controls.update();
+  }, []);
+
+  const refreshHeightRange = React.useCallback(() => {
+    if (!engineRef.current) return;
+    try {
+      setHeightRange(engineRef.current.heightRange());
+    } catch {
+      setHeightRange(null);
+    }
+  }, []);
 
   const updateMesh = React.useCallback(() => {
     if (!sceneRef.current || !engineRef.current) return;
 
-    const meshData = engineRef.current.buildMesh();
+    const meshData = engineRef.current.buildMesh(PREVIEW_MAX_EDGE_VERTS);
+
+    // Reuse the material across rebuilds.
+    //
+    // The pipeline calls this once per chunk so the viewport animates while a
+    // pass runs, and building a fresh ShaderMaterial each time forces WebGL to
+    // recompile and relink the program — hundreds of milliseconds that dwarf
+    // the work being visualised. A 900-step lava eruption reports 91 ms of
+    // engine time and used to take twelve seconds of wall clock, essentially
+    // all of it spent recompiling the same shader fifteen times.
+    // A cached material outlives a hot reload, so an edit to the shader source
+    // or its uniform set would otherwise never reach the GPU — the old program
+    // keeps rendering and writes to uniforms that no longer exist throw. Probe
+    // for a uniform the current source declares and rebuild if it is missing.
+    const cached = materialRef.current;
+    const existing = cached && cached.uniforms.uTerrainExtent ? cached : null;
+    if (cached && !existing) {
+      cached.dispose();
+      materialRef.current = null;
+    }
+
+    if (existing) {
+      existing.uniforms.uBiome.value =
+        ['arctic', 'temperate', 'volcanic', 'desert'].indexOf(params.biome);
+      existing.uniforms.uHeightScale.value = Math.max(1, params.heightMultiplier);
+      existing.uniforms.uTerrainExtent.value = params.size;
+    }
 
     if (meshRef.current) {
       sceneRef.current.remove(meshRef.current);
       meshRef.current.geometry.dispose();
-      (meshRef.current.material as THREE.Material).dispose();
+      if (!existing) (meshRef.current.material as THREE.Material).dispose();
     }
 
     const geometry = new THREE.BufferGeometry();
@@ -159,6 +316,12 @@ export default function App() {
     geometry.setAttribute('normal', new THREE.BufferAttribute(meshData.normals, 3));
     geometry.setAttribute('color', new THREE.BufferAttribute(meshData.colors, 4));
     geometry.setAttribute('uv', new THREE.BufferAttribute(meshData.uvs, 2));
+    // molten depth / heat / chilled-rock depth / glow — zeroed when nothing
+    // has erupted, so the attribute is always bound and the shader is one
+    // program rather than two.
+    geometry.setAttribute('lava', new THREE.BufferAttribute(meshData.lava, 4));
+    // ao / curvature / snow depth / water depth — all simulated by the engine.
+    geometry.setAttribute('surface', new THREE.BufferAttribute(meshData.surface, 4));
     geometry.setIndex(new THREE.BufferAttribute(meshData.indices, 1));
 
     const phi = (90 - sunElevation) * (Math.PI / 180);
@@ -166,7 +329,7 @@ export default function App() {
     const sunPos = new THREE.Vector3().setFromSphericalCoords(300, phi, theta);
 
     // Custom Shader Material for Splat Mapping
-    const material = new THREE.ShaderMaterial({
+    const material = existing ?? new THREE.ShaderMaterial({
       vertexColors: true,
       side: THREE.DoubleSide,
       uniforms: {
@@ -174,18 +337,33 @@ export default function App() {
         uSunPos: { value: sunPos },
         uFogColor: { value: new THREE.Color(0x87CEEB) },
         uFogDensity: { value: fogDensity },
-        uBiome: { value: ['arctic', 'temperate', 'volcanic', 'desert'].indexOf(params.biome) }
+        uBiome: { value: ['arctic', 'temperate', 'volcanic', 'desert'].indexOf(params.biome) },
+        // Height scale, so strata banding keeps a constant band count instead
+        // of multiplying with the Height slider.
+        uHeightScale: { value: Math.max(1, params.heightMultiplier) },
+        uSunColor: { value: new THREE.Color(1.0, 0.96, 0.9) },
+        uSkyColor: { value: new THREE.Color(0x87CEEB) },
+        uSunIntensity: { value: sunIntensity },
+        uExposure: { value: 1.0 },
+        uTerrainExtent: { value: params.size },
       },
       vertexShader: `
+        attribute vec4 lava;
+        attribute vec4 surface;
+
         varying vec3 vPosition;
         varying vec3 vNormal;
         varying vec4 vColor;
         varying vec3 vWorldPos;
+        varying vec4 vLava;
+        varying vec4 vSurface;
 
         void main() {
           vPosition = position;
           vNormal = normal;
           vColor = color;
+          vLava = lava;
+          vSurface = surface;
           vec4 worldPos = modelMatrix * vec4(position, 1.0);
           vWorldPos = worldPos.xyz;
           gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
@@ -196,11 +374,39 @@ export default function App() {
         varying vec3 vNormal;
         varying vec4 vColor;
         varying vec3 vWorldPos;
+        varying vec4 vLava;
+        varying vec4 vSurface;
 
         uniform vec3 uSunPos;
         uniform vec3 uFogColor;
         uniform float uFogDensity;
         uniform int uBiome;
+        uniform float uHeightScale;
+        uniform float uTime;
+        uniform vec3 uSunColor;
+        uniform vec3 uSkyColor;
+        uniform float uSunIntensity;
+        uniform float uExposure;
+        uniform float uTerrainExtent;
+
+        // --- Colour management ------------------------------------------
+        // The palettes below were eyeballed on screen, so they are sRGB
+        // values. Lighting them directly — multiplying an sRGB colour by a
+        // cosine term — is the single most common reason a renderer looks
+        // "flat and plasticky": mid-tones wash out and shadow falloff is
+        // wrong everywhere. Decode to linear, light in linear, tone map, then
+        // encode back. Three.js does not touch a raw ShaderMaterial's output,
+        // so this shader owns the whole chain.
+        vec3 toLinear(vec3 c) { return pow(max(c, vec3(0.0)), vec3(2.2)); }
+        vec3 toSRGB(vec3 c)   { return pow(max(c, vec3(0.0)), vec3(1.0 / 2.2)); }
+
+        // ACES filmic approximation (Narkowicz). Rolls highlights off instead
+        // of clipping them, which is what stops molten lava and lit snow from
+        // turning into flat white paste.
+        vec3 tonemapACES(vec3 x) {
+          const float a = 2.51, b = 0.03, c = 2.43, d = 0.59, e = 0.14;
+          return clamp((x * (a * x + b)) / (x * (c * x + d) + e), 0.0, 1.0);
+        }
 
         // Simple hash function for detail noise
         float hash(vec2 p) {
@@ -215,19 +421,51 @@ export default function App() {
                      mix(hash(i + vec2(0.0, 1.0)), hash(i + vec2(1.0, 1.0)), f.x), f.y);
         }
 
+        float fbm(vec2 p) {
+          float v = 0.0;
+          float a = 0.5;
+          for (int i = 0; i < 5; i++) {
+            v += noise(p) * a;
+            p = p * 2.03 + vec2(17.3, 5.1);
+            a *= 0.5;
+          }
+          return v;
+        }
+
+        // Incandescence ramp. Real lava runs black -> deep red -> orange ->
+        // yellow -> near-white as it heats, and reading that gradient off a
+        // surface is most of how an eye judges how molten something is.
+        // Returns linear light: the stops are authored as sRGB swatches, so
+        // they get decoded like every other palette in this shader.
+        vec3 blackbody(float t) {
+          t = clamp(t, 0.0, 1.0);
+          vec3 c = mix(vec3(0.32, 0.02, 0.005), vec3(0.95, 0.18, 0.02),
+                       smoothstep(0.0, 0.35, t));
+          c = mix(c, vec3(1.0, 0.48, 0.06), smoothstep(0.3, 0.65, t));
+          c = mix(c, vec3(1.0, 0.82, 0.30), smoothstep(0.6, 0.87, t));
+          c = mix(c, vec3(1.0, 0.96, 0.80), smoothstep(0.85, 1.0, t));
+          return toLinear(c);
+        }
+
         void main() {
+          vec3 n = normalize(vNormal);
           vec3 lightDir = normalize(uSunPos);
           vec3 viewDir = normalize(cameraPosition - vWorldPos);
           vec3 halfDir = normalize(lightDir + viewDir);
-          
-          float diff = max(dot(vNormal, lightDir), 0.0);
-          
+
+          float ao        = vSurface.x;
+          float curvature = vSurface.y;
+          float snowDepth = vSurface.z;
+          float lakeDepth = vSurface.w;
+
+          float diff = max(dot(n, lightDir), 0.0);
+
           // Splat mapping logic
           vec3 grassColor;
           vec3 rockColor;
           vec3 snowColor = vec3(0.95, 0.98, 1.0);
           vec3 sedimentColor;
-          vec3 waterColor = vec3(0.02, 0.08, 0.18); 
+          vec3 waterColor = vec3(0.02, 0.08, 0.18);
 
           if (uBiome == 0) { // Arctic
             grassColor = vec3(0.4, 0.45, 0.5);
@@ -238,6 +476,10 @@ export default function App() {
             grassColor = vec3(0.05, 0.1, 0.02);
             rockColor = vec3(0.05, 0.05, 0.06);
             sedimentColor = vec3(0.12, 0.08, 0.06);
+            // Pale ash and pumice, not snow. This palette overrode every other
+            // colour but left the high-altitude band pure white, so any tall
+            // volcanic peak came out snow-capped.
+            snowColor = vec3(0.58, 0.55, 0.53);
           } else if (uBiome == 3) { // Desert
             grassColor = vec3(0.4, 0.35, 0.2);
             rockColor = vec3(0.45, 0.3, 0.2);
@@ -253,48 +495,264 @@ export default function App() {
           float flowMask = vColor.b;
           float sedimentMask = vColor.a;
           
-          // Detail Texturing via Triplanar-like noise
-          float detail = noise(vWorldPos.xz * 2.0) * 0.4 + noise(vWorldPos.xz * 8.0) * 0.1;
-          grassColor *= (0.8 + detail * 0.4);
-          rockColor *= (0.7 + detail * 0.6);
-          sedimentColor *= (0.8 + detail * 0.4);
-          
+          // Everything from here on is linear light.
+          grassColor = toLinear(grassColor);
+          rockColor = toLinear(rockColor);
+          snowColor = toLinear(snowColor);
+          sedimentColor = toLinear(sedimentColor);
+          waterColor = toLinear(waterColor);
+
+          // Detail texturing. Two scales of fBm rather than two raw value-noise
+          // taps — the old version was a single octave at each scale, which
+          // reads as television static up close rather than as ground.
+          float detail = fbm(vWorldPos.xz * 0.35) * 0.65 + fbm(vWorldPos.xz * 2.2) * 0.35;
+          grassColor *= (0.75 + detail * 0.55);
+          rockColor *= (0.65 + detail * 0.75);
+          sedimentColor *= (0.78 + detail * 0.5);
+
           // Base mix: Grass and Rock
           vec3 baseColor = mix(grassColor, rockColor, smoothstep(0.4, 0.8, rockMask));
           
-          // Visual Strata logic (Horizontal banding on rock)
-          float strataDetail = sin(vWorldPos.y * 3.0) + sin(vWorldPos.y * 7.2) * 0.4;
-          vec3 strataColor = vec3(0.35, 0.32, 0.28); 
+          // Visual Strata logic (Horizontal banding on rock).
+          //
+          // Frequency is relative to the terrain's own height scale, matching
+          // the engine's HardnessAt convention (20 / heightScale). A fixed
+          // absolute frequency produced ~5 bands at Height 25 but ~33 at
+          // Height 70, which reads as contour lines rather than geology — the
+          // same scale-dependence bug the engine's strata constant had.
+          float strataFreq = 20.0 / uHeightScale;
+          float strataDetail = sin(vWorldPos.y * strataFreq)
+                             + sin(vWorldPos.y * strataFreq * 2.4) * 0.4;
+          vec3 strataColor = toLinear(vec3(0.35, 0.32, 0.28));
           baseColor = mix(baseColor, strataColor, smoothstep(0.2, 1.0, strataDetail) * rockMask * 0.6);
-          
+
+          // Cavity shading from the engine's curvature. Creases hold dirt and
+          // shadow; convex edges are scoured and catch light. This is the cue
+          // that makes a heightfield read as rock rather than as a tinted
+          // bedsheet, and it costs one lerp.
+          float crease = smoothstep(0.5, 0.85, curvature);
+          float edge   = smoothstep(0.5, 0.15, curvature);
+          baseColor *= (1.0 - crease * 0.35) * (1.0 + edge * 0.18);
+
           // Apply sediment/soil layer
           baseColor = mix(baseColor, sedimentColor, smoothstep(0.01, 0.4, sedimentMask));
-          
+
           // Apply wetness/flow mapping
           float wetness = smoothstep(0.1, 0.9, flowMask);
           baseColor = mix(baseColor, waterColor, wetness * 0.5);
-          
-          // Apply snow at high altitudes
-          baseColor = mix(baseColor, snowColor, smoothstep(0.78, 0.98, height));
-          
-          // Lighting
-          vec3 finalColor = baseColor * (diff * 0.8 + 0.2);
-          
-          // Specular for wet/ice areas
-          float spec = pow(max(dot(vNormal, halfDir), 0.0), 32.0);
-          float specMask = max(smoothstep(0.7, 1.0, height), wetness * 0.6);
-          finalColor += vec3(1.0) * spec * specMask * 0.3;
-          
-          // Fog
-          float dist = length(vPosition.xz);
-          float fog = 1.0 - exp(-dist * uFogDensity * 2.0);
-          finalColor = mix(finalColor, uFogColor, fog);
 
-          gl_FragColor = vec4(finalColor, 1.0);
+          // Snow, from the engine's actual snowpack.
+          //
+          // This used to be smoothstep over the normalized height channel — a
+          // pure shader invention with no connection to the Snow layer, which
+          // simulates accumulation, slope shedding, creep settling and melt and
+          // then had its entire result ignored. Anything above the altitude
+          // threshold went white whether or not a single flake had settled
+          // there, and every drift the simulation actually produced was
+          // invisible. Depth drives coverage: a dusting lets rock show through,
+          // a deep drift buries it.
+          float snowFall = smoothstep(0.02, 0.9, snowDepth);
+          baseColor = mix(baseColor, snowColor, snowFall);
+
+          // ---- Volcanism -------------------------------------------------
+          float molten    = vLava.x;
+          float lavaHeat  = vLava.y;
+          float basalt    = vLava.z;
+          float lavaGlow  = vLava.w;
+
+          // Cooled flows are fresh basalt: near-black, faintly iridescent,
+          // and rougher than the rock around them. Painted before the molten
+          // pass so a flow that has crusted over still reads as a flow.
+          float basaltMask = smoothstep(0.02, 0.5, basalt);
+          vec3 basaltColor = vec3(0.045, 0.040, 0.045)
+                           * (0.55 + fbm(vWorldPos.xz * 1.6) * 0.9);
+          // Ropy pahoehoe texture at grazing angles.
+          basaltColor += vec3(0.06, 0.045, 0.035)
+                       * smoothstep(0.5, 0.9, fbm(vWorldPos.xz * 5.0));
+          baseColor = mix(baseColor, basaltColor, basaltMask);
+
+          // Snow cannot survive on a live flow.
+          float snowKill = 1.0 - clamp(basaltMask * 0.7 + molten * 4.0, 0.0, 1.0);
+
+          // ---- Lakes -----------------------------------------------------
+          // The Lakes layer priority-floods every basin that cannot drain and
+          // produces a per-cell depth. The mesh is displaced to that level, so
+          // here the surface really is the pond top and only needs shading.
+          // Nothing rendered it before: the layer was computable, exportable,
+          // and completely invisible in 3D.
+          float lake = smoothstep(0.02, 0.35, lakeDepth);
+          if (lake > 0.001) {
+            vec3 shallow = toLinear(vec3(0.16, 0.35, 0.38));
+            vec3 deep    = toLinear(vec3(0.01, 0.05, 0.11));
+            vec3 pond = mix(shallow, deep, smoothstep(0.0, 6.0, lakeDepth));
+            baseColor = mix(baseColor, pond, lake);
+            // A pond surface is flat and mirror-like regardless of the lakebed
+            // shape underneath it.
+            n = normalize(mix(n, vec3(0.0, 1.0, 0.0), lake));
+            diff = max(dot(n, lightDir), 0.0);
+          }
+
+          // ---- Lighting ----------------------------------------------------
+          // Sun plus a hemisphere ambient. The old model was one Lambert term
+          // over a flat grey constant, which lights the underside of a cliff
+          // exactly as brightly as its top and is why the terrain read as
+          // shadowless. Sky light comes from above and bounce comes from the
+          // ground, so an upward-facing surface should be lit blue-ish and a
+          // downward-facing one warm and dim.
+          // Light levels are scene-referred now, not display-referred. Under
+          // the old model a colour was written more or less straight to the
+          // framebuffer, so "intensity 1.4" meant roughly full brightness.
+          // Here the palettes are albedos and get multiplied by incoming light
+          // before tone mapping, so sunlight has to be several units strong for
+          // a 0.25-albedo rock to land near mid-grey. Left at the old scale the
+          // whole island rendered as a black silhouette.
+          vec3 skyLight    = toLinear(uSkyColor) * 1.5;
+          vec3 groundLight = toLinear(vec3(0.16, 0.13, 0.10)) * 0.9;
+          float hemi = 0.5 + 0.5 * n.y;
+          vec3 ambient = mix(groundLight, skyLight, hemi);
+
+          // Ambient occlusion, horizon-traced by the engine. It gates the
+          // ambient term only — occlusion is about how much sky a point can
+          // see, and applying it to direct sunlight would darken lit slopes
+          // that are plainly in the sun.
+          ambient *= ao;
+
+          // Sun colour warms and dims as it approaches the horizon.
+          float sunHeight = clamp(lightDir.y, 0.0, 1.0);
+          vec3 sunTint = mix(toLinear(vec3(1.0, 0.45, 0.18)),
+                             toLinear(uSunColor), smoothstep(0.0, 0.35, sunHeight));
+          vec3 sun = sunTint * uSunIntensity * 2.4 * diff;
+          // Soft terminator: real ground scatters light a little past 90°.
+          sun *= smoothstep(-0.08, 0.15, dot(n, lightDir)) * 0.6 + 0.4;
+
+          vec3 finalColor = baseColor * (sun + ambient);
+
+          // Specular for wet/ice/water surfaces.
+          float gloss = max(max(snowFall * snowKill * 0.5, wetness * 0.6), lake);
+          float shininess = mix(32.0, 200.0, lake);
+          float spec = pow(max(dot(n, halfDir), 0.0), shininess);
+          // Fresnel — water goes mirror-bright at grazing angles.
+          float fres = pow(1.0 - max(dot(n, viewDir), 0.0), 5.0);
+          finalColor += sunTint * uSunIntensity * spec * gloss * (0.35 + fres * 1.6);
+          finalColor += skyLight * fres * lake * 0.5 * ao;
+
+          // A flow lights the ground it runs past. Without this the lava is a
+          // bright ribbon lying on unlit rock, which is the single thing that
+          // most makes rendered lava look pasted on. Modulated by the surface
+          // albedo, because this is bounce light landing on rock — not a decal.
+          // Cubed rather than squared, and modest: this is bounce light, so it
+          // should pick out the rock within a stone's throw of the channel and
+          // fall away fast. Squared-and-strong smeared a bright wash over half
+          // the cone and swallowed all the relief AO had just brought out.
+          finalColor += baseColor * blackbody(0.6) * pow(lavaGlow, 3.0) * 2.0;
+
+          // ---- Molten lava -----------------------------------------------
+          // Thin margins fade out rather than ending on a hard edge: the
+          // engine leaves a chilled veneer at the flow front and it should
+          // read as the crust it is.
+          float lavaMask = smoothstep(0.015, 0.18, molten);
+          if (lavaMask > 0.001) {
+            // Downhill direction. For a heightfield normal (-dh/dx, 1, -dh/dz)
+            // the surface descends along n.xz, so this is the direction the
+            // flow is actually travelling — no extra data needed.
+            vec2 flowDir = vNormal.xz;
+            float flowLen = length(flowDir);
+            flowDir = flowLen > 0.001 ? flowDir / flowLen : vec2(0.0, 1.0);
+            vec2 across = vec2(-flowDir.y, flowDir.x);
+
+            // Crust pattern in a frame aligned to the flow: stretched along it,
+            // compressed across it. That anisotropy is what makes the surface
+            // read as *moving* rather than as a static noise field, and it is
+            // why the crust plates look torn downstream.
+            float along  = dot(vWorldPos.xz, flowDir);
+            float side   = dot(vWorldPos.xz, across);
+            float drift  = uTime * (0.35 + lavaHeat * 0.9);
+
+            // Warp the frame before sampling. A channel is only a few cells
+            // wide, so the across-flow coordinate barely varies over it and an
+            // unwarped pattern collapses into evenly spaced rungs — a ladder
+            // painted on the lava. Displacing the coordinates by a
+            // low-frequency field bends the plate boundaries into the
+            // irregular arcs ropy pahoehoe forms as its crust is dragged
+            // downstream.
+            float warp = fbm(vWorldPos.xz * 0.55) - 0.5;
+            vec2 crustUV = vec2((along - drift) * 0.24 + warp * 1.6,
+                                side * 0.85 + warp * 0.7);
+
+            float plates = fbm(crustUV);
+            // Cracks are the low ridges between plates; the hotter the flow,
+            // the wider they gape and the more incandescence shows through.
+            float crack = 1.0 - smoothstep(0.0, 0.18 + lavaHeat * 0.22,
+                                           abs(plates - 0.5));
+            float fine  = fbm(crustUV * 3.7 + vec2(drift * 0.4, 0.0));
+            crack = max(crack, (1.0 - smoothstep(0.0, 0.07, abs(fine - 0.5)))
+                               * lavaHeat * 0.7);
+
+            // A fast flow tears its crust apart; a stalled one skins over.
+            float exposure = clamp(crack * (0.35 + lavaHeat) + lavaHeat * 0.30,
+                                   0.0, 1.0);
+
+            // Interior temperature: the channel core runs hotter than its
+            // margins, so deep lava glows brighter than the same lava spread
+            // thin over the same rock.
+            float coreT = lavaHeat * (0.55 + 0.45 * smoothstep(0.05, 1.2, molten));
+            vec3 glowColor = blackbody(coreT);
+
+            // Chilled crust: nearly black, with the plates faintly visible.
+            vec3 crustColor = toLinear(vec3(0.035, 0.030, 0.032))
+                            * (0.6 + plates * 0.8);
+
+            vec3 lavaSurface = mix(crustColor * (sun * 0.35 + ambient),
+                                   glowColor, exposure);
+            // Emission proper — unlit, so it stays bright in shadow and at
+            // night, which is the whole point of a self-luminous material.
+            //
+            // Driven well past 1.0 on purpose. The tone mapper compresses the
+            // top end, so an emitter that peaks at white-on-the-wire lands as
+            // a dull cream once it has been rolled off; overdriving it is what
+            // buys back a core that actually reads as incandescent.
+            vec3 emission = glowColor * exposure * (0.7 + coreT * 2.6);
+            // Even sealed crust radiates while it is still hot.
+            emission += blackbody(coreT * 0.55) * lavaHeat * 0.25;
+
+            // Molten rock is glassy: a tight, strong highlight.
+            float lavaSpec = pow(max(dot(n, halfDir), 0.0), 90.0);
+            lavaSurface += toLinear(vec3(1.0, 0.85, 0.6)) * lavaSpec * 0.5;
+
+            finalColor = mix(finalColor, lavaSurface + emission, lavaMask);
+          }
+
+          // ---- Atmosphere --------------------------------------------------
+          // Distance from the *camera*, with a height falloff.
+          //
+          // This measured distance from the terrain's origin, so haze formed a
+          // fixed bowl centred on the map: it thickened as you looked outward
+          // even from a metre away, and never changed when you flew backwards.
+          // That is the opposite of aerial perspective, which is precisely the
+          // cue an eye uses to read scale — and terrain is nothing but scale.
+          // Distance is normalized by the terrain extent, so one density
+          // setting means the same amount of haze whether the map is 128 or
+          // 2048 units across — the same scale-independence the strata and
+          // erosion constants already follow.
+          float dist = length(cameraPosition - vWorldPos) / max(uTerrainExtent, 1.0);
+          float heightFalloff = exp(-max(vWorldPos.y, 0.0) / max(uTerrainExtent * 0.35, 1.0));
+          float fog = 1.0 - exp(-dist * uFogDensity * 120.0 * heightFalloff);
+
+          // Haze scatters the sun: looking toward it, the air glows.
+          float sunAmount = max(dot(-viewDir, lightDir), 0.0);
+          vec3 fogCol = mix(toLinear(uFogColor),
+                            sunTint * 1.15,
+                            pow(sunAmount, 6.0) * 0.55);
+          finalColor = mix(finalColor, fogCol, clamp(fog, 0.0, 1.0));
+
+          // ---- Output ------------------------------------------------------
+          finalColor = tonemapACES(finalColor * uExposure);
+          gl_FragColor = vec4(toSRGB(finalColor), 1.0);
         }
       `,
     });
 
+    materialRef.current = material;
     const mesh = new THREE.Mesh(geometry, material);
     sceneRef.current.add(mesh);
     meshRef.current = mesh;
@@ -306,7 +764,11 @@ export default function App() {
       vertices: meshData.vertices.length / 3,
       triangles: meshData.indices.length / 3
     }));
-  }, [params.biome, sunElevation, sunAzimuth, sunIntensity, fogDensity, updateAtmosphere]);
+
+    if (minimapRef.current) updateMinimap();
+  
+    refreshHeightRange();
+  }, [params.biome, sunElevation, sunAzimuth, sunIntensity, fogDensity, updateAtmosphere, updateMinimap, refreshHeightRange]);
 
   useEffect(() => {
     if (!canvasRef.current) return;
@@ -318,7 +780,9 @@ export default function App() {
     scene.fog = new THREE.FogExp2(skyColor, 0.002);
     sceneRef.current = scene;
 
-    const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 2000);
+    // Far plane sized for the largest terrain the resolution slider allows
+    // (2048 world units across at cellSize 1), plus headroom to orbit out.
+    const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 12000);
     camera.position.set(100, 100, 100);
     cameraRef.current = camera;
 
@@ -330,6 +794,10 @@ export default function App() {
     renderer.setSize(window.innerWidth, window.innerHeight);
     renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
     renderer.setClearColor(skyColor, 1.0);
+    // The terrain shader owns its whole colour chain — it decodes its palettes
+    // to linear, tone maps, and encodes back to sRGB itself. Telling Three.js
+    // the output is already sRGB stops it applying a second conversion on top.
+    renderer.outputColorSpace = THREE.SRGBColorSpace;
     rendererRef.current = renderer;
 
     const controls = new OrbitControls(camera, renderer.domElement);
@@ -346,8 +814,11 @@ export default function App() {
     scene.add(sunLight);
     sunLightRef.current = sunLight;
 
-    // Water Plane
-    const waterGeom = new THREE.PlaneGeometry(1000, 1000);
+    // Sea-level plane. Segmented, because the shader displaces its vertices
+    // into swell — the previous single-quad geometry had four corner vertices,
+    // so every ripple the vertex shader computed was interpolated flat across
+    // the whole ocean and none of it was ever visible.
+    const waterGeom = new THREE.PlaneGeometry(4000, 4000, 160, 160);
     const waterMat = new THREE.ShaderMaterial({
       transparent: true,
       side: THREE.DoubleSide,
@@ -362,8 +833,11 @@ export default function App() {
 
         void main() {
           vec3 pos = position;
-          pos.z += sin(pos.x * 0.1 + uTime) * 0.2;
-          pos.z += cos(pos.y * 0.12 + uTime * 1.2) * 0.15;
+          // Displacement is along the plane's local z, which becomes world Y
+          // once the mesh is rotated flat — this is the swell.
+          pos.z += sin(pos.x * 0.05 + uTime) * 0.35;
+          pos.z += cos(pos.y * 0.07 + uTime * 1.2) * 0.25;
+          pos.z += sin((pos.x + pos.y) * 0.021 - uTime * 0.6) * 0.5;
           vec4 worldPos = modelMatrix * vec4(pos, 1.0);
           vWorldPos = worldPos.xyz;
           gl_Position = projectionMatrix * modelViewMatrix * vec4(pos, 1.0);
@@ -375,19 +849,47 @@ export default function App() {
         uniform vec3 uSunPos;
         uniform float uTime;
 
+        vec3 toLinear(vec3 c) { return pow(max(c, vec3(0.0)), vec3(2.2)); }
+        vec3 toSRGB(vec3 c)   { return pow(max(c, vec3(0.0)), vec3(1.0 / 2.2)); }
+        vec3 tonemapACES(vec3 x) {
+          const float a = 2.51, b = 0.03, c = 2.43, d = 0.59, e = 0.14;
+          return clamp((x * (a * x + b)) / (x * (c * x + d) + e), 0.0, 1.0);
+        }
+
+        float h21(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
+        float vn(vec2 p) {
+          vec2 i = floor(p), f = fract(p);
+          f = f * f * (3.0 - 2.0 * f);
+          return mix(mix(h21(i), h21(i + vec2(1, 0)), f.x),
+                     mix(h21(i + vec2(0, 1)), h21(i + vec2(1, 1)), f.x), f.y);
+        }
+
         void main() {
           vec3 viewDir = normalize(cameraPosition - vWorldPos);
           vec3 lightDir = normalize(uSunPos);
-          
-          float fresnel = pow(1.0 - max(dot(viewDir, vec3(0.0, 1.0, 0.0)), 0.0), 3.0);
-          vec3 color = mix(uColor, vec3(0.4, 0.7, 1.0), fresnel * 0.5);
-          
-          // Specular highlights
-          vec3 halfDir = normalize(lightDir + viewDir);
-          float spec = pow(max(dot(vec3(0.0, 1.0, 0.0), halfDir), 0.0), 128.0);
-          color += spec * 0.5;
 
-          gl_FragColor = vec4(color, 0.8);
+          // Ripple normal, so the sea is not a mirror-flat pane. Two drifting
+          // octaves give a moving surface without needing a normal map.
+          float e = 0.6;
+          vec2 q = vWorldPos.xz * 0.06;
+          float n0 = vn(q + vec2(uTime * 0.05, 0.0)) + vn(q * 2.7 - vec2(0.0, uTime * 0.08)) * 0.5;
+          float nx = vn(q + vec2(e, 0.0) + vec2(uTime * 0.05, 0.0))
+                   + vn((q + vec2(e, 0.0)) * 2.7 - vec2(0.0, uTime * 0.08)) * 0.5;
+          float nz = vn(q + vec2(0.0, e) + vec2(uTime * 0.05, 0.0))
+                   + vn((q + vec2(0.0, e)) * 2.7 - vec2(0.0, uTime * 0.08)) * 0.5;
+          vec3 nrm = normalize(vec3(-(nx - n0) * 0.35, 1.0, -(nz - n0) * 0.35));
+
+          float fresnel = pow(1.0 - max(dot(viewDir, nrm), 0.0), 4.0);
+          vec3 deep = toLinear(uColor);
+          vec3 sky  = toLinear(vec3(0.42, 0.62, 0.82));
+          vec3 color = mix(deep, sky, clamp(fresnel * 1.2, 0.0, 1.0));
+
+          // Sun glitter.
+          vec3 halfDir = normalize(lightDir + viewDir);
+          float spec = pow(max(dot(nrm, halfDir), 0.0), 220.0);
+          color += toLinear(vec3(1.0, 0.95, 0.85)) * spec * 3.0;
+
+          gl_FragColor = vec4(toSRGB(tonemapACES(color)), 0.86);
         }
       `
     });
@@ -397,9 +899,12 @@ export default function App() {
     scene.add(water);
     waterRef.current = water;
 
+    // Rebuilt when the resolution changes — see the gridRef effect. A fixed
+    // 200-unit grid vanished under a 2048-wide terrain.
     const grid = new THREE.GridHelper(200, 20, 0x333333, 0x222222);
     grid.position.y = -0.1;
     scene.add(grid);
+    gridRef.current = grid;
 
     // Animation loop
     let animationId: number;
@@ -436,6 +941,43 @@ export default function App() {
     };
   }, []); // Only run once on mount
 
+  // --- Volcano placement ---------------------------------------------------
+
+  // Drops a volcano at a normalized position and returns its layer id so the
+  // drag handler can keep moving it.
+  //
+  // A volcano is inert without an eruption, so the first one placed also
+  // appends a Lava Flow layer. It goes at the end of the stack because it has
+  // to run after every volcano that feeds it — placing a second cone then
+  // reuses that same layer, which is what makes several vents erupt together
+  // into one shared flow field rather than each getting its own pass.
+  const placeVolcano = React.useCallback((nx: number, ny: number): string => {
+    const volcano = makeLayer('volcano');
+    volcano.params.x = nx;
+    volcano.params.y = ny;
+
+    setStack(s => {
+      const volcanoCount = s.filter(l => l.type === 'volcano').length;
+      volcano.params.variant = volcanoCount % 100;
+
+      const lavaIndex = s.findIndex(l => l.type === 'lava');
+      if (lavaIndex >= 0) {
+        // Keep the eruption downstream of the new cone.
+        const next = [...s];
+        next.splice(lavaIndex, 0, volcano);
+        return next;
+      }
+      return [...s, volcano, makeLayer('lava')];
+    });
+
+    return volcano.id;
+  }, []);
+
+  const moveVolcano = React.useCallback((id: string, nx: number, ny: number) => {
+    setStack(s => s.map(l =>
+      l.id === id ? { ...l, params: { ...l.params, x: nx, y: ny } } : l));
+  }, []);
+
   useEffect(() => {
     // 2. Interaction Layer (Raycasting/Events) - Re-bind on mode changes
     if (!rendererRef.current || !cameraRef.current || !sceneRef.current) return;
@@ -448,7 +990,7 @@ export default function App() {
       const mesh = meshRef.current;
       const engine = engineRef.current;
 
-      if ((!isInspectMode && !isCarveMode) || !camera || !mesh || !engine) {
+      if ((!isInspectMode && !isCarveMode && !isVolcanoMode) || !camera || !mesh || !engine) {
         setProbeData(null);
         return;
       }
@@ -462,7 +1004,7 @@ export default function App() {
       if (intersects.length > 0) {
         const point = intersects[0].point;
         const size = params.size;
-        
+
         const x = Math.round(point.x + size / 2);
         const y = Math.round(point.z + size / 2);
 
@@ -479,6 +1021,12 @@ export default function App() {
             engine.carve(x, y, carveRadius, carveDepth);
             updateMesh();
           }
+
+          // Dragging a freshly dropped volcano: rewrite its position rather
+          // than placing another one.
+          if (isVolcanoMode && isMouseDown.current && draggingVolcanoRef.current) {
+            moveVolcano(draggingVolcanoRef.current, x / size, y / size);
+          }
         }
       } else {
         setProbeData(null);
@@ -490,11 +1038,34 @@ export default function App() {
         isMouseDown.current = true;
         if (controlsRef.current) controlsRef.current.enabled = false;
         handlePointerMove(event);
+        return;
+      }
+
+      if (isVolcanoMode) {
+        const camera = cameraRef.current;
+        const mesh = meshRef.current;
+        if (!camera || !mesh) return;
+
+        mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+        mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+        raycaster.setFromCamera(mouse, camera);
+        const hits = raycaster.intersectObject(mesh);
+        if (hits.length === 0) return;
+
+        const size = params.size;
+        const gx = (hits[0].point.x + size / 2) / size;
+        const gy = (hits[0].point.z + size / 2) / size;
+        if (gx < 0 || gx > 1 || gy < 0 || gy > 1) return;
+
+        isMouseDown.current = true;
+        if (controlsRef.current) controlsRef.current.enabled = false;
+        draggingVolcanoRef.current = placeVolcano(gx, gy);
       }
     };
 
     const handlePointerUp = () => {
       isMouseDown.current = false;
+      draggingVolcanoRef.current = null;
       if (controlsRef.current) controlsRef.current.enabled = true;
     };
 
@@ -507,7 +1078,8 @@ export default function App() {
       window.removeEventListener('pointerdown', handlePointerDown);
       window.removeEventListener('pointerup', handlePointerUp);
     };
-  }, [isInspectMode, isCarveMode, carveRadius, carveDepth, params.size, updateMesh]);
+  }, [isInspectMode, isCarveMode, isVolcanoMode, carveRadius, carveDepth,
+      params.size, updateMesh, placeVolcano, moveVolcano]);
 
   const floraRef = useRef<THREE.InstancedMesh | null>(null);
 
@@ -617,7 +1189,7 @@ export default function App() {
     const startTime = performance.now();
 
     try {
-      const project: TitanProject = { version: 1, params, stack };
+      const project: TitanProject = { version: 1, params, stack, imported };
       const completed = await runPipeline(engine, project, {
         onProgress: (frac, label) => {
           if (runIdRef.current === myRun) setProgress({ frac, label });
@@ -628,6 +1200,12 @@ export default function App() {
         shouldCancel: () => runIdRef.current !== myRun,
       });
       if (completed && runIdRef.current === myRun) {
+        // Trace ambient occlusion once the stack has settled, then rebuild the
+        // mesh so it carries it. This is deliberately outside the chunk loop:
+        // AO is the engine's most expensive derived map and re-tracing it per
+        // chunk would cost more than every simulation pass combined.
+        engine.computeAO();
+        updateMesh();
         setStats(prev => ({ ...prev, time: Math.round(performance.now() - startTime) }));
       }
     } catch (err) {
@@ -639,7 +1217,7 @@ export default function App() {
         setProgress(null);
       }
     }
-  }, [params, stack, updateMesh]);
+  }, [params, stack, imported, updateMesh]);
 
   const cancelRun = React.useCallback(() => {
     runIdRef.current++;
@@ -657,9 +1235,9 @@ export default function App() {
     }
   }, [seedLocked, runStack]);
 
-  // --- Undo/redo over (params, stack) snapshots ---------------------------
+  // --- Undo/redo over (params, stack, import) snapshots -------------------
   useEffect(() => {
-    const snapshot = serializeProject({ version: 1, params, stack });
+    const snapshot = serializeProject({ version: 1, params, stack, imported });
     const h = historyRef.current;
     if (applyingHistoryRef.current) {
       applyingHistoryRef.current = false;
@@ -669,13 +1247,14 @@ export default function App() {
       h.future = [];
     }
     setHistoryState({ canUndo: h.past.length > 1, canRedo: h.future.length > 0 });
-  }, [params, stack]);
+  }, [params, stack, imported]);
 
   const applySnapshot = React.useCallback((json: string) => {
     const project = deserializeProject(json);
     applyingHistoryRef.current = true;
     setParams(project.params);
     setStack(project.stack);
+    setImported(project.imported);
   }, []);
 
   const undo = React.useCallback(() => {
@@ -702,6 +1281,8 @@ export default function App() {
     setStack(s => s.map(l => (l.id === id ? { ...l, enabled } : l)));
   const setLayerParam = (id: string, key: string, value: number) =>
     setStack(s => s.map(l => (l.id === id ? { ...l, params: { ...l.params, [key]: value } } : l)));
+  const setLayerMask = (id: string, patch: Partial<LayerMask>) =>
+    setStack(s => s.map(l => (l.id === id ? { ...l, mask: { ...l.mask, ...patch } } : l)));
   const moveLayer = (id: string, dir: -1 | 1) =>
     setStack(s => {
       const i = s.findIndex(l => l.id === id);
@@ -721,9 +1302,62 @@ export default function App() {
     setStack(presetStack);
   };
 
+  // --- Heightmap import ----------------------------------------------------
+  // Decodes .png (any image), .r16 (uint16 LE RAW), or .r32 (float32 LE RAW)
+  // into a normalized 0..1 square field. The engine resamples it to the
+  // working resolution and the Height slider sets its vertical scale.
+  const importHeightmap = async (file: File) => {
+    const ext = file.name.split('.').pop()?.toLowerCase();
+    try {
+      let size: number;
+      let data: Float32Array;
+
+      if (ext === 'r16' || ext === 'raw') {
+        const u16 = new Uint16Array(await file.arrayBuffer());
+        size = Math.floor(Math.sqrt(u16.length));
+        if (size < 2 || size * size !== u16.length) {
+          throw new Error('RAW heightmap must be a square uint16 grid');
+        }
+        data = new Float32Array(size * size);
+        for (let i = 0; i < data.length; i++) data[i] = u16[i] / 65535;
+      } else if (ext === 'r32') {
+        const f32 = new Float32Array(await file.arrayBuffer());
+        size = Math.floor(Math.sqrt(f32.length));
+        if (size < 2 || size * size !== f32.length) {
+          throw new Error('RAW heightmap must be a square float32 grid');
+        }
+        let max = 0;
+        for (let i = 0; i < f32.length; i++) max = Math.max(max, f32[i]);
+        data = new Float32Array(size * size);
+        for (let i = 0; i < data.length; i++) data[i] = max > 0 ? Math.max(0, f32[i]) / max : 0;
+      } else {
+        const bitmap = await createImageBitmap(file);
+        size = Math.min(1024, Math.max(bitmap.width, bitmap.height));
+        const canvas = document.createElement('canvas');
+        canvas.width = size;
+        canvas.height = size;
+        const ctx = canvas.getContext('2d')!;
+        ctx.drawImage(bitmap, 0, 0, size, size);
+        const pixels = ctx.getImageData(0, 0, size, size).data;
+        data = new Float32Array(size * size);
+        for (let i = 0; i < data.length; i++) {
+          data[i] = (pixels[i * 4] + pixels[i * 4 + 1] + pixels[i * 4 + 2]) / (3 * 255);
+        }
+        bitmap.close();
+      }
+
+      setImported({ size, data, name: file.name });
+      // Flat noise structure makes the import the base terrain.
+      setParams(p => ({ ...p, noiseType: 'none' }));
+      setError(null);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Could not import heightmap');
+    }
+  };
+
   // --- Project save/load ---------------------------------------------------
   const saveProject = () => {
-    const json = serializeProject({ version: 1, params, stack });
+    const json = serializeProject({ version: 1, params, stack, imported });
     const blob = new Blob([json], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
@@ -738,6 +1372,7 @@ export default function App() {
       const project = deserializeProject(await file.text());
       setParams(project.params);
       setStack(project.stack);
+      setImported(project.imported);
       setError(null);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Could not read project file');
@@ -754,93 +1389,28 @@ export default function App() {
     URL.revokeObjectURL(url);
   };
 
-  const exportVia = (kind: 'png16' | 'r16' | 'r32' | 'exr' | 'obj', ext: string) => {
+  const exportVia = (kind: ExportKind, ext: string) => {
     if (!engineRef.current) return;
-    downloadBinary(
-      engineRef.current.exportFile(kind),
-      `titan_${params.seed}_${params.size}x${params.size}.${ext}`
-    );
+    try {
+      downloadBinary(
+        engineRef.current.exportFile(kind),
+        `titan_${params.seed}_${params.size}x${params.size}.${ext}`
+      );
+    } catch (err) {
+      // The engine now reports failures (out of memory on a large grid being
+      // the realistic one) instead of silently producing an empty file.
+      setError(err instanceof Error ? err.message : 'Export failed');
+    }
   };
 
 
-  const exportHeightmapPNG = () => {
-    if (!engineRef.current) return;
-    const size = params.size;
-    const canvas = document.createElement('canvas');
-    canvas.width = size;
-    canvas.height = size;
-    const ctx = canvas.getContext('2d')!;
-    const imageData = ctx.createImageData(size, size);
-    
-    const bedrock = engineRef.current.getBedrockMap();
-    const sediment = engineRef.current.getSedimentMap();
-    
-    let minH = Infinity;
-    let maxH = -Infinity;
-    for (let i = 0; i < size * size; i++) {
-      const h = bedrock[i] + sediment[i];
-      if (h < minH) minH = h;
-      if (h > maxH) maxH = h;
-    }
-    const range = maxH - minH || 1;
-
-    for (let i = 0; i < size * size; i++) {
-      const h = bedrock[i] + sediment[i];
-      const val = Math.floor(((h - minH) / range) * 255);
-      imageData.data[i * 4 + 0] = val;
-      imageData.data[i * 4 + 1] = val;
-      imageData.data[i * 4 + 2] = val;
-      imageData.data[i * 4 + 3] = 255;
-    }
-    
-    ctx.putImageData(imageData, 0, 0);
-    const url = canvas.toDataURL('image/png');
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `titan_heightmap_${size}x${size}.png`;
-    a.click();
-  };
-
-  const exportSplatmap = () => {
-    if (!engineRef.current) return;
-    const size = params.size;
-    const canvas = document.createElement('canvas');
-    canvas.width = size;
-    canvas.height = size;
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return;
-    
-    const imageData = ctx.createImageData(size, size);
-    const bedrock = engineRef.current.getBedrockMap();
-    const sediment = engineRef.current.getSedimentMap();
-    const flowMap = engineRef.current.getFlowMap();
-
-    for (let y = 0; y < size; y++) {
-      for (let x = 0; x < size; x++) {
-        const i = y * size + x;
-        const s = sediment[i];
-
-        // R: Rock mask, G: Height mask, B: Flow mask (Wetness)
-        const h = bedrock[i] + s;
-        const hNorm = Math.min(255, (h / params.heightMultiplier) * 255);
-        const fNorm = Math.min(255, (flowMap[i] || 0) * 255);
-        const slope = engineRef.current.calculateSlope(x, y);
-        const rNorm = Math.min(255, slope * 2.5 * 255);
-        
-        imageData.data[i * 4 + 0] = rNorm; // Rock mask
-        imageData.data[i * 4 + 1] = hNorm; // Height mask
-        imageData.data[i * 4 + 2] = fNorm; // Flow mask
-        imageData.data[i * 4 + 3] = 255;
-      }
-    }
-    
-    ctx.putImageData(imageData, 0, 0);
-    const url = canvas.toDataURL('image/png');
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `titan_splatmap_${size}x${size}.png`;
-    a.click();
-  };
+  // exportHeightmapPNG and exportSplatmap used to build their images in
+  // JavaScript from copied-out buffers. Both were wrong in ways the user could
+  // not see: the heightmap was 8-bit (banded, useless as a heightmap) next to a
+  // correct 16-bit C++ exporter, and the splatmap computed its rock mask as
+  // slope * 2.5 while the mesh shader used (slope - 0.36) / 0.48, so the
+  // exported masks did not line up with the terrain on screen. Both now go
+  // through the engine, which shares one channel definition with the mesh.
 
   const updateParam = (key: keyof TerrainParams, value: any) => {
     console.log(`Updating param ${key} to ${value}`);
@@ -852,12 +1422,38 @@ export default function App() {
     console.log('Params updated:', params);
   }, [params]);
 
+  // Reframe the camera when the terrain extent changes.
+  useEffect(() => {
+    frameTerrain(params.size);
+  }, [params.size, frameTerrain]);
+
+  // Resize the reference grid with the terrain. It spans the map plus a
+  // margin, with one division per 1/16th, so it reads as a scale reference at
+  // any resolution rather than a 200-unit postage stamp under a 2048 map.
+  useEffect(() => {
+    const scene = sceneRef.current;
+    if (!scene) return;
+    const extent = Math.max(64, params.size) * 1.5;
+    const old = gridRef.current;
+    if (old) {
+      scene.remove(old);
+      old.geometry.dispose();
+      (old.material as THREE.Material).dispose();
+    }
+    const grid = new THREE.GridHelper(extent, 24, 0x3a3a3a, 0x252525);
+    grid.position.y = -0.1;
+    grid.visible = old ? old.visible : true;
+    scene.add(grid);
+    gridRef.current = grid;
+  }, [params.size]);
+
   useEffect(() => {
     updateAtmosphere();
     if (waterRef.current) {
       waterRef.current.position.y = waterLevel;
     }
-  }, [waterLevel, sunElevation, sunAzimuth, sunIntensity, fogDensity, updateAtmosphere]);
+    if (minimapRef.current) updateMinimap();
+  }, [waterLevel, sunElevation, sunAzimuth, sunIntensity, fogDensity, updateAtmosphere, updateMinimap]);
 
   useEffect(() => {
     // Set explicit background for the window to match sky
@@ -1044,7 +1640,11 @@ export default function App() {
                          { id: 'none', icon: Minus, label: 'Flat' },
                          { id: 'standard', icon: Mountain, label: 'Simplex' },
                          { id: 'ridged', icon: Activity, label: 'Ridged' },
-                         { id: 'billow', icon: Cloud, label: 'Billow' }
+                         { id: 'billow', icon: Cloud, label: 'Billow' },
+                         { id: 'voronoi', icon: Hexagon, label: 'Cells' },
+                         { id: 'voronoiRidge', icon: Grid3X3, label: 'Walls' },
+                         { id: 'worleyManhattan', icon: Grid2X2, label: 'Worley' },
+                         { id: 'hybrid', icon: Layers, label: 'Hybrid' }
                        ].map((t) => (
                          <Button
                            key={t.id}
@@ -1057,6 +1657,46 @@ export default function App() {
                          </Button>
                        ))}
                     </div>
+                  </div>
+
+                  <div className="space-y-3">
+                    <Label className="text-[11px] uppercase tracking-widest text-zinc-400">Heightmap Import</Label>
+                    {imported ? (
+                      <div className="flex items-center gap-2 p-3 bg-zinc-900 rounded border border-emerald-500/30">
+                        <ImageIcon className="w-4 h-4 text-emerald-400 shrink-0" />
+                        <div className="flex-1 min-w-0">
+                          <div className="text-[10px] font-bold truncate">{imported.name ?? 'Imported heightmap'}</div>
+                          <div className="text-[9px] text-zinc-500 font-mono">{imported.size}×{imported.size} · scaled by Height</div>
+                        </div>
+                        <Button variant="ghost" size="sm" className="h-6 w-6 p-0 text-zinc-500 hover:text-red-400"
+                          onClick={() => setImported(undefined)}>
+                          <X className="w-3 h-3" />
+                        </Button>
+                      </div>
+                    ) : (
+                      <Button
+                        variant="outline"
+                        className="w-full border-zinc-800 hover:bg-zinc-800 text-[10px] uppercase tracking-widest h-10"
+                        onClick={() => importFileRef.current?.click()}
+                      >
+                        <Upload className="w-3 h-3 mr-2" />
+                        Import .png / .r16 / .r32
+                      </Button>
+                    )}
+                    <input
+                      ref={importFileRef}
+                      type="file"
+                      accept=".png,.jpg,.jpeg,.webp,.r16,.r32,.raw,image/*"
+                      className="hidden"
+                      onChange={(e) => {
+                        const file = e.target.files?.[0];
+                        if (file) importHeightmap(file);
+                        e.target.value = '';
+                      }}
+                    />
+                    <p className="text-[9px] text-zinc-600 leading-relaxed">
+                      The import becomes the base terrain (resampled to the working resolution). Blend it further with a Combine Import layer.
+                    </p>
                   </div>
 
                   <div className="space-y-4">
@@ -1097,7 +1737,7 @@ export default function App() {
                     <Slider 
                       value={[params.size || 128]} 
                       min={64} 
-                      max={512} 
+                      max={2048} 
                       step={64} 
                       onValueChange={(v: number[]) => {
                         if (v && v.length > 0) updateParam('size', v[0]);
@@ -1129,7 +1769,7 @@ export default function App() {
                     <Slider 
                       value={[params.heightMultiplier || 40]} 
                       min={10} 
-                      max={200} 
+                      max={500} 
                       step={1} 
                       onValueChange={(v: number[]) => {
                         if (v && v.length > 0) updateParam('heightMultiplier', v[0]);
@@ -1232,7 +1872,7 @@ export default function App() {
                         </div>
                         <p className="text-[9px] text-zinc-600 mb-4 leading-relaxed">{def.description}</p>
                         <div className="space-y-4">
-                          {def.params.map(pd => (
+                          {def.params.filter(pd => !pd.advanced).map(pd => (
                             <div key={pd.key} className="space-y-2">
                               <div className="flex items-center justify-between">
                                 <Label className="text-[10px] uppercase text-zinc-400">{pd.label}</Label>
@@ -1256,6 +1896,79 @@ export default function App() {
                               )}
                             </div>
                           ))}
+
+                          {/* Advanced physics. These map onto the engine's _ex
+                              erosion entry points, which shipped in v0.4 and
+                              were reachable from no UI until now. Collapsed by
+                              default so the common case stays two sliders. */}
+                          {def.params.some(pd => pd.advanced) && (
+                            <div className="pt-2">
+                              <button
+                                className="text-[9px] uppercase tracking-widest text-zinc-500 hover:text-emerald-400"
+                                onClick={() => setExpandedAdvanced(prev => ({ ...prev, [layer.id]: !prev[layer.id] }))}
+                              >
+                                {expandedAdvanced[layer.id] ? '- ' : '+ '}Advanced ({def.params.filter(pd => pd.advanced).length})
+                              </button>
+                              {expandedAdvanced[layer.id] && (
+                                <div className="mt-3 space-y-4 pl-2 border-l border-zinc-800">
+                                  {def.params.filter(pd => pd.advanced).map(pd => (
+                                    <div key={pd.key} className="space-y-2">
+                                      <div className="flex items-center justify-between">
+                                        <Label className="text-[10px] uppercase text-zinc-400">{pd.label}</Label>
+                                        <span className="text-xs font-mono">{(layer.params[pd.key] ?? pd.defaultValue).toLocaleString()}</span>
+                                      </div>
+                                      <Slider value={[layer.params[pd.key] ?? pd.defaultValue]} min={pd.min} max={pd.max} step={pd.step}
+                                        onValueChange={(v: number[]) => { if (v && v.length > 0) setLayerParam(layer.id, pd.key, v[0]); }} />
+                                    </div>
+                                  ))}
+                                </div>
+                              )}
+                            </div>
+                          )}
+
+                          {/* Per-layer mask: gate this layer by a terrain feature */}
+                          <div className="pt-3 border-t border-zinc-800/70 space-y-3">
+                            <div className="flex items-center justify-between">
+                              <Label className="text-[10px] uppercase text-zinc-500">Mask</Label>
+                              {layer.mask.mode > 0 && (
+                                <button
+                                  className={`text-[9px] uppercase tracking-wider ${layer.mask.invert ? 'text-emerald-400' : 'text-zinc-600 hover:text-zinc-300'}`}
+                                  onClick={() => setLayerMask(layer.id, { invert: !layer.mask.invert })}
+                                >
+                                  Invert {layer.mask.invert ? 'On' : 'Off'}
+                                </button>
+                              )}
+                            </div>
+                            <div className="grid grid-cols-5 gap-1">
+                              {MASK_MODE_LABELS.map((label, mi) => (
+                                <Button key={label} variant="outline" size="sm"
+                                  className={`h-6 px-0 text-[8px] uppercase tracking-tight bg-zinc-950 border-zinc-800 ${layer.mask.mode === mi ? 'border-emerald-500/50 text-emerald-400' : 'text-zinc-500'}`}
+                                  onClick={() => setLayerMask(layer.id, { mode: mi })}>
+                                  {label}
+                                </Button>
+                              ))}
+                            </div>
+                            {layer.mask.mode > 0 && (
+                              <>
+                                <div className="space-y-2">
+                                  <div className="flex justify-between">
+                                    <Label className="text-[9px] text-zinc-500 uppercase">Band Min</Label>
+                                    <span className="text-[9px] font-mono">{layer.mask.lo.toFixed(2)}</span>
+                                  </div>
+                                  <Slider value={[layer.mask.lo]} min={0} max={1} step={0.05}
+                                    onValueChange={(v: number[]) => { if (v && v.length > 0) setLayerMask(layer.id, { lo: v[0] }); }} />
+                                </div>
+                                <div className="space-y-2">
+                                  <div className="flex justify-between">
+                                    <Label className="text-[9px] text-zinc-500 uppercase">Band Max</Label>
+                                    <span className="text-[9px] font-mono">{layer.mask.hi.toFixed(2)}</span>
+                                  </div>
+                                  <Slider value={[layer.mask.hi]} min={0} max={1} step={0.05}
+                                    onValueChange={(v: number[]) => { if (v && v.length > 0) setLayerMask(layer.id, { hi: v[0] }); }} />
+                                </div>
+                              </>
+                            )}
+                          </div>
                         </div>
                       </div>
                     );
@@ -1273,6 +1986,59 @@ export default function App() {
                         </Button>
                       ))}
                     </div>
+                  </div>
+
+                  <div className="p-4 bg-zinc-900 rounded-lg border border-orange-500/30">
+                    <div className="flex items-center gap-3 mb-3">
+                      <Flame className="w-5 h-5 text-orange-400" />
+                      <h3 className="text-xs font-bold uppercase tracking-widest">Volcanoes</h3>
+                    </div>
+                    <p className="text-[10px] text-zinc-500 mb-4 leading-relaxed">
+                      Turn this on and press anywhere on the terrain to drop a volcano — drag before releasing to position it.
+                      Each one adds a Volcano layer you can tune below; a single Lava Flow layer erupts them all.
+                    </p>
+                    <Button
+                      onClick={() => {
+                        setIsVolcanoMode(v => !v);
+                        setIsCarveMode(false);
+                        setIsInspectMode(false);
+                      }}
+                      className={`w-full text-xs uppercase font-bold tracking-widest ${
+                        isVolcanoMode
+                          ? 'bg-orange-500 hover:bg-orange-400 text-zinc-950'
+                          : 'bg-zinc-800 hover:bg-zinc-700 text-zinc-100'
+                      }`}
+                      disabled={isGenerating}
+                    >
+                      <Flame className="w-3 h-3 mr-2" />
+                      {isVolcanoMode ? 'Placing — click the terrain' : 'Place a Volcano'}
+                    </Button>
+                    <div className="grid grid-cols-2 gap-2 mt-3">
+                      <Button
+                        variant="outline"
+                        className="border-zinc-800 hover:bg-zinc-800 text-[10px] uppercase tracking-widest h-8"
+                        onClick={() => placeVolcano(0.5, 0.5)}
+                      >
+                        <Plus className="w-3 h-3 mr-1" />
+                        At Center
+                      </Button>
+                      <Button
+                        variant="outline"
+                        className="border-zinc-800 hover:bg-zinc-800 text-[10px] uppercase tracking-widest h-8 disabled:opacity-30"
+                        disabled={!stack.some(l => l.type === 'volcano')}
+                        onClick={() => setStack(s => s.filter(
+                          l => l.type !== 'volcano' && l.type !== 'lava'))}
+                      >
+                        <Trash2 className="w-3 h-3 mr-1" />
+                        Clear All
+                      </Button>
+                    </div>
+                    {stack.filter(l => l.type === 'volcano').length > 0 && (
+                      <p className="text-[9px] text-orange-400/80 font-mono mt-3">
+                        {stack.filter(l => l.type === 'volcano').length} volcano
+                        {stack.filter(l => l.type === 'volcano').length === 1 ? '' : 'es'} placed
+                      </p>
+                    )}
                   </div>
 
                   <div className="p-4 bg-zinc-900 rounded-lg border border-zinc-800">
@@ -1362,6 +2128,14 @@ export default function App() {
 
                   <div className="flex items-center justify-between p-4 bg-zinc-900 rounded-lg border border-zinc-800">
                     <div className="flex flex-col gap-1">
+                      <Label className="text-xs font-bold uppercase tracking-widest">2D Top-Down Map</Label>
+                      <span className="text-[10px] text-zinc-500">Hypsometric overhead view</span>
+                    </div>
+                    <Switch checked={showMinimap} onCheckedChange={setShowMinimap} />
+                  </div>
+
+                  <div className="flex items-center justify-between p-4 bg-zinc-900 rounded-lg border border-zinc-800">
+                    <div className="flex flex-col gap-1">
                       <Label className="text-xs font-bold uppercase tracking-widest">Wireframe</Label>
                       <span className="text-[10px] text-zinc-500">View underlying geometry</span>
                     </div>
@@ -1378,8 +2152,7 @@ export default function App() {
                       <span className="text-[10px] text-zinc-500">Show spatial reference</span>
                     </div>
                     <Switch defaultChecked onCheckedChange={(v) => {
-                      const grid = sceneRef.current?.children.find(c => c instanceof THREE.GridHelper);
-                      if (grid) grid.visible = v;
+                      if (gridRef.current) gridRef.current.visible = v;
                     }} />
                   </div>
 
@@ -1390,7 +2163,7 @@ export default function App() {
                     </div>
                     <Switch checked={isInspectMode} onCheckedChange={(v) => {
                       setIsInspectMode(v);
-                      if (v) setIsCarveMode(false);
+                      if (v) { setIsCarveMode(false); setIsVolcanoMode(false); }
                     }} />
                   </div>
 
@@ -1402,7 +2175,7 @@ export default function App() {
                       </div>
                       <Switch checked={isCarveMode} onCheckedChange={(v) => {
                         setIsCarveMode(v);
-                        if (v) setIsInspectMode(false);
+                        if (v) { setIsInspectMode(false); setIsVolcanoMode(false); }
                       }} />
                     </div>
                     {isCarveMode && (
@@ -1432,9 +2205,32 @@ export default function App() {
                       <Download className="w-5 h-5 text-emerald-400" />
                       <h3 className="text-xs font-bold uppercase tracking-widest">Unreal Engine Export</h3>
                     </div>
-                    <p className="text-[10px] text-zinc-500 mb-6 leading-relaxed">
+                    <p className="text-[10px] text-zinc-500 mb-4 leading-relaxed">
                       Export high-bitrate heightmaps and splatmaps for direct import into Unreal Engine 5.
                     </p>
+
+                    {heightRange && (
+                      <div className="mb-6 rounded-md border border-zinc-800 bg-zinc-900/60 p-3">
+                        <div className="text-[9px] uppercase tracking-widest text-zinc-500 mb-1">
+                          Height range (actual)
+                        </div>
+                        <div className="font-mono text-[11px] text-zinc-200">
+                          {heightRange.min.toFixed(2)} &rarr; {heightRange.max.toFixed(2)}
+                          <span className="text-zinc-500">
+                            {'  span '}{(heightRange.max - heightRange.min).toFixed(2)}
+                          </span>
+                        </div>
+                        <div className="text-[9px] text-zinc-500 mt-2 leading-relaxed">
+                          .r16 and .png16 are normalized to exactly this span, not to the
+                          Height slider ({params.heightMultiplier}) &mdash; erosion and
+                          deposition move both ends. Unreal Z scale ={' '}
+                          <span className="font-mono text-zinc-300">
+                            {(((heightRange.max - heightRange.min) * 100) / 512).toFixed(3)}
+                          </span>{' '}
+                          at 1 unit = 1 m.
+                        </div>
+                      </div>
+                    )}
                     
                     <div className="grid grid-cols-2 gap-3">
                       {([
@@ -1443,6 +2239,9 @@ export default function App() {
                         { kind: 'exr', ext: 'exr', label: '.exr', sub: 'Float32 · Blender/Nuke' },
                         { kind: 'r32', ext: 'r32', label: '.r32', sub: 'Float32 RAW · absolute' },
                         { kind: 'obj', ext: 'obj', label: '.obj', sub: 'Mesh · Blender' },
+                        { kind: 'normal', ext: 'png', label: '.png N', sub: 'Normal map · RGB8' },
+                        { kind: 'ao', ext: 'png', label: '.png AO', sub: 'Ambient occlusion' },
+                        { kind: 'splat', ext: 'png', label: '.png Splat', sub: 'RGBA masks · matches viewport' },
                       ] as const).map(f => (
                         <Button
                           key={f.kind}
@@ -1457,27 +2256,7 @@ export default function App() {
                           <span className="text-[8px] opacity-60">{f.sub}</span>
                         </Button>
                       ))}
-                      <Button
-                        onClick={exportHeightmapPNG}
-                        variant="outline"
-                        className="w-full border-zinc-800 hover:bg-zinc-800 text-[10px] uppercase tracking-widest h-12 text-center flex flex-col items-center justify-center"
-                      >
-                        <div className="flex items-center mb-1">
-                          <ImageIcon className="w-3 h-3 mr-1" />
-                          <span>.png 8</span>
-                        </div>
-                        <span className="text-[8px] opacity-60">8-bit Mask</span>
-                      </Button>
                     </div>
-                      
-                    <Button 
-                      onClick={exportSplatmap}
-                      variant="outline" 
-                      className="w-full border-zinc-800 hover:bg-zinc-800 text-[10px] uppercase tracking-widest h-12"
-                    >
-                      <ImageIcon className="w-4 h-4 mr-2" />
-                      Export Splatmap (PNG)
-                    </Button>
                   </div>
 
                   <div className="p-4 bg-zinc-900 rounded-lg border border-zinc-800">
@@ -1582,6 +2361,29 @@ export default function App() {
         </div>
       )}
 
+      {/* 2D top-down map */}
+      {showMinimap && (
+        <div className="absolute top-24 right-6 z-20 pointer-events-auto">
+          <Card className="bg-zinc-950/85 backdrop-blur-md border-zinc-800 p-2">
+            <div className="flex items-center justify-between mb-1.5 px-0.5">
+              <div className="flex items-center gap-1.5">
+                <MapIcon className="w-3 h-3 text-emerald-400" />
+                <span className="text-[9px] font-bold uppercase tracking-widest text-zinc-400">Top-Down</span>
+              </div>
+              <span className="text-[8px] font-mono text-zinc-600">{params.size}×{params.size}</span>
+            </div>
+            <canvas
+              ref={(el) => {
+                minimapRef.current = el;
+                if (el) updateMinimap();
+              }}
+              className="w-[220px] h-[220px] rounded-sm border border-zinc-800"
+              style={{ imageRendering: 'pixelated' }}
+            />
+          </Card>
+        </div>
+      )}
+
       {/* Footer / Overlay */}
       <div className="absolute bottom-6 right-6 z-20 flex flex-col items-end gap-2 pointer-events-none">
         {probeData && (
@@ -1615,6 +2417,13 @@ export default function App() {
           </Card>
         )}
         <div className="flex items-center gap-2 pointer-events-auto">
+          {isVolcanoMode && (
+            <Card className="bg-orange-500/15 backdrop-blur-sm border-orange-500/50 px-3 py-1.5">
+              <span className="text-[10px] font-mono text-orange-300 uppercase tracking-widest">
+                Press terrain to drop a volcano · drag to place
+              </span>
+            </Card>
+          )}
           <Card className="bg-zinc-950/50 backdrop-blur-sm border-zinc-800/50 px-3 py-1.5">
             <span className="text-[10px] font-mono text-zinc-500 uppercase tracking-widest">Orbit: Left Mouse</span>
           </Card>

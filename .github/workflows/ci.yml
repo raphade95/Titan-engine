@@ -33,6 +33,157 @@ jobs:
         run: .\build\Release\titan_tests.exe
         working-directory: titan-terrain-engine/cpp
 
+      # The behavioural tests above only prove a platform agrees with itself.
+      # These compare against checked-in constants, which is what actually
+      # tests the cross-platform seed guarantee. Layer 1 (integer) must match
+      # exactly everywhere; layer 2 (terrain) is toleranced off-reference
+      # because libm is not bit-portable. See docs/determinism.md.
+      # macOS is the reference configuration, so it must enforce exact hashes.
+      # --require-reference makes that explicit: if this runner ever stops
+      # being Apple arm64, the job fails loudly instead of silently downgrading
+      # to the toleranced path and leaving no build anywhere checking bits.
+      - name: Golden checks (macOS, reference)
+        if: runner.os == 'macOS'
+        run: ./build/titan_golden --require-reference
+        working-directory: titan-terrain-engine/cpp
+
+      - name: Golden checks (Linux)
+        if: runner.os == 'Linux'
+        run: ./build/titan_golden
+        working-directory: titan-terrain-engine/cpp
+
+      - name: Golden checks (Windows)
+        if: runner.os == 'Windows'
+        run: .\build\Release\titan_golden.exe
+        working-directory: titan-terrain-engine/cpp
+
+  mutation:
+    name: Golden harness mutation test
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Asserts the golden harness can still detect the determinism defects it
+      # was built for. A regression test that has quietly stopped detecting
+      # anything is worse than no test at all.
+      - run: cpp/tools/mutation_test.sh
+        working-directory: titan-terrain-engine
+
+  wasm:
+    name: WASM engine parity
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: mymindstorm/setup-emsdk@v14
+
+      # src/wasm/titan_core.js is a checked-in build artifact. Without this
+      # job it can silently drift from the C++ it claims to be built from, and
+      # the free-tier web lab would ship a stale engine.
+      - name: Rebuild WASM
+        run: cpp/build_wasm.sh
+        working-directory: titan-terrain-engine
+
+      - name: Fail if the checked-in WASM was stale
+        working-directory: titan-terrain-engine
+        run: |
+          if ! git diff --quiet -- src/wasm/; then
+            echo "::error::src/wasm/titan_core.js is out of date with cpp/."
+            echo "Run cpp/build_wasm.sh and commit the result."
+            git diff --stat -- src/wasm/
+            exit 1
+          fi
+          echo "checked-in WASM matches the C++ sources"
+
+      - name: Golden checks against the shipped WASM
+        run: node cpp/tools/wasm_golden.mjs
+        working-directory: titan-terrain-engine
+
+  plugin-libs:
+    name: TitanBridge library (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            artifact: libTitanCore-Mac
+            path: titan-terrain-engine/cpp/build/libTitanCore.a
+          - os: windows-latest
+            artifact: TitanCore-Win64
+            path: titan-terrain-engine/cpp/build/Release/TitanCore.lib
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      # The Fab package needs a prebuilt libTitanCore per platform. Producing
+      # them here is what stops the shipped plugin drifting behind the engine
+      # again — the checked-in Mac library had fallen ~25 API functions and two
+      # feature releases behind, and no Win64 library existed at all.
+      - name: Build TitanCore
+        run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --config Release --target TitanCore
+        working-directory: titan-terrain-engine/cpp
+      # The Mac library is checked in (the Fab package ships it). Verify it
+      # still exports everything a fresh build does, so a stale binary cannot
+      # sit in the repo unnoticed the way the last one did.
+      - name: Fail if the checked-in Mac library is stale
+        if: runner.os == 'macOS'
+        working-directory: titan-terrain-engine
+        run: |
+          fresh=$(nm -gU cpp/build/libTitanCore.a | grep -o '_titan_[a-z_0-9]*' | sort -u)
+          shipped=$(nm -gU unreal/TitanBridge/ThirdParty/TitanCore/lib/Mac/libTitanCore.a \
+                    | grep -o '_titan_[a-z_0-9]*' | sort -u)
+          if [ "$fresh" != "$shipped" ]; then
+            echo "::error::The checked-in TitanBridge library is out of date with cpp/."
+            echo "Missing from the shipped library:"
+            comm -23 <(echo "$fresh") <(echo "$shipped") | sed 's/^/  /'
+            echo "Rebuild and commit: cmake --build cpp/build --target TitanCore &&"
+            echo "  cp cpp/build/libTitanCore.a unreal/TitanBridge/ThirdParty/TitanCore/lib/Mac/"
+            exit 1
+          fi
+          echo "shipped library exports match a fresh build ($(echo "$fresh" | wc -l | tr -d ' ') symbols)"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.path }}
+          if-no-files-found: error
+
+  unreal-headers:
+    name: Unreal plugin header sync
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # unreal/.../ThirdParty/TitanCore/include is a copy of the real headers
+      # (the packaged Fab plugin cannot reach cpp/). Copies drift — this one
+      # had, by 123 lines in TitanCAPI.h alone — so enforce it rather than
+      # trust it.
+      - name: Compare against the source of truth
+        working-directory: titan-terrain-engine
+        run: |
+          status=0
+          for f in TitanCAPI.h TitanCore.h TitanNoise.h TitanRandom.h; do
+            if ! diff -u "cpp/libTitanCore/include/$f" \
+                         "unreal/TitanBridge/ThirdParty/TitanCore/include/$f"; then
+              echo "::error::$f differs from cpp/libTitanCore/include/$f"
+              status=1
+            fi
+          done
+          if [ $status -eq 0 ]; then echo "Unreal headers match the engine"; fi
+          exit $status
+
+  macos-app:
+    name: TitanLab (macOS) build + smoke
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      # The Swift app links libTitanCore directly, so a C API change can break
+      # it without any other job noticing.
+      - name: Build app and run headless smoke test
+        run: ./build_app.sh --smoke
+        working-directory: titan-terrain-engine/macos
+
   web:
     name: Web lab typecheck + build
     runs-on: ubuntu-latest
