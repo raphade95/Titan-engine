@@ -104,6 +104,10 @@ export default function App() {
   // is NOT [0, Height slider] once erosion and deposition have run, which is
   // what the export docs used to tell people to assume.
   const [heightRange, setHeightRange] = useState<{ min: number; max: number } | null>(null);
+  // The range the normalizing exporters stretch to. Differs from the terrain's
+  // own range when droplet erosion has left sediment towers — and it, not the
+  // terrain range, is what an importing tool's Z scale must be set from.
+  const [exportRange, setExportRange] = useState<{ min: number; max: number } | null>(null);
   // Which layers have their advanced physics panel open, keyed by layer id.
   const [expandedAdvanced, setExpandedAdvanced] = useState<Record<string, boolean>>({});
   const [isSidebarOpen, setIsSidebarOpen] = useState(true);
@@ -272,8 +276,10 @@ export default function App() {
     if (!engineRef.current) return;
     try {
       setHeightRange(engineRef.current.heightRange());
+      setExportRange(engineRef.current.exportHeightRange());
     } catch {
       setHeightRange(null);
+      setExportRange(null);
     }
   }, []);
 
@@ -2245,28 +2251,45 @@ export default function App() {
                       Export high-bitrate heightmaps and splatmaps for direct import into Unreal Engine 5.
                     </p>
 
-                    {heightRange && (
-                      <div className="mb-6 rounded-md border border-zinc-800 bg-zinc-900/60 p-3">
-                        <div className="text-[9px] uppercase tracking-widest text-zinc-500 mb-1">
-                          Height range (actual)
+                    {heightRange && exportRange && (() => {
+                      // The exporters trim an outlier tail when droplet erosion
+                      // has left sediment towers, so the file's span can be
+                      // narrower than the terrain's. Report the one the file
+                      // actually encodes — a Z scale from the other is wrong.
+                      const trimmed = exportRange.max < heightRange.max - 1e-4;
+                      const span = exportRange.max - exportRange.min;
+                      return (
+                        <div className="mb-6 rounded-md border border-zinc-800 bg-zinc-900/60 p-3">
+                          <div className="text-[9px] uppercase tracking-widest text-zinc-500 mb-1">
+                            Export height range
+                          </div>
+                          <div className="font-mono text-[11px] text-zinc-200">
+                            {exportRange.min.toFixed(2)} &rarr; {exportRange.max.toFixed(2)}
+                            <span className="text-zinc-500">
+                              {'  span '}{span.toFixed(2)}
+                            </span>
+                          </div>
+                          <div className="text-[9px] text-zinc-500 mt-2 leading-relaxed">
+                            .r16 and .png16 are normalized to exactly this span, not to the
+                            Height slider ({params.heightMultiplier}) &mdash; erosion and
+                            deposition move both ends. Unreal Z scale ={' '}
+                            <span className="font-mono text-zinc-300">
+                              {((span * 100) / 512).toFixed(3)}
+                            </span>{' '}
+                            at 1 unit = 1 m.
+                          </div>
+                          {trimmed && (
+                            <div className="text-[9px] text-amber-500/80 mt-2 leading-relaxed">
+                              Terrain reaches {heightRange.max.toFixed(2)}, but a few
+                              single-cell sediment towers sit far above everything else.
+                              Normalizing to them would waste most of the 16-bit depth, so
+                              the export clips them to {exportRange.max.toFixed(2)}. A
+                              Thermal Weathering layer settles them out properly.
+                            </div>
+                          )}
                         </div>
-                        <div className="font-mono text-[11px] text-zinc-200">
-                          {heightRange.min.toFixed(2)} &rarr; {heightRange.max.toFixed(2)}
-                          <span className="text-zinc-500">
-                            {'  span '}{(heightRange.max - heightRange.min).toFixed(2)}
-                          </span>
-                        </div>
-                        <div className="text-[9px] text-zinc-500 mt-2 leading-relaxed">
-                          .r16 and .png16 are normalized to exactly this span, not to the
-                          Height slider ({params.heightMultiplier}) &mdash; erosion and
-                          deposition move both ends. Unreal Z scale ={' '}
-                          <span className="font-mono text-zinc-300">
-                            {(((heightRange.max - heightRange.min) * 100) / 512).toFixed(3)}
-                          </span>{' '}
-                          at 1 unit = 1 m.
-                        </div>
-                      </div>
-                    )}
+                      );
+                    })()}
                     
                     <div className="grid grid-cols-2 gap-3">
                       {([

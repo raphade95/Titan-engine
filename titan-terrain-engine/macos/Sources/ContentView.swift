@@ -793,11 +793,16 @@ struct ContentView: View {
     ]
 
     private var heightRangeSection: some View {
-        let lo = model.heightRange.min
-        let hi = model.heightRange.max
+        // The exporters trim an outlier tail when droplet erosion has left
+        // sediment towers, so the file's span can be narrower than the
+        // terrain's. Report the one the file actually encodes — a Z scale
+        // derived from the other is wrong.
+        let lo = model.exportRange.min
+        let hi = model.exportRange.max
         let span = hi - lo
+        let trimmed = model.exportRange.max < model.heightRange.max - 1e-4
         return VStack(alignment: .leading, spacing: 6) {
-            Text("HEIGHT RANGE (ACTUAL)")
+            Text("EXPORT HEIGHT RANGE")
                 .font(.system(size: 9, weight: .semibold))
                 .tracking(1.4)
                 .foregroundStyle(.secondary)
@@ -807,6 +812,12 @@ struct ContentView: View {
                 .font(.system(size: 9))
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
+            if trimmed {
+                Text(String(format: "Terrain reaches %.2f, but a few single-cell sediment towers sit far above everything else. Normalizing to them would waste most of the 16-bit depth, so the export clips them to %.2f. A Thermal Weathering layer settles them out properly.", model.heightRange.max, hi))
+                    .font(.system(size: 9))
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
         }
         .padding(10)
         .frame(maxWidth: .infinity, alignment: .leading)

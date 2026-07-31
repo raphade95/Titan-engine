@@ -417,6 +417,26 @@ export class TitanCore {
     }
   }
 
+  /**
+   * The range the normalizing exporters (.r16/.png16) actually stretch to.
+   *
+   * Usually identical to heightRange(). It differs when droplet erosion has
+   * left a few single-cell sediment towers, which would otherwise spend most
+   * of the 16-bit depth on the gap between the terrain and a handful of
+   * pixels. This is the range an importing tool's Z scale must be set from,
+   * because it is what the file encodes.
+   */
+  exportHeightRange(): { min: number; max: number } {
+    const m = this.module;
+    const ptr = m._malloc(8);
+    try {
+      m._titan_export_height_range(this.handle, ptr, ptr + 4);
+      return { min: m.HEAPF32[ptr >> 2], max: m.HEAPF32[(ptr >> 2) + 1] };
+    } finally {
+      m._free(ptr);
+    }
+  }
+
   carve(x: number, y: number, radius: number, depth: number): void {
     this.module._titan_carve(this.handle, x, y, radius, depth);
   }

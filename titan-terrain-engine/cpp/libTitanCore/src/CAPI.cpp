@@ -636,6 +636,16 @@ TITAN_API void titan_height_range(TitanHandle* handle, float* outMin, float* out
     })
 }
 
+TITAN_API void titan_export_height_range(TitanHandle* handle, float* outMin, float* outMax) {
+    if (!handle) { SetError("null handle"); return; }
+    TITAN_GUARD({
+        float lo = 0.0f, hi = 0.0f;
+        Engine(handle)->ExportHeightRange(lo, hi);
+        if (outMin) *outMin = lo;
+        if (outMax) *outMax = hi;
+    })
+}
+
 TITAN_API void titan_mass_balance(TitanHandle* handle, double* exported, double* created) {
     if (!handle) { SetError("null handle"); return; }
     TITAN_GUARD({

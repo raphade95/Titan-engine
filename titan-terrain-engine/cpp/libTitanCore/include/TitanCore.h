@@ -367,6 +367,21 @@ public:
         CollectHeightRange(outMin, outMax);
     }
 
+    // The range the *normalizing* exporters (.r16, .png16) actually stretch to,
+    // which is not always the full surface range.
+    //
+    // Droplet erosion can leave a handful of single-cell sediment towers far
+    // above everything around them. Normalizing to the true maximum then spends
+    // most of the 16-bit depth on empty space between the real terrain and a
+    // few pixels: a 196k-droplet pass measured a p99.9 of 35 against a maximum
+    // of 92, so the landscape occupied 36% of the range and lost more than a
+    // bit and a half of precision everywhere.
+    //
+    // Only a genuine outlier tail is trimmed — the bound has to sit more than a
+    // quarter of the robust span beyond the 99.9th percentile — so ordinary
+    // terrain, where the maximum is a real summit, exports untouched.
+    void ExportHeightRange(float& outMin, float& outMax) const;
+
     // Mass accounting for hydraulic erosion, in world-height units summed over
     // cells. `MassExported` is material droplets legitimately carried off the
     // map; `MassCreated` is the (small) amount conjured by the sediment floor

@@ -321,6 +321,15 @@ TITAN_API int titan_size(TitanHandle* handle);
 // scale on import. Either pointer may be NULL.
 TITAN_API void titan_height_range(TitanHandle* handle, float* outMin, float* outMax);
 
+// The range the normalizing exporters (.r16, .png16) actually stretch to.
+//
+// Usually identical to titan_height_range. It differs when droplet erosion has
+// left a few single-cell sediment towers: normalizing to the true maximum then
+// spends most of the 16-bit depth on the gap between the terrain and a handful
+// of pixels. Use *this* range to set an importing tool's Z scale — it is what
+// the file encodes. Either pointer may be NULL.
+TITAN_API void titan_export_height_range(TitanHandle* handle, float* outMin, float* outMax);
+
 // Mass accounting for hydraulic erosion, summed over cells in world height
 // units. `exported` is material droplets carried off the map (a real export to
 // the sea, not a leak); `created` is the small amount conjured when two

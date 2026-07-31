@@ -117,10 +117,43 @@ void PngChunk(std::vector<uint8_t>& out, const char type[4], const std::vector<u
 
 // --- PNG, 16-bit grayscale ----------------------------------------------------
 
+// See the header for why the exported range is not always the surface range.
+//
+// The test is scale-free and symmetric: a bound is trimmed only when it sits
+// more than a quarter of the robust span (p0.1..p99.9) beyond that percentile.
+// Measured across realistic stacks, well-behaved terrain sits at 1.03-1.07x its
+// p99.9 and is left exactly alone, while a hydraulic pass without a following
+// thermal settle sits at 2.0-2.6x and is trimmed. Thermal weathering flattens
+// the towers itself, which is why preset stacks ending in it never trip this.
+void TerrainEngine::ExportHeightRange(float& outMin, float& outMax) const {
+    CollectHeightRange(outMin, outMax);
+
+    const size_t count = m_Bedrock.size();
+    // Percentiles are meaningless on a handful of cells.
+    if (count < 1024) return;
+
+    std::vector<float> h(count);
+    for (size_t i = 0; i < count; ++i) h[i] = m_Bedrock[i] + m_Sediment[i];
+
+    const size_t hiIdx = static_cast<size_t>(static_cast<double>(count) * 0.999);
+    const size_t loIdx = static_cast<size_t>(static_cast<double>(count) * 0.001);
+    std::nth_element(h.begin(), h.begin() + hiIdx, h.end());
+    const float pHi = h[hiIdx];
+    std::nth_element(h.begin(), h.begin() + loIdx, h.begin() + hiIdx);
+    const float pLo = h[loIdx];
+
+    const float robustSpan = pHi - pLo;
+    if (!(robustSpan > 0.0f)) return;
+    const float allowance = robustSpan * 0.25f;
+
+    if (outMax - pHi > allowance) outMax = pHi + allowance;
+    if (pLo - outMin > allowance) outMin = pLo - allowance;
+}
+
 size_t TerrainEngine::ExportPNG16() {
     const int size = m_Params.size;
     float minH, maxH;
-    CollectHeightRange(minH, maxH);
+    ExportHeightRange(minH, maxH);
     const float range = (maxH - minH) > 0.0f ? (maxH - minH) : 1.0f;
 
     // Filter byte 0 per row + 2 bytes per pixel, big-endian.
@@ -131,8 +164,10 @@ size_t TerrainEngine::ExportPNG16() {
         for (int x = 0; x < size; ++x) {
             const size_t i = static_cast<size_t>(y) * size + x;
             const float h = m_Bedrock[i] + m_Sediment[i];
-            const uint16_t v = static_cast<uint16_t>(
-                std::lround(((h - minH) / range) * 65535.0f));
+            // Clamped: a trimmed tail leaves a few cells outside the range,
+            // and an unclamped cast would wrap them to the bottom of the map.
+            const uint16_t v = static_cast<uint16_t>(std::lround(
+                std::clamp((h - minH) / range, 0.0f, 1.0f) * 65535.0f));
             raw.push_back(static_cast<uint8_t>(v >> 8));
             raw.push_back(static_cast<uint8_t>(v));
         }
@@ -352,15 +387,15 @@ size_t TerrainEngine::ExportSplatPNG() {
 size_t TerrainEngine::ExportR16() {
     const int size = m_Params.size;
     float minH, maxH;
-    CollectHeightRange(minH, maxH);
+    ExportHeightRange(minH, maxH);
     const float range = (maxH - minH) > 0.0f ? (maxH - minH) : 1.0f;
 
     m_ExportBuffer.clear();
     m_ExportBuffer.reserve(static_cast<size_t>(size) * size * 2);
     for (size_t i = 0; i < m_Bedrock.size(); ++i) {
         const float h = m_Bedrock[i] + m_Sediment[i];
-        PutU16LE(m_ExportBuffer, static_cast<uint16_t>(
-            std::lround(((h - minH) / range) * 65535.0f)));
+        PutU16LE(m_ExportBuffer, static_cast<uint16_t>(std::lround(
+            std::clamp((h - minH) / range, 0.0f, 1.0f) * 65535.0f)));
     }
     return m_ExportBuffer.size();
 }

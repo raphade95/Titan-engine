@@ -377,6 +377,11 @@ final class EngineModel: ObservableObject {
     // import — it is NOT [0, heightMultiplier] once erosion and deposition
     // have run, which is what the export docs used to claim.
     @Published var heightRange: (min: Float, max: Float) = (0, 0)
+    /// The range the normalizing exporters stretch to. Differs from the
+    /// terrain's own range when droplet erosion has left sediment towers — and
+    /// it, not the terrain range, is what an importing tool's Z scale must be
+    /// set from, because it is what the file encodes.
+    @Published var exportRange: (min: Float, max: Float) = (0, 0)
 
     // Imported heightfield (normalized 0..1), additive base after generate.
     @Published var importedName: String? = nil
@@ -699,6 +704,9 @@ final class EngineModel: ObservableObject {
             var rangeLo: Float = 0
             var rangeHi: Float = 0
             titan_height_range(engine, &rangeLo, &rangeHi)
+            var exportLo: Float = 0
+            var exportHi: Float = 0
+            titan_export_height_range(engine, &exportLo, &exportHi)
 
             let snapshot = Self.snapshotMesh(engine, heightMax: p.height,
                                              extent: Float(p.size) * p.cell)
@@ -710,6 +718,7 @@ final class EngineModel: ObservableObject {
                 guard let self, self.runCounter == run else { return }
                 self.isGenerating = false
                 self.heightRange = (rangeLo, rangeHi)
+                self.exportRange = (exportLo, exportHi)
                 self.lastComputeMs = elapsed
                 self.statusText = "\(self.engineVersion) — \(elapsed) ms"
                 self.topDownImage = topDown

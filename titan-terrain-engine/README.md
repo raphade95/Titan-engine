@@ -71,6 +71,10 @@ only marshals parameters in and copies buffers out across the C API
 - Gradient generators (linear/radial stamps), full slope & curvature maps.
 - Exports: 16-bit RAW heightmap (`.r16`), 16-bit PNG, float32 RAW/EXR, OBJ
   mesh, RGBA splatmap PNG, world-space normal map PNG, ambient-occlusion PNG.
+  The normalizing formats trim outlier sediment towers rather than spending most
+  of the 16-bit depth on the gap between the terrain and a few pixels — an
+  unsettled hydraulic pass went from 36% usable range to 81%, while terrain
+  whose maximum is a real summit exports untouched.
 - 2D top-down hypsometric map view in both the web lab and TitanLab (macOS).
 - Drop-a-volcano placement in both viewports: press on the terrain to place a
   cone, drag to position it. Lava is rendered from a per-vertex attribute the

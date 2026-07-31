@@ -1334,6 +1334,110 @@ void TestResolutionIndependence() {
     std::printf("\n");
 }
 
+void TestExportHeightRange() {
+    std::printf("Export height range\n");
+
+    auto build = [](Titan::TerrainEngine& e, bool erode, bool settle) {
+        Titan::TerrainParams p = MakeParams(4242, 1, 256);
+        e.Initialize(p);
+        e.GenerateHeightmap();
+        if (erode) {
+            Titan::HydraulicParams hp;
+            e.ApplyHydraulicErosion(196608, hp);
+        }
+        if (settle) {
+            Titan::ThermalParams tp;
+            e.ApplyThermalWeathering(10, tp);
+        }
+    };
+
+    auto usableFraction = [](Titan::TerrainEngine& e) {
+        std::vector<float> h;
+        h.reserve(256u * 256u);
+        for (int y = 0; y < 256; ++y) {
+            for (int x = 0; x < 256; ++x) h.push_back(e.GetHeight(x, y));
+        }
+        std::sort(h.begin(), h.end());
+        const float p999 = h[static_cast<size_t>(h.size() * 0.999)];
+        float lo = 0, hi = 0;
+        e.ExportHeightRange(lo, hi);
+        return static_cast<double>(p999 - lo) / std::max(1e-6f, hi - lo);
+    };
+
+    // Terrain whose maximum is a real summit must export completely untouched —
+    // the trim is for outlier tails, not a blanket haircut.
+    {
+        Titan::TerrainEngine e;
+        build(e, false, false);
+        float tLo = 0, tHi = 0, eLo = 0, eHi = 0;
+        e.HeightRange(tLo, tHi);
+        e.ExportHeightRange(eLo, eHi);
+        Check(eLo == tLo && eHi == tHi,
+              "clean terrain exports its true range, unmodified");
+    }
+
+    // Droplet erosion leaves single-cell sediment towers. Normalizing to the
+    // true maximum then spends most of the 16-bit depth on the gap between the
+    // landscape and a handful of pixels.
+    {
+        Titan::TerrainEngine e;
+        build(e, true, false);
+        float tLo = 0, tHi = 0, eLo = 0, eHi = 0;
+        e.HeightRange(tLo, tHi);
+        e.ExportHeightRange(eLo, eHi);
+        std::vector<float> h;
+        h.reserve(256u * 256u);
+        for (int y = 0; y < 256; ++y) {
+            for (int x = 0; x < 256; ++x) h.push_back(e.GetHeight(x, y));
+        }
+        std::sort(h.begin(), h.end());
+        const float p999 = h[static_cast<size_t>(h.size() * 0.999)];
+        const double before = static_cast<double>(p999 - tLo) / (tHi - tLo);
+        std::printf("        eroded: true max %.2f, export max %.2f, "
+                    "usable %.0f%% -> %.0f%%\n",
+                    tHi, eHi, 100.0 * before, 100.0 * usableFraction(e));
+        Check(eHi < tHi, "an outlier tail is trimmed off the export range");
+        Check(usableFraction(e) > 0.7,
+              "the terrain occupies most of the exported range");
+
+        // Trimming must never invert or collapse the range.
+        Check(eHi > eLo, "trimmed range stays ordered");
+    }
+
+    // A thermal settle flattens the towers itself, so a stack ending in one
+    // needs no trimming — this is why the preset stacks never trip it.
+    {
+        Titan::TerrainEngine e;
+        build(e, true, true);
+        float tLo = 0, tHi = 0, eLo = 0, eHi = 0;
+        e.HeightRange(tLo, tHi);
+        e.ExportHeightRange(eLo, eHi);
+        Check(eHi == tHi, "terrain settled by thermal weathering needs no trim");
+    }
+
+    // The exporters must clamp, not wrap: with a trimmed tail a few cells sit
+    // outside the range, and an unclamped cast would send the tallest peaks to
+    // the bottom of the map.
+    {
+        Titan::TerrainEngine e;
+        build(e, true, false);
+        const size_t bytes = e.ExportR16();
+        Check(bytes == 256u * 256u * 2u, "r16 exports at full size after trimming");
+        const uint8_t* data = e.ExportData();
+        int maxed = 0, zeroed = 0;
+        for (size_t i = 0; i < bytes; i += 2) {
+            const uint16_t v = static_cast<uint16_t>(data[i] | (data[i + 1] << 8));
+            if (v == 65535) ++maxed;
+            if (v == 0) ++zeroed;
+        }
+        std::printf("        r16 after trim: %d cells at ceiling, %d at floor\n",
+                    maxed, zeroed);
+        Check(maxed > 0 && maxed < 256 * 256 / 100,
+              "clipped cells saturate the ceiling rather than wrapping");
+    }
+    std::printf("\n");
+}
+
 void TestLayerResolutionIndependence() {
     std::printf("Layer resolution independence\n");
 
@@ -1925,6 +2029,7 @@ int main() {
     TestSplatMatchesMesh();
     TestBandScratchSharedWithHosts();
     TestResolutionIndependence();
+    TestExportHeightRange();
     TestLayerResolutionIndependence();
     TestAmbientOcclusion();
     TestSplatHeightUsesRealRange();

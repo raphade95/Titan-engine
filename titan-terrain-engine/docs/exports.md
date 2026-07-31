@@ -47,9 +47,36 @@ ends up **twice** the slider value.
 
 So read the range off the app instead of assuming it:
 
-- **Web lab** and **TitanLab** — the Export tab shows `HEIGHT RANGE (ACTUAL)`
+- **Web lab** and **TitanLab** — the Export tab shows `EXPORT HEIGHT RANGE`
   with the span and a ready-computed Unreal Z scale.
-- **C API** — `titan_height_range(handle, &min, &max)`.
+- **C API** — `titan_export_height_range(handle, &min, &max)` for what the file
+  encodes, `titan_height_range` for the true surface range. See below for when
+  the two differ.
+
+### When the export range is not the terrain range
+
+Droplet erosion can leave a handful of single-cell sediment towers standing far
+above everything around them. Normalizing to the true maximum then spends most
+of the 16-bit depth on the empty gap between the landscape and a few pixels — a
+196k-droplet pass measured a 99.9th percentile of 35 against a maximum of 92, so
+the terrain occupied **36%** of the range and lost more than a bit and a half of
+precision everywhere.
+
+`.r16` and `.png16` therefore normalize to an **export range** that trims a
+genuine outlier tail, clamping the few cells above it. The test is conservative:
+a bound is only trimmed when it sits more than a quarter of the robust span
+beyond the 99.9th percentile. Across realistic stacks, ordinary terrain measures
+1.03–1.07x its p99.9 and exports completely untouched, while an unsettled
+hydraulic pass measures 2.0–2.6x and is trimmed — recovering 36–47% usable range
+to about 81%.
+
+Both apps show the export range and flag when it has been trimmed.
+`titan_export_height_range` returns it; `titan_height_range` still reports the
+true surface range. **Set an importing tool's Z scale from the export range**,
+since that is what the file encodes.
+
+A **Thermal Weathering** layer settles the towers out properly — which is why
+the preset stacks, which end in one, never trigger any trimming.
 
 The splatmap's **green channel follows the same range**. It used to divide by
 the Height slider, which meant every cell above the slider clamped to 255 — so
@@ -96,26 +123,33 @@ Or skip files entirely: use the **TitanBridge plugin** and generate in-editor.
 
 ## Resolution and world extent
 
-The resolution slider (64–2048) sets both the simulation grid **and** the world
-extent: a terrain spans `size x cellSize` world units, and every host currently
-fixes `cellSize` at 1. So a 1024 grid is a 1024-unit-wide world, four times
-wider than a 256 one.
+**World Size** sets the extent; **Resolution** sets the sample density. The
+engine's `cellSize` is `worldSize / size`, so raising Resolution resolves finer
+detail on the same landform rather than stretching it into a larger, flatter
+one. Presets are recipes at any resolution.
 
-That means **height does not scale with resolution**. A preset tuned at 128
-with Height 60 has a 60:128 relief ratio; the same preset at 1024 has 60:1024
-and reads as a flat plate. Raise Height proportionally (the slider goes to 500)
-when you raise resolution, or treat the presets as 128–256 recipes.
+This was not always so. Both apps used to pin `cellSize` at 1.0, which made the
+extent equal to the sample count — a 1024 grid was a 1024-unit world, four times
+wider than a 256 one, while Height stayed absolute. The same seed came out 6.7x
+flatter at 1024 than at 128. The simulation passes were cell-denominated too, so
+refining the grid rewrote the physics on top of that.
+
+Both are fixed. The passes measure in world units, and hydraulic, fluvial and
+blur agree to within 0.2% across a doubling of the grid. Two caveats worth
+knowing:
+
+- **Thermal weathering is still cell-denominated.** Each pass creeps material
+  exactly one cell, so a finer grid smooths a shorter world distance for the
+  same pass count. Raise the pass count when you raise Resolution.
+- **The default is coarse.** 128 samples over a 128-unit world is one world unit
+  per droplet step, which is under-resolved for the droplet model — it leaves
+  larger depositional spikes than a finer grid does. The value is preserved for
+  compatibility, not because it is the converged answer.
 
 The preview mesh is decimated to at most 512 vertices per edge regardless of
 resolution, so orbiting stays smooth at 2048. **Exports always use the full
 simulation resolution** — what you export is not what the preview mesh
 tessellates.
-
-> Design note: most competitors treat resolution as detail density over a fixed
-> world, which would mean deriving `cellSize` from `size`. Titan does not do
-> that today, because `cellSize` also scales slope, talus angle, and fluvial
-> distances — changing it would alter every existing terrain and every preset.
-> It is a deliberate open decision, not an oversight.
 
 ## Notes
 
