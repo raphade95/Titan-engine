@@ -32,7 +32,11 @@ import SwiftUI
 enum NodeGeometry {
     static let width: CGFloat = 178
     static let headerHeight: CGFloat = 26
-    static let thumbHeight: CGFloat = 84
+    // Deliberately small. A thumbnail is a glance, not a preview — the
+    // viewport is the preview. At 84 the image was most of the card, which
+    // pushed the ports to the extremes of a tall body and left a connected
+    // node reading as a picture with no visible wiring.
+    static let thumbHeight: CGFloat = 52
     static let height: CGFloat = headerHeight + thumbHeight + 18
     static let portRadius: CGFloat = 5.5
     static let portHit: CGFloat = 13
@@ -306,6 +310,10 @@ struct GraphCanvas: View {
     /// Framed once, when the canvas first has a real size to frame against.
     @State private var hasFramed = false
 
+    /// The canvas's own coordinate space: unscaled and unpanned, so a gesture
+    /// location converts to graph space through toGraph and nothing else.
+    static let canvasSpace = "titanGraphCanvas"
+
     private var graph: TerrainGraph { model.graph }
 
     var body: some View {
@@ -331,6 +339,15 @@ struct GraphCanvas: View {
 
                 overlayControls(geo: geo)
             }
+            // Every gesture that needs a position measures it here, in
+            // unscaled, unpanned canvas coordinates, and converts with
+            // toGraph. This name used to be referenced by the two port
+            // gestures and declared by nobody: an unresolved coordinate space
+            // does not raise, it just reports a location in some other space,
+            // so toGraph turned it into a graph point far from the cursor and
+            // inputHit almost never matched. Dragging a wire between two ports
+            // simply did not connect.
+            .coordinateSpace(name: Self.canvasSpace)
             .clipped()
             .onDeleteCommand { deleteSelection() }
             // Open framed on the graph. The starter layout puts its nodes at
@@ -485,17 +502,28 @@ struct GraphCanvas: View {
         }
         .contentShape(RoundedRectangle(cornerRadius: 7))
         .onTapGesture { selection = node.id; selectedEdge = nil }
+        // Measured in canvas space and converted, rather than taking
+        // DragGesture's own translation and dividing by zoom. The card sits
+        // inside a .scaleEffect, and what a local-space translation means
+        // under one is exactly the ambiguity that sent a dragged node flying:
+        // the divide double-compensated, so the node moved 1/zoom further than
+        // the cursor and a zoomed-out canvas threw it clean off the screen.
+        // The difference of two converted points has no such ambiguity — it is
+        // the graph-space distance the cursor actually travelled.
         .gesture(
-            DragGesture(minimumDistance: 2)
+            DragGesture(minimumDistance: 2, coordinateSpace: .named(Self.canvasSpace))
                 .onChanged { v in
                     if draggingNode != node.id { draggingNode = node.id; selection = node.id }
-                    dragOffset = CGSize(width: v.translation.width / zoom,
-                                        height: v.translation.height / zoom)
+                    let from = toGraph(v.startLocation)
+                    let to = toGraph(v.location)
+                    dragOffset = CGSize(width: to.x - from.x, height: to.y - from.y)
                 }
-                .onEnded { _ in
+                .onEnded { v in
+                    let from = toGraph(v.startLocation)
+                    let to = toGraph(v.location)
                     if let i = graph.index(node.id) {
-                        graph.nodes[i].position.x += dragOffset.width
-                        graph.nodes[i].position.y += dragOffset.height
+                        graph.nodes[i].position.x += to.x - from.x
+                        graph.nodes[i].position.y += to.y - from.y
                         spliceIfDroppedOnWire(graph.nodes[i])
                     }
                     draggingNode = nil
@@ -506,12 +534,21 @@ struct GraphCanvas: View {
     @ViewBuilder
     private func thumbnail(_ node: GraphNode) -> some View {
         if let image = model.nodeThumbnails[node.id] {
+            // .fill on a square image in a wide, short slot scales it to the
+            // width and lets the rest hang out of the card. clipShape hides
+            // the overflow but the view is still there to be hit, so an
+            // evaluated node covered its own ports and everything under it:
+            // once a node had a thumbnail it could no longer be dragged or
+            // rewired, only selected. .fit keeps it inside, clipped() bounds
+            // it, and the image takes no hits at all — it is decoration.
             Image(decorative: image, scale: 1)
                 .resizable()
                 .interpolation(.medium)
-                .aspectRatio(contentMode: .fill)
+                .aspectRatio(contentMode: .fit)
                 .frame(maxWidth: .infinity)
+                .clipped()
                 .clipShape(RoundedRectangle(cornerRadius: 3))
+                .allowsHitTesting(false)
         } else {
             RoundedRectangle(cornerRadius: 3)
                 .fill(Color.black.opacity(0.25))
@@ -560,7 +597,7 @@ struct GraphCanvas: View {
     // MARK: Wiring gestures
 
     private func outputDragGesture(node: GraphNode) -> some Gesture {
-        DragGesture(minimumDistance: 1, coordinateSpace: .named("graphSpace"))
+        DragGesture(minimumDistance: 1, coordinateSpace: .named(Self.canvasSpace))
             .onChanged { v in
                 pending = (node.id, NodeGeometry.outputPoint(node), toGraph(v.location))
             }
@@ -582,7 +619,7 @@ struct GraphCanvas: View {
     /// Dragging *from* an input pulls the existing wire off, which is how a
     /// connection is undone everywhere else.
     private func inputDragGesture(node: GraphNode, port: Int) -> some Gesture {
-        DragGesture(minimumDistance: 1, coordinateSpace: .named("graphSpace"))
+        DragGesture(minimumDistance: 1, coordinateSpace: .named(Self.canvasSpace))
             .onChanged { v in
                 if let src = graph.source(of: node.id, port: port), let s = graph.node(src) {
                     pending = (src, NodeGeometry.outputPoint(s), toGraph(v.location))
