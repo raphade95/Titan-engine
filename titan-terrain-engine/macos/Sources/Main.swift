@@ -194,6 +194,30 @@ func runSmokeTest() -> Int32 {
         return f
     }
 
+    // A Lava node fed by a Volcano node must actually erupt. It did not: every
+    // node began by restoring its input with titan_set_height, which clears
+    // the derived fields — including the vent list the volcano had just
+    // registered — so SimulateLava found no vents and returned. The same two
+    // operations as stack layers produce lava, because the stack never rewinds
+    // the engine between them. Guarded here because nothing about the rendered
+    // result says "this should have been on fire".
+    let volcanic = TerrainGraph()
+    let vTerrain = volcanic.add(.terrain, at: .zero)
+    let vCone = volcanic.add(.volcano, at: CGPoint(x: 200, y: 0))
+    let vLava = volcanic.add(.lava, at: CGPoint(x: 400, y: 0))
+    let vOut = volcanic.add(.output, at: CGPoint(x: 600, y: 0))
+    volcanic.connect(from: vTerrain, to: vCone, port: 0)
+    volcanic.connect(from: vCone, to: vLava, port: 0)
+    volcanic.connect(from: vLava, to: vOut, port: 0)
+    check(evaluate(volcanic).error == nil, "a volcanic graph evaluates")
+    if let lava = titan_lava_ptr(engine) {
+        var total: Float = 0
+        for i in 0..<(128 * 128) { total += lava[i] }
+        check(total > 0, "lava reaches the surface downstream of a volcano (total \(total))")
+    } else {
+        check(false, "lava reaches the surface downstream of a volcano (no lava field at all)")
+    }
+
     let linear = TerrainGraph.starter()
     let linearResult = evaluate(linear, thumbnails: true)
     check(linearResult.error == nil, "starter graph evaluates (\(linearResult.error ?? "no error"))")
@@ -364,6 +388,26 @@ func runSmokeTest() -> Int32 {
         check((parsed["version"] as? Int) ?? 9 < 4,
               "a graph that is not driving the terrain does not force v4")
         check(parsed["graph"] != nil, "but the graph is still saved with the file")
+    }
+
+    // Stack -> graph -> stack must not rewrite the base structure. The two
+    // editors number noise differently (the model holds the engine's id, a
+    // Terrain node holds an index into layerNoiseLabels), and copying the raw
+    // number across turned a Simplex stack into a Ridged graph and then into a
+    // flat plane on the way back.
+    let round = EngineModel()
+    for engineID in layerNoiseIDs {
+        round.noiseType = Int(engineID)
+        round.stack = []
+        round.graph = TerrainGraph()
+        round.openGraphDrawer()
+        let asNode = round.graph.nodes.first { $0.kind == .terrain }?.params["noiseType"] ?? -1
+        check(Int(asNode) == layerNoiseIDs.firstIndex(of: engineID),
+              "engine noise \(engineID) maps to node index \(Int(asNode))")
+        round.noiseType = 0                    // clobber, so the bake must restore it
+        check(round.applyGraphToStack(), "the round-tripped graph bakes back")
+        check(round.noiseType == Int(engineID),
+              "and comes back as engine noise \(engineID), not \(round.noiseType)")
     }
     }
 

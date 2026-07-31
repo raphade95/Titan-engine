@@ -914,13 +914,31 @@ final class EngineModel: ObservableObject {
     /// keeps whatever the graph has become since.
     func openGraphDrawer() {
         if graph.nodes.isEmpty {
+            // noiseType is the one parameter the two editors do not share a
+            // numbering for. The model carries the engine's own noise id (0 is
+            // Flat, 1 Simplex, ...); a Terrain node carries an index into
+            // layerNoiseLabels, where 0 is Simplex. Copying the number across
+            // unconverted shifted every structure by one on the way in — a
+            // Simplex stack opened as a Ridged graph — and collapsed it to
+            // Flat on the way back out.
             let base: [String: Double] = [
-                "noiseType": Double(noiseType), "scale": scale, "height": heightMultiplier,
+                "noiseType": Double(layerNoiseIDs.firstIndex(of: Int32(noiseType)) ?? 0),
+                "scale": scale, "height": heightMultiplier,
                 "octaves": octaves, "persistence": persistence,
                 "lacunarity": lacunarity, "exponent": exponent, "warp": warpStrength,
             ]
             graph = stack.isEmpty ? TerrainGraph.starter()
                                   : TerrainGraph.from(stack: stack, base: base)
+            // Seed the Terrain node from the Base tab in both cases. Only the
+            // from(stack:) path used to do it, so opening the drawer on a
+            // document with no layers threw the base terrain away and replaced
+            // it with the starter's own defaults — a flat project became a
+            // Simplex massif just by opening the drawer.
+            if let ti = graph.nodes.firstIndex(where: { $0.kind == .terrain }) {
+                for (k, v) in base where graph.nodes[ti].params[k] != nil {
+                    graph.nodes[ti].params[k] = v
+                }
+            }
         }
         graphDrawerOpen = true
     }
@@ -933,7 +951,12 @@ final class EngineModel: ObservableObject {
     func applyGraphToStack() -> Bool {
         guard let layers = graph.asStack() else { return false }
         if let terrain = graph.nodes.first(where: { $0.kind == .terrain }) {
-            noiseType = Int(terrain.params["noiseType"] ?? Double(noiseType))
+            // Back out of the node's index space into the engine's noise id.
+            // See openGraphDrawer: baking without this converted every graph
+            // into a flat plane, because node index 0 (Simplex) read as engine
+            // id 0 (Flat).
+            let idx = Int(terrain.params["noiseType"] ?? 0)
+            noiseType = Int(layerNoiseIDs[min(max(idx, 0), layerNoiseIDs.count - 1)])
             scale = terrain.params["scale"] ?? scale
             heightMultiplier = terrain.params["height"] ?? heightMultiplier
             octaves = terrain.params["octaves"] ?? octaves

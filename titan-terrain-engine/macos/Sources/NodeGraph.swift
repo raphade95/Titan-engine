@@ -439,6 +439,32 @@ enum GraphEvaluator {
         var cache: [UUID: [Float]] = [:]
         var visiting: Set<UUID> = []
 
+        // Whose field the engine is currently carrying.
+        //
+        // A cached field is only the surface. titan_set_height takes it as
+        // bedrock and clears everything derived — sediment, flow, snow, water,
+        // lava, and the volcano vent list — because a bare height field has no
+        // history. That is correct for a fork, where the engine genuinely has
+        // to be rewound, and destructive everywhere else: a Lava node fed by a
+        // Volcano node restored its input, wiped the vents the volcano had just
+        // registered, and SimulateLava returned immediately with nothing to
+        // erupt. Volcano -> Lava produced no lava at all, while the same two
+        // layers in the stack do, because the stack never rewinds.
+        //
+        // So don't rewind when there is nothing to rewind to: if the engine is
+        // already holding exactly the field this node wants, leave it alone and
+        // the derived state survives. A straight chain now runs the identical
+        // call sequence the stack runs, which is the point of the node sharing
+        // the layer's execute(). Only an actual fork pays for a restore.
+        var engineHolds: UUID? = nil
+
+        /// Puts `field` on the engine unless it is already there.
+        func place(_ field: [Float], from src: UUID?) {
+            if let src, src == engineHolds { return }
+            restore(engine, field)
+            engineHolds = src
+        }
+
         func fieldOf(_ id: UUID) -> [Float]? {
             if let cached = cache[id] { return cached }
             guard let node = plan.nodes[id] else { return nil }
@@ -469,7 +495,7 @@ enum GraphEvaluator {
             // A disabled node passes its input through untouched, the same as
             // unticking a layer in the stack.
             if !node.enabled, let passthrough = inputs.first {
-                if id == root { restore(engine, passthrough) }
+                if id == root { place(passthrough, from: plan.incoming[id]?[0]) }
                 cache[id] = passthrough
                 return passthrough
             }
@@ -488,10 +514,10 @@ enum GraphEvaluator {
                 titan_clear_terrain(engine)
             case .output:
                 if let passthrough = inputs.first {
-                    restore(engine, passthrough)
+                    place(passthrough, from: plan.incoming[id]?[0])
                 }
             case .mask:
-                restore(engine, inputs[0])
+                place(inputs[0], from: plan.incoming[id]?[0])
                 let feature = Int32(node.params["feature"] ?? 0)
                 titan_mask_by_feature(engine, feature, Float(node.params["lo"] ?? 0),
                                       Float(node.params["hi"] ?? 1),
@@ -504,7 +530,13 @@ enum GraphEvaluator {
                     for i in 0..<count { band[i] = scratch[i] }
                 }
                 cache[id] = band
-                if id == root { restore(engine, band) }  // so it can be previewed
+                // Previewing a mask shows the band itself, which means putting
+                // it on the engine as if it were terrain — so the engine is no
+                // longer holding this node's input.
+                if id == root {
+                    restore(engine, band)
+                    engineHolds = id
+                }
                 if thumbnails, let img = makeThumbnail(band, size: Int(gridSize), grayscale: true) {
                     result.thumbnails[id] = img
                 }
@@ -513,7 +545,7 @@ enum GraphEvaluator {
             case .combine:
                 // B is the surface; A is blended onto it. Two branches meet
                 // here through the same combiner the stack's import path uses.
-                restore(engine, inputs[1])
+                place(inputs[1], from: plan.incoming[id]?[1])
                 inputs[0].withUnsafeBufferPointer { buf in
                     titan_apply_heightfield(engine, buf.baseAddress, gridSize,
                                             Float(node.params["strength"] ?? 1),
@@ -521,7 +553,7 @@ enum GraphEvaluator {
                                             Float(node.params["alpha"] ?? 0.5))
                 }
             default:
-                restore(engine, inputs[0])
+                place(inputs[0], from: plan.incoming[id]?[0])
                 let masked = activate(mask: maskField, on: engine, count: count)
                 var layer = TitanLayer(kind: node.kind.layerKind!, params: node.params)
                 layer.curve = node.curve
@@ -529,6 +561,11 @@ enum GraphEvaluator {
                                     heightMultiplier: 1.0, imported: nil)
                 if masked { titan_set_mask(engine, nil, 0) }
             }
+
+            // Everything reaching here ran on the engine, so the engine is now
+            // carrying this node's result — including the derived fields a
+            // cached height field cannot describe.
+            engineHolds = id
 
             var out = [Float](repeating: 0, count: count)
             out.withUnsafeMutableBufferPointer { buf in

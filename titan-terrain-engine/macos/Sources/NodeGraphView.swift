@@ -100,8 +100,13 @@ struct NodeGraphDrawer: View {
             header
             Divider()
             HSplitView {
+                // The canvas needs a real minimum height of its own. Without
+                // one the drawer has no intrinsic size to defend, and the
+                // enclosing VSplitView compresses it past the minHeight set on
+                // the drawer itself — which is what clipped the control strip
+                // off the bottom edge.
                 GraphCanvas(model: model, selection: $selection, selectedEdge: $selectedEdge)
-                    .frame(minWidth: 420)
+                    .frame(minWidth: 420, minHeight: 240)
                 inspector
                     .frame(minWidth: 220, idealWidth: 268, maxWidth: 340)
             }
@@ -298,6 +303,8 @@ struct GraphCanvas: View {
     @State private var pending: (from: UUID, at: CGPoint, cursor: CGPoint)? = nil
     @State private var palette: (point: CGPoint, connectFrom: UUID?)? = nil
     @State private var paletteQuery = ""
+    /// Framed once, when the canvas first has a real size to frame against.
+    @State private var hasFramed = false
 
     private var graph: TerrainGraph { model.graph }
 
@@ -326,7 +333,23 @@ struct GraphCanvas: View {
             }
             .clipped()
             .onDeleteCommand { deleteSelection() }
+            // Open framed on the graph. The starter layout puts its nodes at
+            // y=240, and the drawer is nowhere near 240pt tall, so without this
+            // the canvas opens on empty grid with every node below the fold —
+            // and the Fit button that would rescue it is in the same clipped
+            // strip. Framing on appear is what every node editor does anyway.
+            .onAppear { frameIfNeeded(geo.size) }
+            .onChange(of: geo.size) { _ in frameIfNeeded(geo.size) }
         }
+    }
+
+    /// Frames the graph the first time the canvas has a usable size. A
+    /// GeometryReader reports .zero on the first pass, so this cannot simply
+    /// run in onAppear and be done with it.
+    private func frameIfNeeded(_ size: CGSize) {
+        guard !hasFramed, size.width > 1, size.height > 1, !graph.nodes.isEmpty else { return }
+        hasFramed = true
+        fit(in: size)
     }
 
     // MARK: Background, pan and zoom
@@ -683,8 +706,12 @@ struct GraphCanvas: View {
     // MARK: Overlay controls
 
     private func overlayControls(geo: GeometryProxy) -> some View {
+        // Pinned to the top, not the bottom. The drawer is short and gets
+        // squeezed further by the split view, and a bottom-anchored strip was
+        // the first thing to fall off the edge — taking Fit, Add and the zoom
+        // controls with it, so a graph that opened out of view could not be
+        // brought back. The top edge is the one that is always on screen.
         VStack {
-            Spacer()
             HStack(spacing: 6) {
                 Button { openPalette(at: CGPoint(x: 60, y: 60), connectFrom: nil) } label: {
                     Image(systemName: "plus")
@@ -713,19 +740,30 @@ struct GraphCanvas: View {
             .padding(.horizontal, 10)
             .padding(.vertical, 6)
             .background(.ultraThinMaterial)
+            Spacer()
         }
     }
 
+    /// Height the control strip occupies, kept clear so a framed graph is not
+    /// tucked underneath it.
+    private static let controlStrip: CGFloat = 30
+
     private func fit(in size: CGSize) {
         guard !graph.nodes.isEmpty else { return }
-        let minX = graph.nodes.map(\.position.x).min()! - 30
-        let minY = graph.nodes.map(\.position.y).min()! - 30
-        let maxX = graph.nodes.map(\.position.x).max()! + NodeGeometry.width + 30
-        let maxY = graph.nodes.map(\.position.y).max()! + NodeGeometry.height + 30
-        let scale = min(size.width / max(1, maxX - minX), size.height / max(1, maxY - minY))
+        let minX = graph.nodes.map(\.position.x).min()! - 24
+        let minY = graph.nodes.map(\.position.y).min()! - 24
+        let maxX = graph.nodes.map(\.position.x).max()! + NodeGeometry.width + 24
+        let maxY = graph.nodes.map(\.position.y).max()! + NodeGeometry.height + 24
+        let usable = max(1, size.height - Self.controlStrip)
+        let scale = min(size.width / max(1, maxX - minX), usable / max(1, maxY - minY))
         zoom = min(1.4, max(0.35, scale))
         zoomStart = zoom
-        pan = CGSize(width: -minX * zoom, height: -minY * zoom)
+        // Centre what is left over, so a small graph does not sit jammed into
+        // the top-left corner of a wide canvas.
+        let slackX = max(0, size.width - (maxX - minX) * zoom) / 2
+        let slackY = max(0, usable - (maxY - minY) * zoom) / 2
+        pan = CGSize(width: -minX * zoom + slackX,
+                     height: -minY * zoom + slackY + Self.controlStrip)
         panStart = pan
     }
 
