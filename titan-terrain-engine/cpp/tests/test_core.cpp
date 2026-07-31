@@ -1334,6 +1334,119 @@ void TestResolutionIndependence() {
     std::printf("\n");
 }
 
+void TestTiledExport() {
+    std::printf("Tiled export\n");
+
+    Titan::TerrainEngine e;
+    e.Initialize(MakeParams(31337, 1, 256));
+    e.GenerateHeightmap();
+    {
+        Titan::HydraulicParams hp;
+        e.ApplyHydraulicErosion(49152, hp);
+        Titan::ThermalParams tp;
+        e.ApplyThermalWeathering(8, tp);
+    }
+
+    Check(e.TileResolution(4, 0) == 64, "4x4 tiles of a 256 grid are 64 samples");
+    Check(e.TileResolution(4, 1) == 65, "one sample of overlap makes them 65");
+    Check(e.TileResolution(5, 0) == 0, "a tile count that does not divide the grid is rejected");
+    Check(e.TileResolution(0, 0) == 0, "zero tiles is rejected");
+    Check(e.TileResolution(4, 64) == 0, "an overlap as large as the step is rejected");
+
+    // The whole point: reassembling the tiles must reproduce the single-file
+    // export exactly. Anything else means a seam.
+    const size_t wholeBytes = e.ExportR16();
+    std::vector<uint8_t> whole(e.ExportData(), e.ExportData() + wholeBytes);
+    Check(wholeBytes == 256u * 256u * 2u, "whole-terrain r16 is the expected size");
+
+    const int tiles = 4;
+    const int step = 256 / tiles;
+    std::vector<uint16_t> assembled(256u * 256u, 0);
+    bool sizesOk = true;
+    for (int ty = 0; ty < tiles; ++ty) {
+        for (int tx = 0; tx < tiles; ++tx) {
+            const size_t bytes = e.ExportTile(tx, ty, tiles, 0,
+                                              static_cast<int>(Titan::TerrainEngine::TileFormat::R16));
+            if (bytes != static_cast<size_t>(step) * step * 2) { sizesOk = false; continue; }
+            const uint8_t* d = e.ExportData();
+            for (int y = 0; y < step; ++y) {
+                for (int x = 0; x < step; ++x) {
+                    const size_t si = (static_cast<size_t>(y) * step + x) * 2;
+                    const uint16_t v = static_cast<uint16_t>(d[si] | (d[si + 1] << 8));
+                    assembled[static_cast<size_t>(ty * step + y) * 256 + (tx * step + x)] = v;
+                }
+            }
+        }
+    }
+    Check(sizesOk, "every tile is exactly step x step samples");
+
+    size_t mismatches = 0;
+    for (size_t i = 0; i < assembled.size(); ++i) {
+        const uint16_t w = static_cast<uint16_t>(whole[i * 2] | (whole[i * 2 + 1] << 8));
+        if (w != assembled[i]) ++mismatches;
+    }
+    Check(mismatches == 0,
+          "tiles reassemble into the whole-terrain export bit-for-bit");
+
+    // A shared vertex row is what landscape importers expect: the last column
+    // of one tile must equal the first column of its neighbour.
+    std::vector<uint16_t> left, right;
+    {
+        const int res = e.TileResolution(4, 1);
+        e.ExportTile(0, 0, 4, 1, 0);
+        const uint8_t* d = e.ExportData();
+        for (int y = 0; y < res; ++y) {
+            const size_t si = (static_cast<size_t>(y) * res + (res - 1)) * 2;
+            left.push_back(static_cast<uint16_t>(d[si] | (d[si + 1] << 8)));
+        }
+        e.ExportTile(1, 0, 4, 1, 0);
+        d = e.ExportData();
+        for (int y = 0; y < res; ++y) {
+            const size_t si = static_cast<size_t>(y) * res * 2;
+            right.push_back(static_cast<uint16_t>(d[si] | (d[si + 1] << 8)));
+        }
+    }
+    Check(left == right, "with overlap 1, neighbouring tiles share their edge exactly");
+
+    // Every tile must be measured against the whole terrain. Normalizing each
+    // to its own extremes is the classic way to ruin a tiled heightmap: each
+    // tile gets its own vertical scale and the set steps at every seam.
+    uint16_t globalMin = 65535, globalMax = 0;
+    for (int ty = 0; ty < tiles; ++ty) {
+        for (int tx = 0; tx < tiles; ++tx) {
+            e.ExportTile(tx, ty, tiles, 0, 0);
+            const uint8_t* d = e.ExportData();
+            uint16_t lo = 65535, hi = 0;
+            for (int i = 0; i < step * step; ++i) {
+                const uint16_t v = static_cast<uint16_t>(d[i * 2] | (d[i * 2 + 1] << 8));
+                lo = std::min(lo, v);
+                hi = std::max(hi, v);
+            }
+            globalMin = std::min(globalMin, lo);
+            globalMax = std::max(globalMax, hi);
+            // A per-tile normalization would drive every single tile to the
+            // full 0..65535 range.
+            if (tx == 0 && ty == 0) {
+                Check(!(lo == 0 && hi == 65535),
+                      "an individual tile does not span the full range on its own");
+            }
+        }
+    }
+    Check(globalMax > globalMin, "the tile set as a whole spans a real range");
+
+    // Formats and bounds.
+    Check(e.ExportTile(0, 0, 4, 0, 2) == static_cast<size_t>(step) * step * 4,
+          "r32 tiles are four bytes per sample");
+    const size_t pngBytes = e.ExportTile(0, 0, 4, 0, 1);
+    Check(pngBytes > 8 && e.ExportData()[0] == 137 && e.ExportData()[1] == 80,
+          "png16 tiles carry a PNG signature");
+
+    bool threw = false;
+    try { e.ExportTile(4, 0, 4, 0, 0); } catch (const std::exception&) { threw = true; }
+    Check(threw, "an out-of-range tile index is rejected rather than read out of bounds");
+    std::printf("\n");
+}
+
 void TestExportHeightRange() {
     std::printf("Export height range\n");
 
@@ -2029,6 +2142,7 @@ int main() {
     TestSplatMatchesMesh();
     TestBandScratchSharedWithHosts();
     TestResolutionIndependence();
+    TestTiledExport();
     TestExportHeightRange();
     TestLayerResolutionIndependence();
     TestAmbientOcclusion();

@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <stdexcept>
 #include <vector>
 
 #if !defined(__EMSCRIPTEN__)
@@ -148,6 +149,112 @@ void TerrainEngine::ExportHeightRange(float& outMin, float& outMax) const {
 
     if (outMax - pHi > allowance) outMax = pHi + allowance;
     if (pLo - outMin > allowance) outMin = pLo - allowance;
+}
+
+// --- Tiled export -----------------------------------------------------------
+// See the header for why tiles are sliced from one simulation rather than
+// generated independently at their own world origins.
+
+int TerrainEngine::TileResolution(int tilesPerSide, int overlap) const {
+    const int size = m_Params.size;
+    if (tilesPerSide < 1 || tilesPerSide > size) return 0;
+    if (size % tilesPerSide != 0) return 0;
+    if (overlap < 0) return 0;
+    const int step = size / tilesPerSide;
+    if (overlap >= step) return 0;
+    return step + overlap;
+}
+
+size_t TerrainEngine::ExportTile(int tileX, int tileY, int tilesPerSide,
+                                 int overlap, int format) {
+    const int size = m_Params.size;
+    const int tileRes = TileResolution(tilesPerSide, overlap);
+    if (tileRes == 0) {
+        throw std::invalid_argument(
+            "tile split invalid: tilesPerSide must divide the grid and "
+            "overlap must be smaller than the tile step");
+    }
+    if (tileX < 0 || tileY < 0 || tileX >= tilesPerSide || tileY >= tilesPerSide) {
+        throw std::out_of_range("tile index out of range");
+    }
+
+    const int step = size / tilesPerSide;
+    const int x0 = tileX * step;
+    const int y0 = tileY * step;
+
+    // Every tile measures against the *whole terrain's* range. Per-tile
+    // normalization would give each tile its own vertical scale and step at
+    // every seam, which is the classic way to ruin a tiled heightmap.
+    float minH = 0.0f, maxH = 0.0f;
+    ExportHeightRange(minH, maxH);
+    const float range = (maxH - minH) > 0.0f ? (maxH - minH) : 1.0f;
+
+    // Sample with clamping so the far tiles can overlap past the grid edge.
+    auto heightAt = [&](int x, int y) {
+        const int cx = std::clamp(x0 + x, 0, size - 1);
+        const int cy = std::clamp(y0 + y, 0, size - 1);
+        const size_t i = static_cast<size_t>(cy) * size + cx;
+        return m_Bedrock[i] + m_Sediment[i];
+    };
+    auto normalized = [&](int x, int y) {
+        return std::clamp((heightAt(x, y) - minH) / range, 0.0f, 1.0f);
+    };
+
+    const auto fmt = static_cast<TileFormat>(format);
+    m_ExportBuffer.clear();
+
+    if (fmt == TileFormat::R32) {
+        // Absolute heights: no normalization, so tiles are trivially seamless.
+        m_ExportBuffer.reserve(static_cast<size_t>(tileRes) * tileRes * 4);
+        for (int y = 0; y < tileRes; ++y) {
+            for (int x = 0; x < tileRes; ++x) PutF32LE(m_ExportBuffer, heightAt(x, y));
+        }
+        return m_ExportBuffer.size();
+    }
+
+    if (fmt == TileFormat::R16) {
+        m_ExportBuffer.reserve(static_cast<size_t>(tileRes) * tileRes * 2);
+        for (int y = 0; y < tileRes; ++y) {
+            for (int x = 0; x < tileRes; ++x) {
+                PutU16LE(m_ExportBuffer, static_cast<uint16_t>(
+                    std::lround(normalized(x, y) * 65535.0f)));
+            }
+        }
+        return m_ExportBuffer.size();
+    }
+
+    if (fmt != TileFormat::PNG16) {
+        throw std::invalid_argument("unknown tile format");
+    }
+
+    std::vector<uint8_t> raw;
+    raw.reserve(static_cast<size_t>(tileRes) * (tileRes * 2 + 1));
+    for (int y = 0; y < tileRes; ++y) {
+        raw.push_back(0); // filter byte
+        for (int x = 0; x < tileRes; ++x) {
+            const uint16_t v = static_cast<uint16_t>(
+                std::lround(normalized(x, y) * 65535.0f));
+            raw.push_back(static_cast<uint8_t>(v >> 8));
+            raw.push_back(static_cast<uint8_t>(v));
+        }
+    }
+
+    static const uint8_t sig[8] = {137, 80, 78, 71, 13, 10, 26, 10};
+    PutBytes(m_ExportBuffer, sig, 8);
+    std::vector<uint8_t> ihdr;
+    PutU32BE(ihdr, static_cast<uint32_t>(tileRes));
+    PutU32BE(ihdr, static_cast<uint32_t>(tileRes));
+    PutU8(ihdr, 16); // bit depth
+    PutU8(ihdr, 0);  // grayscale
+    PutU8(ihdr, 0);  // compression
+    PutU8(ihdr, 0);  // filter
+    PutU8(ihdr, 0);  // no interlace
+    PngChunk(m_ExportBuffer, "IHDR", ihdr);
+    std::vector<uint8_t> idat;
+    ZlibStored(idat, raw);
+    PngChunk(m_ExportBuffer, "IDAT", idat);
+    PngChunk(m_ExportBuffer, "IEND", {});
+    return m_ExportBuffer.size();
 }
 
 size_t TerrainEngine::ExportPNG16() {

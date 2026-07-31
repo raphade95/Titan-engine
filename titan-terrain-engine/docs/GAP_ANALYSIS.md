@@ -2,10 +2,10 @@
 
 Competitive gaps identified by comparing Titan's current feature set against World Machine 2, Gaea 2.0 Early Access, Houdini HeightField (H16–H17), and Terragen Classic at their earliest public releases.
 
-**Status (v0.8):** every High and Medium item below is implemented in libTitanCore
-and exposed in both the web lab and the macOS app. Three items remain open, all
-Low priority: surface-detail nodes (#11), tiled export (#20), and DEM/GeoTIFF
-decoding (the remaining half of #5).
+**Status (v0.9):** every High and Medium item below is implemented in libTitanCore
+and exposed in both the web lab and the macOS app. Two items remain open, both
+Low priority: surface-detail nodes (#11) and DEM/GeoTIFF decoding (the remaining
+half of #5).
 
 This list is a *competitive floor*, not a roadmap — it was drawn up against what
 rivals shipped in their earliest public releases. The engine has since gone well
@@ -16,11 +16,12 @@ past it, and the work below is not on the table at all:
 | v0.6 | Snow and Lakes promoted from engine-only to layers in both UIs |
 | v0.7 | **Volcanism** — stratovolcano edifice stamping plus a cellular lava flow with yield strength, self-channelizing streams, and chilled lava folded back into the terrain. Drag-to-place in both viewports |
 | v0.8 | **Viewport overhaul** — linear-space lighting, horizon-traced AO shared with the exporter, hemisphere ambient, curvature cavity shading, ACES tone mapping, camera-relative aerial perspective, and simulated snow/lakes actually rendered |
+| v0.9 | **Tiled export** for large worlds, and a world/detail scale split — `worldSize` is the extent, `size` is sample density, and the simulation passes measure in world units so refining the grid converges instead of reshaping the terrain |
 | throughout | LOD preview meshing (decouples simulation resolution from preview cost, so grids can exceed 512), parameter sanitization, exception-safe C boundary with `titan_last_error`, canonical engine-side seed hashing and band curves, mass-balance and height-range introspection |
 
-Test coverage grew from ~17 checks to 47 test functions — 185 assertions —
-across `titan_tests` and `titan_golden`, plus the WASM golden harness and the
-TitanLab smoke test.
+Test coverage grew from ~17 checks to 51 test functions — 213 assertions —
+across `titan_tests` and `titan_golden`, plus the WASM golden harness, the
+`.titan` format test, and the TitanLab smoke test.
 
 **The one open architectural question** is not on this list either: every
 competitor is a node graph, Titan is a linear layer stack. That is a deliberate
@@ -77,7 +78,7 @@ as a to-do.
 
 | # | Feature | Present In | Priority | Status |
 |---|---------|-----------|----------|--------|
-| 20 | Tiled export (for large worlds) | WM2 Pro (Tiled Output), Houdini (Tile Split/Splice), Gaea (Build Swarm) | Low | ⏳ world-space origins already make tiles seamless; batch UI post-launch |
+| 20 | Tiled export (for large worlds) | WM2 Pro (Tiled Output), Houdini (Tile Split/Splice), Gaea (Build Swarm) | Low | ✅ v0.9 — N×N slices of one simulation, shared height range, optional shared edge row; .zip (web) or folder (macOS) |
 
 ## Workflow & UI
 
@@ -110,8 +111,8 @@ as a to-do.
 16. ✅ Curvature map
 17. ✅ Normal map export
 
-### Low (4 items — nice to have, not launch blockers)
+### Low (4 items — nice to have, not launch blockers) — 3 of 4 shipped
 18. ⏳ Surface detail nodes (partially covered by masked noise layers)
 19. ✅ Occlusion / AO map (exported *and* used for viewport shading since v0.8)
-20. ⏳ Tiled export
+20. ✅ Tiled export
 21. ✅ 2D top-down view

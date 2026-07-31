@@ -69,6 +69,9 @@ struct ContentView: View {
     @State private var tab = 0
     // Which layers have their advanced physics panel open, keyed by layer id.
     @State private var expandedAdvanced: Set<UUID> = []
+    // Tiled export: tiles per side, and whether neighbours share an edge row.
+    @State private var tilesPerSide = 2
+    @State private var tileOverlap = 1
 
     var body: some View {
         HSplitView {
@@ -829,6 +832,8 @@ struct ContentView: View {
             heightRangeSection
             exportFormatsSection
             Divider()
+            tiledExportSection
+            Divider()
             projectSection
             Divider()
             importGuideSection
@@ -846,6 +851,72 @@ struct ContentView: View {
                 }
             }
         }
+    }
+
+    private var tiledExportSection: some View {
+        let size = Int(model.size)
+        let divides = tilesPerSide > 0 && size % tilesPerSide == 0
+        let tileRes = divides ? size / tilesPerSide + tileOverlap : 0
+        return VStack(alignment: .leading, spacing: 8) {
+            sectionTitle("Tiled Export")
+            Text("Splits the terrain into a grid of heightmaps for large worlds (Unreal World Partition). Tiles are sliced from one simulation and share a single height range, so they assemble seamlessly — the set reassembles into the whole-terrain export bit for bit.")
+                .font(.system(size: 9)).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            Picker("", selection: $tilesPerSide) {
+                ForEach([1, 2, 4, 8, 16], id: \.self) { n in
+                    Text("\(n)×\(n)").tag(n)
+                }
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+
+            Toggle("Shared edge row", isOn: Binding(
+                get: { tileOverlap == 1 },
+                set: { tileOverlap = $0 ? 1 : 0 }
+            ))
+            .font(.system(size: 10))
+            Text(tileOverlap == 1
+                 ? "Neighbours share a row of vertices — what landscape importers expect. The last tile in each axis repeats its final row."
+                 : "Exact partition: every sample in exactly one tile, nothing duplicated.")
+                .font(.system(size: 8.5)).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            if divides {
+                Text(String(format: "%d files · %d×%d px each · %.0f world units per tile",
+                            tilesPerSide * tilesPerSide, tileRes, tileRes,
+                            model.worldSize / Double(tilesPerSide)))
+                    .font(.system(size: 9, design: .monospaced))
+                    .foregroundStyle(.secondary)
+            } else {
+                Text("\(tilesPerSide)×\(tilesPerSide) does not divide a \(size) grid evenly.")
+                    .font(.system(size: 9, design: .monospaced))
+                    .foregroundStyle(.orange)
+            }
+
+            HStack {
+                ForEach([("r16", 0), ("png", 1), ("r32", 2)], id: \.0) { ext, fmt in
+                    Button {
+                        chooseFolderAndExportTiles(format: fmt, ext: ext)
+                    } label: {
+                        Text(".\(ext)").frame(maxWidth: .infinity)
+                    }
+                    .disabled(!divides || model.isGenerating)
+                }
+            }
+        }
+    }
+
+    private func chooseFolderAndExportTiles(format: Int, ext: String) {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.canCreateDirectories = true
+        panel.prompt = "Export Tiles"
+        panel.message = "Choose a folder for the \(tilesPerSide * tilesPerSide) tile files"
+        guard panel.runModal() == .OK, let dir = panel.url else { return }
+        model.exportTiles(to: dir, tilesPerSide: tilesPerSide,
+                          overlap: tileOverlap, format: format, ext: ext)
     }
 
     private var projectSection: some View {

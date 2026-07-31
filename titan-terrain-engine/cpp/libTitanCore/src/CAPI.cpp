@@ -646,6 +646,23 @@ TITAN_API void titan_export_height_range(TitanHandle* handle, float* outMin, flo
     })
 }
 
+TITAN_API int64_t titan_export_tile(TitanHandle* handle, int tileX, int tileY,
+                                    int tilesPerSide, int overlap, int format) {
+    if (!handle) { SetError("null handle"); return 0; }
+    TITAN_GUARD_RET(0, {
+        return static_cast<int64_t>(
+            Engine(handle)->ExportTile(tileX, tileY, tilesPerSide, overlap, format));
+    })
+}
+
+TITAN_API int titan_tile_resolution(TitanHandle* handle, int tilesPerSide,
+                                    int overlap) {
+    if (!handle) { SetError("null handle"); return 0; }
+    TITAN_GUARD_RET(0, {
+        return Engine(handle)->TileResolution(tilesPerSide, overlap);
+    })
+}
+
 TITAN_API void titan_mass_balance(TitanHandle* handle, double* exported, double* created) {
     if (!handle) { SetError("null handle"); return; }
     TITAN_GUARD({

@@ -75,6 +75,12 @@ only marshals parameters in and copies buffers out across the C API
   of the 16-bit depth on the gap between the terrain and a few pixels — an
   unsettled hydraulic pass went from 36% usable range to 81%, while terrain
   whose maximum is a real summit exports untouched.
+- **Tiled export** for large worlds (Unreal World Partition): an N×N grid of
+  heightmaps sliced from one simulation and sharing one height range, so the set
+  reassembles into the single-file export bit for bit. Generating tiles
+  independently would seam — world-space noise lines up exactly, but erosion is
+  not local, and separately eroded tiles disagree by up to 4.2% of the relief
+  along their shared edge.
 - 2D top-down hypsometric map view in both the web lab and TitanLab (macOS).
 - Drop-a-volcano placement in both viewports: press on the terrain to place a
   cone, drag to position it. Lava is rendered from a per-vertex attribute the

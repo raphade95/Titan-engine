@@ -41,6 +41,7 @@ import {
 } from 'lucide-react';
 
 import { TitanCore } from './core/TitanCore';
+import { makeZip } from './core/zip';
 import { TerrainParams, ExportKind } from './core/types';
 import {
   ImportedField,
@@ -138,6 +139,10 @@ export default function App() {
   const [waterLevel, setWaterLevel] = useState(-10);
   const [imported, setImported] = useState<ImportedField | undefined>(undefined);
   const [showMinimap, setShowMinimap] = useState(false);
+  // Tiled export: how many tiles per side, and whether neighbours share an
+  // edge row (what landscape importers usually expect).
+  const [tilesPerSide, setTilesPerSide] = useState(2);
+  const [tileOverlap, setTileOverlap] = useState(1);
   const minimapRef = useRef<HTMLCanvasElement | null>(null);
   const importFileRef = useRef<HTMLInputElement | null>(null);
   const [sunIntensity, setSunIntensity] = useState(1.4);
@@ -1405,6 +1410,37 @@ export default function App() {
     URL.revokeObjectURL(url);
   };
 
+  // Exports every tile as one archive. The browser throttles or blocks a burst
+  // of individual downloads, and a 8x8 split is 64 files.
+  const exportTiles = (format: number, ext: string) => {
+    const engine = engineRef.current;
+    if (!engine) return;
+    try {
+      const res = engine.tileResolution(tilesPerSide, tileOverlap);
+      if (!res) {
+        setError(`${tilesPerSide}x${tilesPerSide} tiles do not divide a ${params.size} grid evenly`);
+        return;
+      }
+      const files = [];
+      for (let ty = 0; ty < tilesPerSide; ++ty) {
+        for (let tx = 0; tx < tilesPerSide; ++tx) {
+          files.push({
+            // x0_y0 naming is what Unreal's tiled landscape import expects.
+            name: `titan_${params.seed}_x${tx}_y${ty}.${ext}`,
+            data: engine.exportTile(tx, ty, tilesPerSide, tileOverlap, format),
+          });
+        }
+      }
+      downloadBinary(
+        makeZip(files),
+        `titan_${params.seed}_${tilesPerSide}x${tilesPerSide}_${res}px.zip`
+      );
+      setError(null);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Tiled export failed');
+    }
+  };
+
   const exportVia = (kind: ExportKind, ext: string) => {
     if (!engineRef.current) return;
     try {
@@ -2316,6 +2352,99 @@ export default function App() {
                         </Button>
                       ))}
                     </div>
+                  </div>
+
+                  <div className="p-4 bg-zinc-900 rounded-lg border border-zinc-800">
+                    <div className="flex items-center gap-3 mb-3">
+                      <Grid3X3 className="w-5 h-5 text-emerald-400" />
+                      <h3 className="text-xs font-bold uppercase tracking-widest">Tiled Export</h3>
+                    </div>
+                    <p className="text-[10px] text-zinc-500 mb-4 leading-relaxed">
+                      Splits the terrain into a grid of heightmaps for large worlds
+                      (Unreal World Partition). Tiles are sliced from one simulation and
+                      share a single height range, so they assemble seamlessly — the set
+                      reassembles into the whole-terrain export bit for bit.
+                    </p>
+
+                    <div className="space-y-3 mb-4">
+                      <div className="flex items-center justify-between">
+                        <Label className="text-[10px] uppercase text-zinc-400">Tiles</Label>
+                        <span className="text-xs font-mono">
+                          {tilesPerSide}×{tilesPerSide} = {tilesPerSide * tilesPerSide}
+                        </span>
+                      </div>
+                      <div className="grid grid-cols-5 gap-1">
+                        {[1, 2, 4, 8, 16].map(n => {
+                          const res = params.size % n === 0 ? params.size / n + tileOverlap : 0;
+                          return (
+                            <Button
+                              key={n}
+                              variant="outline"
+                              size="sm"
+                              disabled={res === 0}
+                              className={`h-7 px-0 text-[9px] uppercase tracking-tight bg-zinc-950 border-zinc-800 disabled:opacity-25 ${
+                                tilesPerSide === n ? 'border-emerald-500/50 text-emerald-400' : 'text-zinc-500'
+                              }`}
+                              onClick={() => setTilesPerSide(n)}
+                            >
+                              {n}×{n}
+                            </Button>
+                          );
+                        })}
+                      </div>
+
+                      <div className="flex items-center justify-between pt-1">
+                        <Label className="text-[10px] uppercase text-zinc-400">Shared Edge</Label>
+                        <button
+                          className={`text-[9px] uppercase tracking-wider ${
+                            tileOverlap ? 'text-emerald-400' : 'text-zinc-600 hover:text-zinc-300'
+                          }`}
+                          onClick={() => setTileOverlap(o => (o ? 0 : 1))}
+                        >
+                          {tileOverlap ? 'On' : 'Off'}
+                        </button>
+                      </div>
+                      <p className="text-[9px] text-zinc-600 leading-relaxed -mt-1">
+                        {tileOverlap
+                          ? 'Neighbours share a row of vertices — what landscape importers expect. The last tile in each axis repeats its final row.'
+                          : 'Exact partition: every sample in exactly one tile, nothing duplicated.'}
+                      </p>
+
+                      {params.size % tilesPerSide === 0 ? (
+                        <div className="text-[9px] font-mono text-zinc-400">
+                          {tilesPerSide * tilesPerSide} files ·{' '}
+                          {params.size / tilesPerSide + tileOverlap}×
+                          {params.size / tilesPerSide + tileOverlap} px each ·{' '}
+                          {(params.worldSize / tilesPerSide).toFixed(0)} world units per tile
+                        </div>
+                      ) : (
+                        <div className="text-[9px] font-mono text-amber-500/80">
+                          {tilesPerSide}×{tilesPerSide} does not divide a {params.size} grid evenly.
+                        </div>
+                      )}
+                    </div>
+
+                    <div className="grid grid-cols-3 gap-2">
+                      {([
+                        { fmt: 0, ext: 'r16', label: '.r16' },
+                        { fmt: 1, ext: 'png', label: '.png 16' },
+                        { fmt: 2, ext: 'r32', label: '.r32' },
+                      ] as const).map(f => (
+                        <Button
+                          key={f.fmt}
+                          onClick={() => exportTiles(f.fmt, f.ext)}
+                          variant="outline"
+                          disabled={params.size % tilesPerSide !== 0}
+                          className="border-zinc-800 hover:bg-zinc-800 text-[10px] uppercase tracking-widest h-9 disabled:opacity-30"
+                        >
+                          {f.label}
+                        </Button>
+                      ))}
+                    </div>
+                    <p className="text-[9px] text-zinc-600 mt-2 leading-relaxed">
+                      Downloads one .zip named <span className="font-mono">…_x0_y0.…</span> per
+                      tile, the layout Unreal's tiled landscape import expects.
+                    </p>
                   </div>
 
                   <div className="p-4 bg-zinc-900 rounded-lg border border-zinc-800">

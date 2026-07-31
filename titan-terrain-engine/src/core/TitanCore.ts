@@ -364,6 +364,39 @@ export class TitanCore {
     return this.copyLayer(this.module._titan_scratch_ptr(this.handle));
   }
 
+  // --- Tiled export -------------------------------------------------------
+
+  /**
+   * Samples per edge a tile would have, or 0 if the split is invalid.
+   * Use it to validate a tile count before offering it.
+   */
+  tileResolution(tilesPerSide: number, overlap: number): number {
+    return this.module._titan_tile_resolution(this.handle, tilesPerSide, overlap);
+  }
+
+  /**
+   * One tile of the already-simulated terrain.
+   *
+   * Tiles are sliced rather than regenerated at their own world origins.
+   * World-space noise sampling does make independently generated tiles line up
+   * exactly on raw terrain, but erosion is not local — droplets do not cross a
+   * tile boundary — so separately eroded tiles seam by several percent of the
+   * relief. Every tile also normalizes against the whole terrain's range, so
+   * the set assembles without steps.
+   *
+   * format: 0 = .r16, 1 = 16-bit PNG, 2 = .r32.
+   */
+  exportTile(tileX: number, tileY: number, tilesPerSide: number,
+             overlap: number, format: number): Uint8Array {
+    const m = this.module;
+    m._titan_clear_error();
+    const size = Number(m._titan_export_tile(this.handle, tileX, tileY,
+                                             tilesPerSide, overlap, format));
+    if (!size) throw new Error(this.lastError() ?? 'tile export failed');
+    const ptr = m._titan_export_data_ptr(this.handle) as number;
+    return new Uint8Array(m.HEAPU8.buffer, ptr, size).slice();
+  }
+
   /** Last engine error on this thread, or null. */
   lastError(): string | null {
     const ptr = this.module._titan_last_error();

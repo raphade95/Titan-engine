@@ -1276,6 +1276,68 @@ final class EngineModel: ObservableObject {
 
     // MARK: - Export
 
+    // MARK: - Tiled export
+
+    /// Samples per edge a tile would have, or 0 if the split is invalid.
+    func tileResolution(tilesPerSide: Int, overlap: Int) -> Int {
+        Int(titan_tile_resolution(engine, Int32(tilesPerSide), Int32(overlap)))
+    }
+
+    /// One tile of the already-simulated terrain.
+    ///
+    /// Tiles are sliced rather than regenerated at their own world origins.
+    /// World-space noise sampling does make independently generated tiles line
+    /// up exactly on raw terrain, but erosion is not local — droplets do not
+    /// cross a tile boundary — so separately eroded tiles seam by several
+    /// percent of the relief. Every tile also normalizes against the whole
+    /// terrain's range, so the set assembles without steps.
+    ///
+    /// format: 0 = .r16, 1 = 16-bit PNG, 2 = .r32.
+    func exportTileData(tileX: Int, tileY: Int, tilesPerSide: Int,
+                        overlap: Int, format: Int) -> Data? {
+        titan_clear_error()
+        let bytes = titan_export_tile(engine, Int32(tileX), Int32(tileY),
+                                      Int32(tilesPerSide), Int32(overlap), Int32(format))
+        guard bytes > 0, let ptr = titan_export_data_ptr(engine) else {
+            if let err = titan_last_error() {
+                statusText = "Tiled export failed — \(String(cString: err))"
+            }
+            return nil
+        }
+        return Data(bytes: ptr, count: Int(bytes))
+    }
+
+    /// Writes every tile into `directory`, named for Unreal's tiled import.
+    /// Returns the number of files written.
+    @discardableResult
+    func exportTiles(to directory: URL, tilesPerSide: Int, overlap: Int,
+                     format: Int, ext: String) -> Int {
+        guard tileResolution(tilesPerSide: tilesPerSide, overlap: overlap) > 0 else {
+            statusText = "\(tilesPerSide)x\(tilesPerSide) tiles do not divide a \(Int(size)) grid evenly"
+            return 0
+        }
+        var written = 0
+        for ty in 0..<tilesPerSide {
+            for tx in 0..<tilesPerSide {
+                guard let data = exportTileData(tileX: tx, tileY: ty,
+                                                tilesPerSide: tilesPerSide,
+                                                overlap: overlap, format: format) else {
+                    return written
+                }
+                // x0_y0 naming is what Unreal's tiled landscape import expects.
+                let url = directory.appendingPathComponent(
+                    "titan_\(seed)_x\(tx)_y\(ty).\(ext)")
+                do { try data.write(to: url) } catch {
+                    statusText = "Could not write \(url.lastPathComponent)"
+                    return written
+                }
+                written += 1
+            }
+        }
+        statusText = "Wrote \(written) tiles to \(directory.lastPathComponent)"
+        return written
+    }
+
     /// Runs a C++ exporter and copies the result out.
     ///
     /// Sizes are Int64: a full-resolution OBJ of a large grid exceeds 2 GB,

@@ -330,6 +330,34 @@ TITAN_API void titan_height_range(TitanHandle* handle, float* outMin, float* out
 // the file encodes. Either pointer may be NULL.
 TITAN_API void titan_export_height_range(TitanHandle* handle, float* outMin, float* outMax);
 
+// --- Tiled export ---------------------------------------------------------
+//
+// Slices the already-simulated terrain into tilesPerSide^2 tiles, one call per
+// tile, into the usual export buffer (read via titan_export_data_ptr).
+//
+// Tiles are sliced, not regenerated at their own world origins. World-space
+// noise sampling does make independently generated tiles line up exactly on raw
+// terrain, but erosion is not local: droplets do not cross a tile boundary,
+// drainage terminates at it, and talus has nothing to slump onto beyond it, so
+// separately eroded tiles disagree along their shared edge by several percent
+// of the relief. Every tile also normalizes against the whole terrain's export
+// range, so the set assembles without steps between tiles.
+//
+// tilesPerSide must divide the grid. `overlap` adds that many samples to each
+// tile's far edge, so 1 makes neighbours share a row of vertices (what
+// landscape importers usually expect) and the last tile in each axis clamps at
+// the grid edge; 0 is an exact partition with nothing duplicated.
+// format: 0 = .r16, 1 = 16-bit PNG, 2 = .r32 (absolute float).
+//
+// Returns bytes written, or 0 on invalid arguments (see titan_last_error).
+TITAN_API int64_t titan_export_tile(TitanHandle* handle, int tileX, int tileY,
+                                    int tilesPerSide, int overlap, int format);
+
+// Samples per edge a tile would have, or 0 if the split is invalid — use it to
+// validate a tile count before offering it.
+TITAN_API int titan_tile_resolution(TitanHandle* handle, int tilesPerSide,
+                                    int overlap);
+
 // Mass accounting for hydraulic erosion, summed over cells in world height
 // units. `exported` is material droplets carried off the map (a real export to
 // the sea, not a leak); `created` is the small amount conjured when two

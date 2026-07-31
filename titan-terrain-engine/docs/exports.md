@@ -88,6 +88,37 @@ data in the same export. It is now normalized to the actual span, matching both
 Use `.exr` or `.r32` if you would rather not think about it at all: both store
 absolute float heights with no normalization.
 
+## Tiled export
+
+Large worlds import as a grid of heightmaps rather than one file. Pick a tile
+count in the Export tab; the web lab downloads a `.zip`, TitanLab writes the
+files into a folder you choose. Names follow `titan_<seed>_x<i>_y<j>.<ext>`,
+the layout Unreal's tiled landscape import expects.
+
+Two properties make the set assemble cleanly:
+
+**Tiles are sliced from one simulation, not generated per tile.** World-space
+noise sampling does make independently generated tiles line up exactly — the
+measured seam error on raw terrain is 0.0 — but erosion is not a local
+operation. Droplets do not cross a tile boundary, drainage networks terminate
+at it, and talus creep has nothing to slump onto beyond it. Tiles eroded
+separately disagree along their shared edge by up to 4.2% of the relief, which
+is a visible ridge. Slicing avoids the question entirely: the tile set
+reassembles into the single-file export bit for bit.
+
+**Every tile shares one height range.** Normalizing each tile to its own
+extremes would give every tile a different vertical scale and step at every
+seam. All tiles use the whole terrain's export range, so the Z scale shown in
+the Export tab is correct for all of them.
+
+`Shared edge row` adds one sample to each tile's far edge so neighbours share a
+row of vertices, which is what landscape importers expect; the last tile in
+each axis clamps at the grid edge and repeats its final row. Turn it off for an
+exact partition — every sample in exactly one tile, nothing duplicated.
+
+The tile count must divide the resolution (a 1024 grid tiles 1/2/4/8/16 ways;
+the UI greys out the rest). Each tile covers `worldSize / tiles` world units.
+
 ## Unreal Engine
 
 1. **Landscape mode → New → Import from File** and select the `.r16`.
