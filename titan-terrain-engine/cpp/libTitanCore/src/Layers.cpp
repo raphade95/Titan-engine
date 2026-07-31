@@ -329,9 +329,20 @@ void TerrainEngine::ApplySnow(const SnowParams& p) {
             // layer twice used to double the snowpack, which is wrong for a
             // stack that re-evaluates. The mask still gates the change, so a
             // masked-out cell keeps whatever it already had.
+            //
+            // Written as a lerp, not as `snow += (target - snow) * mask`.
+            // Those are the same number in exact arithmetic and different in
+            // float: at mask 1 the increment form evaluates S + (target - S),
+            // which lands back on target for only ~77% of float pairs, so a
+            // second run of the layer moved the snowpack by an ulp and the
+            // idempotence test failed. It failed only on Linux and Windows,
+            // because the values reaching this line come through std::tan and
+            // libm is not bit-portable — macOS happened to draw from the 77%.
+            // The lerp is exact at mask 0 and mask 1 by construction.
             const float target = p.amount * band * shed;
             const size_t si = static_cast<size_t>(i);
-            m_Snow[si] += (target - m_Snow[si]) * MaskAt(i);
+            const float mask = MaskAt(i);
+            m_Snow[si] = target * mask + m_Snow[si] * (1.0f - mask);
         }
     }
 
