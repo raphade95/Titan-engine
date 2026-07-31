@@ -14,10 +14,10 @@ cd "$(dirname "$0")/.."
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
 
-SRC="libTitanCore/src/TitanNoise.cpp libTitanCore/src/TerrainEngine.cpp
-     libTitanCore/src/Erosion.cpp libTitanCore/src/Fluvial.cpp
-     libTitanCore/src/Layers.cpp libTitanCore/src/Filters.cpp
-     libTitanCore/src/Export.cpp libTitanCore/src/CAPI.cpp"
+# Globbed, not listed. A hardcoded list silently rots every time the engine
+# gains a source file: Volcano.cpp and DemImport.cpp were both added without
+# it, and the whole suite failed as "mutant did not compile" — which reads
+# like a broken mutation rather than a broken script.
 FLAGS="-std=c++20 -O2 -fno-fast-math -ffp-contract=off"
 
 pass=0
@@ -34,10 +34,10 @@ fail=0
 run_mutant() {
     local expect="$1" name="$2" desc="$3"
     if ! clang++ $FLAGS -I "$WORK/src/libTitanCore/include" \
-         $(cd "$WORK/src" && echo $SRC | tr ' ' '\n' | grep -v '^$' | sed "s|^|$WORK/src/|") \
+         "$WORK"/src/libTitanCore/src/*.cpp \
          "$WORK/src/tests/test_golden.cpp" -o "$WORK/mutant" 2>"$WORK/build.log"; then
         echo "  ERROR     $name — mutant did not compile"
-        sed 's/^/            /' "$WORK/build.log" | head -5
+        sed 's/^/            /' "$WORK/build.log" | head -15
         fail=$((fail + 1))
         return
     fi

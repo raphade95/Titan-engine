@@ -10,6 +10,29 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
+# src/wasm/titan_core.js is checked in, and CI proves it is reproducible by
+# rebuilding and diffing. That only means anything if everyone builds with the
+# same compiler: emscripten's output is not stable across versions, so a
+# Homebrew emscripten one minor behind CI's produces a byte-different artifact
+# from identical sources and the diff reads as staleness that no rebuild fixes.
+# Pin the version in one file, enforce it here and in .github/workflows/ci.yml.
+PINNED=$(cat emsdk-version.txt)
+ACTUAL=$(emcc --version | head -1 | sed -E 's/.* ([0-9]+\.[0-9]+\.[0-9]+).*/\1/')
+
+if [ "$ACTUAL" != "$PINNED" ]; then
+    echo "error: emcc is $ACTUAL, but this artifact is pinned to $PINNED." >&2
+    echo "       A different emscripten emits a byte-different module, which" >&2
+    echo "       CI reports as a stale check-in. Install and activate the pin:" >&2
+    echo "" >&2
+    echo "         git clone https://github.com/emscripten-core/emsdk.git ~/emsdk" >&2
+    echo "         ~/emsdk/emsdk install $PINNED && ~/emsdk/emsdk activate $PINNED" >&2
+    echo "         source ~/emsdk/emsdk_env.sh" >&2
+    echo "" >&2
+    echo "       To move the pin deliberately, edit cpp/emsdk-version.txt and" >&2
+    echo "       commit the rebuilt module in the same change." >&2
+    exit 1
+fi
+
 OUT_DIR="../src/wasm"
 mkdir -p "$OUT_DIR"
 

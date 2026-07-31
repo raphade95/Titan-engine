@@ -189,6 +189,11 @@ struct FluvialParams {
 // batch order, so results are bit-identical regardless of thread count.
 // ApplyHydraulicErosion rounds every request up to whole rounds, so results
 // are also identical however the caller chunks the work.
+// Ceiling on how far thermal weathering's pass count may be scaled up to keep
+// a pass a fixed world distance rather than one cell. Covers the resolution
+// slider against a sane world size; see ApplyThermalWeathering.
+constexpr int kThermalPassScaleCap = 8;
+
 constexpr int kDropletBatch = 2048;
 constexpr int kBatchesPerRound = 8;
 constexpr int kDropletsPerRound = kDropletBatch * kBatchesPerRound;
@@ -206,6 +211,21 @@ public:
 
     // Resets height, sediment, flow, snow, and water to a flat empty state.
     void ClearTerrain();
+
+    // Whole-field read/write of the terrain surface, for callers that
+    // evaluate a branching graph of operations rather than one linear stack.
+    //
+    // A graph needs to park a branch's result somewhere, run a second branch
+    // from an earlier state, and then combine the two. Doing that host-side
+    // would mean reimplementing the operations; with these it stays a matter
+    // of scheduling calls the engine already owns.
+    //
+    // SetHeight takes the field as bedrock and resets everything derived from
+    // the surface — sediment, flow, snow, water, lava — because those describe
+    // a history this field does not have. Erosion state does not survive a
+    // hand-off between branches, only the surface does.
+    void ReadHeight(float* out, int count) const;
+    void SetHeight(const float* data, int count);
 
     // Adds a noise field onto the existing terrain with the given blend mode.
     // Respects the active mask. Bedrock/sediment re-split 80/20 afterwards.
@@ -284,6 +304,24 @@ public:
     // heightScale, and blends with the given BlendMode (alpha for Mix).
     void ApplyHeightfield(const float* data, int srcSize, float heightScale,
                           int blendMode, float alpha);
+
+    // --- Real-world elevation import ----------------------------------------
+    //
+    // Decodes a GeoTIFF/TIFF or an SRTM .hgt into a square, 0..1 normalized
+    // field ready for ApplyHeightfield, and records the real elevation range
+    // so a host can report it. Returns the field's edge length, or throws on
+    // malformed input (the C API turns that into titan_last_error).
+    //
+    // In the engine rather than per host so the web lab, TitanLab and Unreal
+    // all read the same files identically — and because a DEM is genuinely
+    // untrusted third-party binary that wants one carefully bounds-checked
+    // parser, not three.
+    int DecodeDem(const uint8_t* data, size_t bytes);
+    const std::vector<float>& DemField() const { return m_Dem; }
+    float DemMinElevation() const { return m_DemMin; }
+    float DemMaxElevation() const { return m_DemMax; }
+    int DemSourceWidth() const { return m_DemSourceWidth; }
+    int DemSourceHeight() const { return m_DemSourceHeight; }
 
     // Derived maps rasterized into the scratch buffer (ScratchMask()).
     void ComputeSlopeMap();     // slope as rise/run
@@ -547,6 +585,11 @@ private:
     std::vector<float> m_LavaGlow;      // blurred emission for the viewport
     std::vector<Vent> m_Vents;          // eruption sources, one per volcano
     std::vector<float> m_AO;            // horizon AO, empty until computed
+    std::vector<float> m_Dem;           // last decoded DEM, square and 0..1
+    float m_DemMin = 0.0f;              // its real elevation range, unnormalized
+    float m_DemMax = 0.0f;
+    int m_DemSourceWidth = 0;           // dimensions before the square resample
+    int m_DemSourceHeight = 0;
 
     // Height range the splat's normalized-height channel is measured against,
     // refreshed by BuildMesh and the splatmap exporter. See RefreshSplatRange.

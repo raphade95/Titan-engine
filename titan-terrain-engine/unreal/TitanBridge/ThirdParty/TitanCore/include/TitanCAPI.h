@@ -102,6 +102,19 @@ TITAN_API void titan_set_mask(TitanHandle* handle, const float* data, int size);
 // Reset height/flow/snow/water to a flat empty state (stack rebuild start).
 TITAN_API void titan_clear_terrain(TitanHandle* handle);
 
+// --- v0.11: whole-field read/write, for graph evaluation -------------------
+//
+// A node graph forks: two branches run from the same upstream state and are
+// combined further down. That needs somewhere to park a branch's result, and
+// a way to rewind the engine to an earlier surface — otherwise a host has to
+// reimplement the operations to evaluate anything but a straight line.
+//
+// `count` is size*size; a short buffer is filled or read as far as it goes
+// rather than overrunning. titan_set_height resets sediment, flow, snow,
+// water and lava: they describe a history the incoming field does not have.
+TITAN_API void titan_read_height(TitanHandle* handle, float* out, int count);
+TITAN_API void titan_set_height(TitanHandle* handle, const float* data, int count);
+
 // Adds a noise field with a blend mode. noiseType: 0 none, 1 simplex fBm,
 // 2 ridged, 3 billow, 4 voronoi cells, 5 voronoi ridges. blendMode: 0 add,
 // 1 subtract, 2 multiply, 3 max, 4 min, 5 mix (by blendAlpha).
@@ -259,6 +272,36 @@ TITAN_API void titan_sample_curve(const float* xs, const float* ys, int count,
 TITAN_API void titan_apply_heightfield(TitanHandle* handle, const float* data,
                                        int srcSize, float heightScale,
                                        int blendMode, float alpha);
+
+// --- v0.10: real-world elevation import -----------------------------------
+//
+// Decodes a GeoTIFF/TIFF or an SRTM .hgt into a square, 0..1 normalized field
+// ready for titan_apply_heightfield. Returns the field's edge length, or 0 on
+// failure (see titan_last_error) — malformed third-party files are expected,
+// so every read in the decoder is bounds-checked and reported rather than
+// trusted.
+//
+// Supports classic TIFF, both byte orders, strips and tiles, 8/16/32-bit
+// unsigned, signed and float samples, horizontal differencing, and none/LZW/
+// Deflate/PackBits compression. BigTIFF is not supported.
+// `bytes` is an int, not an int64: the engine caps DEM dimensions at 32768 a
+// side, so no readable file approaches 2 GB, and an int64 parameter marshals as
+// a BigInt under the WASM build — a trap every JS caller would have to know
+// about. Oversized or negative lengths are rejected.
+TITAN_API int titan_decode_dem(TitanHandle* handle, const uint8_t* data, int bytes);
+
+// The decoded field: edgeSize*edgeSize floats normalized to 0..1.
+TITAN_API float* titan_dem_ptr(TitanHandle* handle);
+
+// The source's real elevation range in its own units (metres, for most DEMs),
+// before normalization — what a user needs to set a true vertical scale.
+// Either pointer may be NULL.
+TITAN_API void titan_dem_elevation_range(TitanHandle* handle, float* outMin, float* outMax);
+
+// Dimensions before the square resample, so a host can say when a rectangular
+// DEM was stretched to fit Titan's square terrain.
+TITAN_API int titan_dem_source_width(TitanHandle* handle);
+TITAN_API int titan_dem_source_height(TitanHandle* handle);
 
 // Derived maps rasterized into scratch (read via titan_scratch_ptr).
 TITAN_API void titan_compute_slope_map(TitanHandle* handle);     // rise/run

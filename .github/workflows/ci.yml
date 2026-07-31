@@ -76,29 +76,72 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
+      # Pinned, not "latest". Emscripten's output is not byte-stable across
+      # versions, so an unpinned toolchain makes the reproducibility check
+      # below fail spontaneously the day emsdk ships a release — which is
+      # exactly what happened. The pin lives in cpp/emsdk-version.txt so
+      # build_wasm.sh enforces the same number locally.
+      - name: Read the emsdk pin
+        id: emsdk
+        run: echo "version=$(cat titan-terrain-engine/cpp/emsdk-version.txt)" >> "$GITHUB_OUTPUT"
       - uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: ${{ steps.emsdk.outputs.version }}
 
       # src/wasm/titan_core.js is a checked-in build artifact. Without this
       # job it can silently drift from the C++ it claims to be built from, and
       # the free-tier web lab would ship a stale engine.
+      #
+      # These checks run BEFORE the rebuild, deliberately. build_wasm.sh
+      # overwrites the module in place, so anything run after it is testing a
+      # fresh build — not the artifact the web lab actually serves. The old
+      # ordering meant the step named "golden checks against the shipped WASM"
+      # never once looked at the shipped WASM.
+      - name: Golden checks against the shipped WASM
+        run: node cpp/tools/wasm_golden.mjs
+        working-directory: titan-terrain-engine
+
+      - name: Record the shipped WASM's C API surface
+        run: node cpp/tools/wasm_exports.mjs > /tmp/shipped-exports.txt
+        working-directory: titan-terrain-engine
+
       - name: Rebuild WASM
         run: cpp/build_wasm.sh
         working-directory: titan-terrain-engine
 
-      - name: Fail if the checked-in WASM was stale
+      # Staleness, asked semantically: does the shipped module still expose
+      # everything the engine exports? This is the check that catches the real
+      # failure — a C API function added to cpp/ and never rebuilt into the
+      # module — and it stays true regardless of which compiler built what.
+      - name: Fail if the shipped WASM is missing engine exports
+        working-directory: titan-terrain-engine
+        run: |
+          node cpp/tools/wasm_exports.mjs > /tmp/fresh-exports.txt
+          if ! diff -q /tmp/shipped-exports.txt /tmp/fresh-exports.txt >/dev/null; then
+            echo "::error::src/wasm/titan_core.js does not match the engine's C API."
+            echo "Missing from the shipped module:"
+            comm -13 /tmp/shipped-exports.txt /tmp/fresh-exports.txt | sed 's/^/  /'
+            echo "Present only in the shipped module:"
+            comm -23 /tmp/shipped-exports.txt /tmp/fresh-exports.txt | sed 's/^/  /'
+            echo "Run cpp/build_wasm.sh and commit the result."
+            exit 1
+          fi
+          echo "shipped module exports match a fresh build ($(wc -l < /tmp/fresh-exports.txt | tr -d ' ') functions)"
+
+      # Reproducibility, asked byte-exactly. Weaker than the export check at
+      # catching real drift, stronger at catching everything else: a changed
+      # constant, a changed flag, a source file dropped from build_wasm.sh.
+      # Only meaningful because the toolchain above is pinned.
+      - name: Fail if the checked-in WASM is not reproducible
         working-directory: titan-terrain-engine
         run: |
           if ! git diff --quiet -- src/wasm/; then
-            echo "::error::src/wasm/titan_core.js is out of date with cpp/."
-            echo "Run cpp/build_wasm.sh and commit the result."
+            echo "::error::src/wasm/titan_core.js is not what emsdk ${{ steps.emsdk.outputs.version }} builds from cpp/."
+            echo "Run cpp/build_wasm.sh with the pinned emsdk and commit the result."
             git diff --stat -- src/wasm/
             exit 1
           fi
-          echo "checked-in WASM matches the C++ sources"
-
-      - name: Golden checks against the shipped WASM
-        run: node cpp/tools/wasm_golden.mjs
-        working-directory: titan-terrain-engine
+          echo "checked-in WASM reproduces exactly from the C++ sources"
 
   plugin-libs:
     name: TitanBridge library (${{ matrix.os }})
