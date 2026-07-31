@@ -309,6 +309,10 @@ struct GraphCanvas: View {
     @State private var paletteQuery = ""
     /// Framed once, when the canvas first has a real size to frame against.
     @State private var hasFramed = false
+    /// onDeleteCommand only reaches a view that holds keyboard focus. Without
+    /// this the canvas was never in the responder chain, so selecting a wire
+    /// or a node and pressing Delete did nothing at all.
+    @FocusState private var canvasFocused: Bool
 
     /// The canvas's own coordinate space: unscaled and unpanned, so a gesture
     /// location converts to graph space through toGraph and nothing else.
@@ -334,11 +338,18 @@ struct GraphCanvas: View {
                 .allowsHitTesting(palette == nil)
 
                 if let palette {
-                    paletteView(at: palette.point, connectFrom: palette.connectFrom)
+                    paletteView(at: palette.point, connectFrom: palette.connectFrom, in: geo.size)
                 }
 
                 overlayControls(geo: geo)
             }
+            .focusable()
+            .focused($canvasFocused)
+            // Focusable for the Delete key's sake, not to be decorated for it.
+            // The ring AppKit draws lands on the canvas's layout bounds rather
+            // than its visible frame, so it appeared as a stray blue rule down
+            // the edge of the sidebar.
+            .focusEffectDisabled()
             // Every gesture that needs a position measures it here, in
             // unscaled, unpanned canvas coordinates, and converts with
             // toGraph. This name used to be referenced by the two port
@@ -392,7 +403,7 @@ struct GraphCanvas: View {
             }
             .onTapGesture { location in
                 if let edge = wireHit(at: toGraph(location)) {
-                    selectedEdge = edge
+                    selectedEdge = edge; canvasFocused = true
                     selection = nil
                 } else {
                     selection = nil
@@ -501,7 +512,7 @@ struct GraphCanvas: View {
             ports(node)
         }
         .contentShape(RoundedRectangle(cornerRadius: 7))
-        .onTapGesture { selection = node.id; selectedEdge = nil }
+        .onTapGesture { selection = node.id; selectedEdge = nil; canvasFocused = true }
         // Measured in canvas space and converted, rather than taking
         // DragGesture's own translation and dividing by zoom. The card sits
         // inside a .scaleEffect, and what a local-space translation means
@@ -685,7 +696,8 @@ struct GraphCanvas: View {
         palette = (point, connectFrom)
     }
 
-    private func paletteView(at point: CGPoint, connectFrom: UUID?) -> some View {
+    private func paletteView(at point: CGPoint, connectFrom: UUID?,
+                             in canvas: CGSize) -> some View {
         let matches = NodeKind.allCases.filter { kind in
             guard kind != .output else { return false }
             guard connectFrom == nil || kind.fieldInputs > 0 else { return false }
@@ -723,11 +735,17 @@ struct GraphCanvas: View {
             }
             .frame(maxHeight: 240)
         }
-        .frame(width: 240)
+        .frame(width: Self.paletteWidth)
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8))
         .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.black.opacity(0.3)))
         .shadow(radius: 12)
-        .offset(x: min(point.x, 3000), y: point.y)
+        // Kept inside the canvas. It used to be placed at the click point with
+        // no regard for its own size, so opening it near the right or bottom
+        // edge — which in a drawer this short is most of it — pushed the
+        // category column under the inspector and the list off the end of the
+        // window, where neither could be reached.
+        .offset(x: min(max(0, point.x), max(0, canvas.width - Self.paletteWidth)),
+                y: min(max(0, point.y), max(0, canvas.height - Self.paletteHeight)))
         .onExitCommand { palette = nil }
     }
 
@@ -762,6 +780,15 @@ struct GraphCanvas: View {
                 }
                 Button { fit(in: geo.size) } label: { Image(systemName: "arrow.up.left.and.arrow.down.right") }
                     .help("Fit the graph in view")
+                // Deletion needs a button, not only the Delete key. The key
+                // routes through onDeleteCommand, which reaches whichever view
+                // holds focus — fine once the canvas is focusable, but it
+                // silently does nothing the moment focus is anywhere else, and
+                // there was no other way to remove a wire at all.
+                Button { deleteSelection() } label: { Image(systemName: "trash") }
+                    .disabled(selection == nil && selectedEdge == nil)
+                    .help(selectedEdge != nil ? "Delete the selected wire (⌫)"
+                                              : "Delete the selected node (⌫)")
                 Text("\(Int(zoom * 100))%")
                     .font(.system(size: 9, design: .monospaced))
                     .foregroundStyle(.secondary)
@@ -784,6 +811,10 @@ struct GraphCanvas: View {
     /// Height the control strip occupies, kept clear so a framed graph is not
     /// tucked underneath it.
     private static let controlStrip: CGFloat = 30
+
+    /// The palette's own size, so it can be kept inside the canvas.
+    private static let paletteWidth: CGFloat = 240
+    private static let paletteHeight: CGFloat = 288
 
     private func fit(in size: CGSize) {
         guard !graph.nodes.isEmpty else { return }
