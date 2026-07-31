@@ -75,8 +75,13 @@ struct ContentView: View {
 
     var body: some View {
         HSplitView {
-            sidebar
-                .frame(minWidth: 310, idealWidth: 340, maxWidth: 400)
+            // Hideable, so the viewport can have the whole window. The node
+            // drawer already worked this way; the settings sidebar is the
+            // larger of the two and had no way to get out of the way at all.
+            if model.sidebarOpen {
+                sidebar
+                    .frame(minWidth: 310, idealWidth: 340, maxWidth: 400)
+            }
             VSplitView {
                 viewport
                     .frame(minWidth: 500, maxWidth: .infinity, minHeight: 240, maxHeight: .infinity)
@@ -89,6 +94,16 @@ struct ContentView: View {
         }
         .onAppear { model.rebuild() }
         .toolbar {
+            ToolbarItem(placement: .navigation) {
+                Button {
+                    withAnimation(.easeInOut(duration: 0.18)) { model.sidebarOpen.toggle() }
+                } label: {
+                    Label(model.sidebarOpen ? "Hide Settings" : "Show Settings",
+                          systemImage: "sidebar.leading")
+                }
+                .help(model.sidebarOpen ? "Hide the settings sidebar (⌥⌘S)"
+                                        : "Show the settings sidebar (⌥⌘S)")
+            }
             ToolbarItem(placement: .primaryAction) {
                 Button {
                     toggleGraphDrawer()
@@ -98,7 +113,11 @@ struct ContentView: View {
                 .help("Build the terrain as a node graph (⌥⌘G)")
             }
         }
-        .background(GraphDrawerShortcut(toggle: toggleGraphDrawer))
+        .background(WindowShortcut(key: "g", label: "Toggle node graph",
+                                   action: toggleGraphDrawer))
+        .background(WindowShortcut(key: "s", label: "Toggle settings sidebar") {
+            withAnimation(.easeInOut(duration: 0.18)) { model.sidebarOpen.toggle() }
+        })
     }
 
     // MARK: - Viewport (3D + overlays)
@@ -1105,16 +1124,19 @@ struct ContentView: View {
     }
 }
 
-/// ⌥⌘G from anywhere in the window. A zero-size button rather than a menu
-/// command so the shortcut belongs to the window that owns the drawer.
-struct GraphDrawerShortcut: View {
-    let toggle: () -> Void
+/// An ⌥⌘-something shortcut scoped to this window. A zero-size button rather
+/// than a menu command so the shortcut belongs to the window that owns the
+/// panel it toggles.
+struct WindowShortcut: View {
+    let key: KeyEquivalent
+    let label: String
+    let action: () -> Void
 
     var body: some View {
-        Button(action: toggle) { EmptyView() }
-            .keyboardShortcut("g", modifiers: [.command, .option])
+        Button(action: action) { EmptyView() }
+            .keyboardShortcut(key, modifiers: [.command, .option])
             .opacity(0)
             .frame(width: 0, height: 0)
-            .accessibilityLabel("Toggle node graph")
+            .accessibilityLabel(label)
     }
 }

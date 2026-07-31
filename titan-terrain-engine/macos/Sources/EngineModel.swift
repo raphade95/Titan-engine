@@ -482,6 +482,10 @@ final class EngineModel: ObservableObject {
     @Published var graph = TerrainGraph()
     @Published var graphMode = false
     @Published var graphDrawerOpen = false
+    /// The settings sidebar. Hideable so the viewport can take the whole
+    /// window — the terrain is the thing being made, and on a laptop screen
+    /// 340pt of controls is a third of it.
+    @Published var sidebarOpen = true
     @Published var nodeThumbnails: [UUID: CGImage] = [:]
 
     @Published var isGenerating = false

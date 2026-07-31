@@ -52,14 +52,33 @@ final class OrbitCamera {
     var minDistance: Float = 20
     var maxDistance: Float = 1500
 
+    /// How far the scene reaches from its centre: the terrain's own extent,
+    /// plus the grid and sea plane drawn around it. The clip planes are
+    /// derived from this rather than fixed, because a fixed far plane is a
+    /// hard ceiling on world size — see viewProjection.
+    var sceneRadius: Float = 200
+
     func zoom(_ delta: Float) {
         distance = min(max(distance * (1.0 - delta * 0.05), minDistance), maxDistance)
     }
 
     func viewProjection(aspect: Float) -> float4x4 {
         let view = float4x4.lookAt(eye: position, center: target, up: SIMD3<Float>(0, 1, 0))
+        // The far plane used to be a hard 4000. World Size is a world-unit
+        // control that reaches well past that, and at 4608 the camera frames
+        // the terrain from about 6000 units out — entirely behind the far
+        // plane, so the landscape vanished and only reappeared when you zoomed
+        // close enough to cross back inside it. Resolution changed nothing,
+        // because resolution is not what moved the camera.
+        //
+        // Derived from what the camera could actually see instead: its own
+        // distance from the target plus everything drawn around it.
+        let far = max(1000, (distance + sceneRadius) * 2.5)
+        // Scaled with it, so a large world does not spend its whole depth
+        // buffer on the first half-unit in front of the eye.
+        let near = max(0.1, far * 1e-4)
         let proj = float4x4.perspective(fovYRadians: 60 * .pi / 180, aspect: aspect,
-                                        near: 0.5, far: 4000)
+                                        near: near, far: far)
         return proj * view
     }
 }
@@ -297,6 +316,9 @@ final class TerrainRenderer: NSObject, MTKViewDelegate {
         if let camera = view?.camera {
             camera.minDistance = newExtent * 0.05
             camera.maxDistance = newExtent * 8
+            // The sea plane and grid are drawn well beyond the terrain, so the
+            // clip planes have to account for more than the terrain itself.
+            camera.sceneRadius = newExtent * 2 + terrainHeightMax
             // Reframe when the world itself resizes, not merely when the mesh
             // is rebuilt — otherwise raising World Size leaves the camera at
             // its old distance and buries it inside the terrain. A pure
