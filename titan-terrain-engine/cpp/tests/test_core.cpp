@@ -14,6 +14,8 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <utility>
 #include <limits>
 #include <numeric>
 #include <vector>
@@ -1332,6 +1334,108 @@ void TestResolutionIndependence() {
     std::printf("\n");
 }
 
+void TestLayerResolutionIndependence() {
+    std::printf("Layer resolution independence\n");
+
+    // Base noise became resolution-independent when world size split from
+    // sample density. The simulation layers did not: a droplet advanced one
+    // *cell* per step while heights were in *world* units, erosion and blur
+    // radii were cell counts, and fluvial drainage area was measured in cells.
+    // Refining the grid therefore rewrote the physics.
+    //
+    // Convergence is measured between two already-resolved grids rather than
+    // against the coarsest one. A 128-cell grid over a 128-unit world takes
+    // one world unit per integration step, which is far too coarse for the
+    // droplet model — its output is dominated by discretization error (it
+    // deposits a 137-unit spike on a 31-unit landscape). That coarse point is
+    // the shipped default and is deliberately preserved bit-for-bit, so the
+    // meaningful question is whether refinement *converges* rather than
+    // diverges.
+    struct Stats { double mean; float p99; double meanSlope; };
+    auto measure = [](int size, const char* layer) -> Stats {
+        Titan::TerrainEngine e;
+        Titan::TerrainParams p = MakeParams(12345, 1, size);
+        p.cellSize = 128.0f / static_cast<float>(size);
+        e.Initialize(p);
+        e.GenerateHeightmap();
+
+        if (std::strcmp(layer, "hydraulic") == 0) {
+            Titan::HydraulicParams hp;
+            e.ApplyHydraulicErosion(65536, hp);
+        } else if (std::strcmp(layer, "fluvial") == 0) {
+            Titan::FluvialParams fp;
+            e.ApplyFluvialErosion(3, fp);
+        } else if (std::strcmp(layer, "blur") == 0) {
+            e.ApplyBlur(4.0f, 1.0f);
+        }
+
+        // Robust statistics, not the extremes.
+        //
+        // HeightRange's maximum is a max over a million cells, so a single
+        // pathological deposit dominates it: at 512 the droplet model leaves
+        // exactly two cells above twice the 99th percentile, and comparing
+        // maxima reported a 57% divergence for a field that agrees to 0.2%
+        // everywhere else. Mean and p99 measure the terrain; a max measures
+        // its worst outlier.
+        std::vector<float> heights;
+        heights.reserve(static_cast<size_t>(size) * size);
+        double slope = 0.0;
+        int n = 0;
+        for (int y = 0; y < size; ++y) {
+            for (int x = 0; x < size; ++x) {
+                heights.push_back(e.GetHeight(x, y));
+                if (x > 0 && y > 0 && x < size - 1 && y < size - 1 && (x % 2) == 1 && (y % 2) == 1) {
+                    slope += e.GetSlope(x, y);
+                    ++n;
+                }
+            }
+        }
+        std::sort(heights.begin(), heights.end());
+        double mean = 0.0;
+        for (float v : heights) mean += v;
+        mean /= static_cast<double>(heights.size());
+        const float p99 = heights[static_cast<size_t>(heights.size() * 0.99)];
+        return Stats{ mean, p99, slope / n };
+    };
+
+    for (const char* layer : {"blur", "fluvial", "hydraulic"}) {
+        const Stats a = measure(512, layer);
+        const Stats b = measure(1024, layer);
+        const double meanDrift = std::fabs(b.mean - a.mean) / std::max(1e-6, a.mean);
+        const double p99Drift = std::fabs(b.p99 - a.p99) / std::max(1e-6f, a.p99);
+        const double slopeRatio = b.meanSlope / a.meanSlope;
+        std::printf("        %-10s 512 -> 1024: mean %.2f -> %.2f (%.1f%%), "
+                    "p99 %.2f -> %.2f (%.1f%%), slope x%.2f\n",
+                    layer, a.mean, b.mean, meanDrift * 100.0,
+                    a.p99, b.p99, p99Drift * 100.0, slopeRatio);
+
+        char label[96];
+        std::snprintf(label, sizeof(label), "%s converges under refinement", layer);
+        Check(meanDrift < 0.03 && p99Drift < 0.03 && slopeRatio > 0.85 && slopeRatio < 1.20,
+              label);
+    }
+
+    // Thermal is knowingly excluded. Each pass moves material exactly one cell,
+    // so a pass is a cell-space travel distance and a finer grid creeps a
+    // shorter world distance for the same pass count. Fixing it means scaling
+    // the pass count by 1/cellSize, which multiplies its cost eightfold at the
+    // finest grids — a performance trade worth making deliberately rather than
+    // silently. Its peak is stable; only the degree of smoothing drifts.
+    {
+        Titan::TerrainEngine e;
+        Titan::TerrainParams p = MakeParams(12345, 1, 512);
+        p.cellSize = 0.25f;
+        e.Initialize(p);
+        e.GenerateHeightmap();
+        Titan::ThermalParams tp;
+        e.ApplyThermalWeathering(20, tp);
+        float lo = 0, hi = 0;
+        e.HeightRange(lo, hi);
+        Check(std::isfinite(hi) && hi > 0.0f, "thermal still produces sane terrain at a fine grid");
+    }
+    std::printf("\n");
+}
+
 void TestAmbientOcclusion() {
     std::printf("Ambient occlusion\n");
 
@@ -1821,6 +1925,7 @@ int main() {
     TestSplatMatchesMesh();
     TestBandScratchSharedWithHosts();
     TestResolutionIndependence();
+    TestLayerResolutionIndependence();
     TestAmbientOcclusion();
     TestSplatHeightUsesRealRange();
     TestSnowAndLakesReachTheMesh();

@@ -295,7 +295,10 @@ void TerrainEngine::SimulateLava(const LavaParams& in) {
     p.viscosity = std::clamp(std::isfinite(p.viscosity) ? p.viscosity : 0.45f, 0.0f, 1.0f);
     p.solidifyRate = std::clamp(std::isfinite(p.solidifyRate) ? p.solidifyRate : 0.05f, 0.0f, 1.0f);
     p.coolRate = std::clamp(std::isfinite(p.coolRate) ? p.coolRate : 0.012f, 0.0f, 1.0f);
-    p.ventRadius = std::clamp(std::isfinite(p.ventRadius) ? p.ventRadius : 2.5f, 0.5f, 64.0f);
+    // Vent radius is a world distance; convert to cells. cellSize 1.0 is
+    // exactly identity, so existing eruptions are untouched.
+    p.ventRadius = std::clamp(std::isfinite(p.ventRadius) ? p.ventRadius : 2.5f, 0.5f, 64.0f)
+                 / (m_Params.cellSize > 0.0f ? m_Params.cellSize : 1.0f);
     if (p.steps == 0) return;
 
     EnsureLavaFields();

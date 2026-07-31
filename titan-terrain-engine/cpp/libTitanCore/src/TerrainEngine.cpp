@@ -361,6 +361,9 @@ void TerrainEngine::ApplyPlateau(float plateauHeight, float softness) {
 }
 
 void TerrainEngine::Carve(float x, float y, float radius, float depth) {
+    // Brush radius is a world distance, converted to cells. cellSize 1.0 is
+    // exactly identity.
+    radius /= (m_Params.cellSize > 0.0f ? m_Params.cellSize : 1.0f);
     const int centerX = static_cast<int>(std::floor(x));
     const int centerY = static_cast<int>(std::floor(y));
     const int r = static_cast<int>(std::ceil(radius));

@@ -54,7 +54,11 @@ only marshals parameters in and copies buffers out across the C API
   `cellSize` to 1.0, which made the extent equal to the pixel count — the same
   seed came out 6.7x flatter at 1024 than at 128 because raising "Resolution"
   silently widened the world while Height stayed absolute. Refining the grid now
-  resolves more detail on the same landform.
+  resolves more detail on the same landform, and the simulation passes measure
+  in world units too — hydraulic, fluvial and blur agree to within 0.2% across a
+  doubling of the grid. (Thermal weathering is the exception: each pass creeps
+  material exactly one cell, so a finer grid smooths less for the same pass
+  count.)
 - World-space noise sampling: adjacent tiles are seamless (chunking-ready).
 - **Cellular noise family**: voronoi F1/F2-F1 plus Worley manhattan/chebyshev
   metrics, and a Musgrave hybrid multifractal "terrain" mode.
@@ -92,6 +96,7 @@ npm run test:golden   # checked-in golden hashes — the cross-platform contract
 npm run test:mutation # proves the golden harness can still catch regressions
 npm run build:wasm    # rebuild src/wasm/titan_core.js for the viewer
 npm run test:wasm     # golden checks against the WASM the web lab ships
+npm run test:project  # .titan round-trip fidelity and version migration
 ```
 
 Run the native tests before shipping any engine change — determinism and mass

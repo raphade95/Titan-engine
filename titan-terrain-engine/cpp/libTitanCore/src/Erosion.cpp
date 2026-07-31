@@ -36,13 +36,17 @@ namespace {
 float BrushTake(const std::vector<float>& base, std::vector<float>& delta,
                 int size, float x, float y, float amount, float radius,
                 bool floorAtZero) {
-    radius = std::min(radius, 15.0f);
+    // The cap bounds the fixed sample array below: a radius of r visits
+    // (2r+1)^2 cells, so 31 needs 3969 slots. It also has to leave room for a
+    // world-unit radius converted to cells on a fine grid — an erosion radius
+    // of 3 world units is 24 cells at cellSize 0.125.
+    radius = std::min(radius, 31.0f);
     const int centerX = static_cast<int>(std::floor(x));
     const int centerY = static_cast<int>(std::floor(y));
     const int r = static_cast<int>(radius);
 
     struct Sample { int idx; float w; };
-    Sample samples[1024];
+    Sample samples[4096];
     int count = 0;
     float weightSum = 0.0f;
 
@@ -121,6 +125,36 @@ void TerrainEngine::RunDropletBatch(uint64_t firstDroplet, int count, const Hydr
     const auto spawnMode = static_cast<SpawnMode>(p.spawnMode);
     const bool usePrecip = spawnMode == SpawnMode::Precipitation && !m_Precipitation.empty();
 
+    // --- Cell space vs. world space ----------------------------------------
+    //
+    // A droplet advances exactly one *cell* per step while heights are in
+    // *world* units, so every quantity below that mixes the two is really a
+    // function of the sample spacing. That never showed while cellSize was
+    // pinned at 1.0. Once world size and resolution became independent it
+    // meant refining the grid silently rewrote the physics: the same seed and
+    // the same droplets over the same landscape produced a 137-unit
+    // depositional peak at cellSize 1.0 and a 31-unit one at 0.25.
+    //
+    // The fix is to reference the world, not the grid:
+    //   * slopes are rises per world unit, not per cell;
+    //   * a droplet's life is a world distance, so a finer grid gets
+    //     proportionally more (and proportionally smaller) steps;
+    //   * per-step rates scale with the step length so the total along a given
+    //     path is the same however finely it was walked;
+    //   * the erosion brush is a world radius converted to cells.
+    //
+    // Every factor is normalized so cellSize 1.0 is exactly identity — `x *
+    // 1.0f` and `x / 1.0f` are exact in floating point — which keeps every
+    // existing project, preset and golden hash bit-for-bit unchanged.
+    const float cs = m_Params.cellSize > 0.0f ? m_Params.cellSize : 1.0f;
+    const float invCs = 1.0f / cs;
+
+    // World radius -> cells.
+    const float brushRadius = p.erosionRadius * invCs;
+    // A fixed world distance to travel, walked in cell-sized steps.
+    const int lifetimeSteps = std::max(1, static_cast<int>(
+        std::lround(static_cast<double>(p.maxDropletLifetime) * invCs)));
+
     for (int d = 0; d < count; ++d) {
         // Per-droplet RNG stream: depends only on seed + global index.
         // MakeRng pins down the seeding order; see TitanRandom.h.
@@ -153,7 +187,7 @@ void TerrainEngine::RunDropletBatch(uint64_t firstDroplet, int count, const Hydr
         float water = 1.0f;
         float sediment = 0.0f;
 
-        for (int lifetime = 0; lifetime < p.maxDropletLifetime; ++lifetime) {
+        for (int lifetime = 0; lifetime < lifetimeSteps; ++lifetime) {
             const int nodeX = static_cast<int>(posX);
             const int nodeY = static_cast<int>(posY);
 
@@ -187,47 +221,57 @@ void TerrainEngine::RunDropletBatch(uint64_t firstDroplet, int count, const Hydr
             const float newHeight = SampleHeight(posX, posY);
             const float oldHeight = SampleHeight(oldPosX, oldPosY);
             const float deltaHeight = newHeight - oldHeight;
+            // Rise per world unit travelled, so the droplet reads the terrain's
+            // real steepness rather than a figure that shrinks as the grid is
+            // refined.
+            const float slope = deltaHeight * invCs;
 
-            const float capacity = std::max(-deltaHeight * speed * water * p.sedimentCapacityFactor,
+            const float capacity = std::max(-slope * speed * water * p.sedimentCapacityFactor,
                                             p.minSedimentCapacity);
 
             const float maskHere = SampleMask(oldPosX, oldPosY);
 
             if (sediment > capacity || deltaHeight > 0.0f) {
+                // The uphill case is bounded by the actual rise, which already
+                // scales with the step. The rate-driven case is per unit
+                // distance, so it takes the step length explicitly.
                 float amountToDeposit = (deltaHeight > 0.0f)
                     ? std::min(deltaHeight, sediment)
-                    : (sediment - capacity) * p.depositSpeed;
+                    : (sediment - capacity) * p.depositSpeed * cs;
                 amountToDeposit *= maskHere;
                 sediment -= amountToDeposit;
                 DepositToDelta(sedimentDelta, size, oldPosX, oldPosY, amountToDeposit);
             } else {
                 const float amountToErode = maskHere
-                    * std::min((capacity - sediment) * p.dissolveSpeed, -deltaHeight);
+                    * std::min((capacity - sediment) * p.dissolveSpeed * cs, -deltaHeight);
                 const float sedimentHere = SampleWithDelta(m_Sediment, sedimentDelta,
                                                            size, oldPosX, oldPosY);
 
                 if (sedimentHere >= amountToErode) {
                     sediment += BrushTake(m_Sediment, sedimentDelta, size,
                                           oldPosX, oldPosY, amountToErode,
-                                          p.erosionRadius, true);
+                                          brushRadius, true);
                 } else {
                     const float hardness = HardnessAt(oldHeight);
                     const float bedrockDemand = (amountToErode - sedimentHere)
                         * (p.bedrockErosionSpeed / hardness);
                     sediment += BrushTake(m_Sediment, sedimentDelta, size,
                                           oldPosX, oldPosY, sedimentHere,
-                                          p.erosionRadius, true);
+                                          brushRadius, true);
                     sediment += BrushTake(m_Bedrock, bedrockDelta, size,
                                           oldPosX, oldPosY, bedrockDemand,
-                                          p.erosionRadius, false);
+                                          brushRadius, false);
                 }
             }
 
-            speed = std::sqrt(std::max(0.0f, speed * speed + deltaHeight * p.gravity));
-            water *= (1.0f - p.evaporateSpeed);
+            speed = std::sqrt(std::max(0.0f, speed * speed + slope * p.gravity));
+            // Evaporation and flow accumulation are per unit distance too, so
+            // a finer grid taking more, shorter steps loses the same water and
+            // records the same flow over the same path.
+            water *= (1.0f - p.evaporateSpeed * cs);
 
             if (nodeX >= 0 && nodeX < size && nodeY >= 0 && nodeY < size) {
-                flowDelta[nodeY * size + nodeX] += water * 0.1f;
+                flowDelta[nodeY * size + nodeX] += water * 0.1f * cs;
             }
 
             if (speed == 0.0f) break;

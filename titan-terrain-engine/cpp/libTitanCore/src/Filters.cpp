@@ -93,8 +93,14 @@ void TerrainEngine::ApplyTransform(float scaleV, float offset, bool invert) {
     ResplitHeight(total);
 }
 
+// Filter radii are world distances converted to cells.
+//
+// They were plain cell counts, so "blur radius 4" smoothed four samples' worth
+// of terrain — a different physical distance at every resolution, and a
+// different amount of the landscape. cellSize 1.0 is exactly identity.
 void TerrainEngine::ApplyBlur(float radius, float strength) {
-    const int r = static_cast<int>(std::lround(radius));
+    const float cs = m_Params.cellSize > 0.0f ? m_Params.cellSize : 1.0f;
+    const int r = static_cast<int>(std::lround(radius / cs));
     if (r < 1 || strength <= 0.0f) return;
     strength = std::clamp(strength, 0.0f, 1.0f);
     const size_t count = m_Bedrock.size();
@@ -112,7 +118,8 @@ void TerrainEngine::ApplyBlur(float radius, float strength) {
 }
 
 void TerrainEngine::ApplySharpen(float radius, float strength) {
-    const int r = std::max(1, static_cast<int>(std::lround(radius)));
+    const float cs = m_Params.cellSize > 0.0f ? m_Params.cellSize : 1.0f;
+    const int r = std::max(1, static_cast<int>(std::lround(radius / cs)));
     if (strength <= 0.0f) return;
     const size_t count = m_Bedrock.size();
 

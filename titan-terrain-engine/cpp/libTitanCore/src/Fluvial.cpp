@@ -134,7 +134,13 @@ void TerrainEngine::ApplyFluvialErosion(int iterations, const FluvialParams& p) 
             return filled[a] != filled[b] ? filled[a] > filled[b] : a < b;
         });
 
-        std::fill(area.begin(), area.end(), 1.0f); // each cell contributes one unit of rain
+        // Each cell contributes the rain falling on the *world area* it covers,
+        // not one unit per cell. A^m is the stream-power term, so counting
+        // cells made drainage area — and therefore erosion — a function of the
+        // sampling grid: refining it quadrupled every catchment. cellSize 1.0
+        // is exactly the old value, so nothing existing moves.
+        const float cellArea = m_Params.cellSize * m_Params.cellSize;
+        std::fill(area.begin(), area.end(), cellArea);
         for (int oi = 0; oi < count; ++oi) {
             const int i = order[oi];
             if (downstream[i] >= 0) area[downstream[i]] += area[i];
