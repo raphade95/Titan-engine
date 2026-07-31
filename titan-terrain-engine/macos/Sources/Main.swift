@@ -390,6 +390,37 @@ func runSmokeTest() -> Int32 {
         check(parsed["graph"] != nil, "but the graph is still saved with the file")
     }
 
+    // Undo/redo. Snapshots are the serialized document, so this also proves
+    // the engine is never asked to remember anything: every step below is a
+    // reload and a rebuild through the one handle the model already owns.
+    let hist = EngineModel()
+    hist.scale = 3.0
+    hist.rebuild()
+    check(!hist.canUndo, "a document with one state has nothing to undo")
+    hist.scale = 7.5
+    hist.rebuild()
+    check(hist.canUndo, "an edit becomes undoable")
+    check(!hist.canRedo, "with nothing ahead of it yet")
+    hist.undo()
+    check(hist.scale == 3.0, "undo restores the previous value (got \(hist.scale))")
+    check(hist.canRedo, "and the undone edit becomes redoable")
+    hist.redo()
+    check(hist.scale == 7.5, "redo puts it back (got \(hist.scale))")
+    // A fresh edit after undoing must discard the abandoned future, or redo
+    // walks into a timeline the user never took.
+    hist.undo()
+    hist.scale = 5.0
+    hist.rebuild()
+    check(!hist.canRedo, "a new edit after undo drops the redo branch")
+    // Undo has to reach the graph too, not just the base parameters.
+    hist.graph = TerrainGraph.starter()
+    hist.graphMode = true
+    hist.rebuildFromGraph()
+    let nodeCount = hist.graph.nodes.count
+    hist.undo()
+    check(hist.graph.nodes.count != nodeCount || !hist.graphMode,
+          "undo reaches graph state, not only sliders")
+
     // Stack -> graph -> stack must not rewrite the base structure. The two
     // editors number noise differently (the model holds the engine's id, a
     // Terrain node holds an index into layerNoiseLabels), and copying the raw

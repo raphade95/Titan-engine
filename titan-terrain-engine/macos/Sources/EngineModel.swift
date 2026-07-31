@@ -734,6 +734,7 @@ final class EngineModel: ObservableObject {
     // MARK: - Pipeline execution (mirrors runPipeline in pipeline.ts)
 
     func rebuild() {
+        recordUndoPoint()
         runCounter += 1
         let run = runCounter
         isGenerating = true
@@ -851,6 +852,7 @@ final class EngineModel: ObservableObject {
     /// The counterpart to rebuild(): same engine, same operations, same
     /// ending — only the order they run in is decided differently.
     func rebuildFromGraph() {
+        recordUndoPoint()
         runCounter += 1
         let run = runCounter
         isGenerating = true
@@ -911,6 +913,78 @@ final class EngineModel: ObservableObject {
     /// Re-runs whichever editor is driving the terrain.
     func refresh() {
         if graphMode { rebuildFromGraph() } else { rebuild() }
+    }
+
+    // MARK: - Undo / redo
+    //
+    // Snapshots are the serialized project, and nothing else. That is worth
+    // being explicit about, because the obvious way to undo a terrain tool is
+    // to keep copies of the engine's fields — which would mean owning C
+    // allocations, deciding who frees them, and doing it across a dispatch
+    // queue that already destroyed the engine out from under itself once.
+    //
+    // None of that is necessary here. The engine holds no authored state: it
+    // is a pure function of the document, and rebuild() re-derives it from
+    // scratch on every edit already. So undo is "restore the document and
+    // rebuild", the snapshot is Data, and the C side never learns that undo
+    // exists. One handle, created once, freed once, exactly as before.
+    //
+    // Using serializeProject means a snapshot covers whatever the .titan
+    // format covers, by construction — a new parameter cannot be added to the
+    // document and silently left out of undo.
+
+    private var undoPast: [Data] = []
+    private var undoFuture: [Data] = []
+    private var undoCurrent: Data? = nil
+    /// Set while a snapshot is being applied, so restoring does not record.
+    private var undoSuspended = false
+
+    @Published private(set) var canUndo = false
+    @Published private(set) var canRedo = false
+
+    /// How many steps back the history goes. Snapshots are a few KB of JSON
+    /// (parameters and graph topology, never a heightfield), so this is
+    /// bounded for tidiness rather than out of any real pressure.
+    private let undoLimit = 60
+
+    /// Records the document as it now stands. Called from the rebuild paths,
+    /// which is the one place every edit already funnels through — a slider
+    /// commits on release, so a drag records once rather than per frame.
+    func recordUndoPoint() {
+        guard !undoSuspended, let snapshot = serializeProject() else { return }
+        guard let previous = undoCurrent else {
+            undoCurrent = snapshot          // the opening state, nothing to undo to
+            return
+        }
+        guard previous != snapshot else { return }
+        undoPast.append(previous)
+        if undoPast.count > undoLimit { undoPast.removeFirst() }
+        undoCurrent = snapshot
+        undoFuture.removeAll()              // a fresh edit forks the timeline
+        canUndo = !undoPast.isEmpty
+        canRedo = false
+    }
+
+    func undo() {
+        guard let previous = undoPast.popLast(), let current = undoCurrent else { return }
+        undoFuture.append(current)
+        undoCurrent = previous
+        apply(snapshot: previous)
+    }
+
+    func redo() {
+        guard let next = undoFuture.popLast(), let current = undoCurrent else { return }
+        undoPast.append(current)
+        undoCurrent = next
+        apply(snapshot: next)
+    }
+
+    private func apply(snapshot: Data) {
+        undoSuspended = true
+        _ = loadProject(from: snapshot)     // rebuilds; recording is suppressed
+        undoSuspended = false
+        canUndo = !undoPast.isEmpty
+        canRedo = !undoFuture.isEmpty
     }
 
     /// Opens the drawer on the work already done: the stack laid out as the

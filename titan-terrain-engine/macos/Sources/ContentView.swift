@@ -104,6 +104,19 @@ struct ContentView: View {
                 .help(model.sidebarOpen ? "Hide the settings sidebar (⌥⌘S)"
                                         : "Show the settings sidebar (⌥⌘S)")
             }
+            ToolbarItemGroup(placement: .principal) {
+                Button { model.undo() } label: {
+                    Label("Undo", systemImage: "arrow.uturn.backward")
+                }
+                .disabled(!model.canUndo)
+                .help("Undo (⌘Z)")
+
+                Button { model.redo() } label: {
+                    Label("Redo", systemImage: "arrow.uturn.forward")
+                }
+                .disabled(!model.canRedo)
+                .help("Redo (⇧⌘Z)")
+            }
             ToolbarItem(placement: .primaryAction) {
                 Button {
                     toggleGraphDrawer()
@@ -118,6 +131,10 @@ struct ContentView: View {
         .background(WindowShortcut(key: "s", label: "Toggle settings sidebar") {
             withAnimation(.easeInOut(duration: 0.18)) { model.sidebarOpen.toggle() }
         })
+        .background(WindowShortcut(key: "z", modifiers: .command,
+                                   label: "Undo") { model.undo() })
+        .background(WindowShortcut(key: "z", modifiers: [.command, .shift],
+                                   label: "Redo") { model.redo() })
     }
 
     // MARK: - Viewport (3D + overlays)
@@ -1129,12 +1146,13 @@ struct ContentView: View {
 /// panel it toggles.
 struct WindowShortcut: View {
     let key: KeyEquivalent
+    var modifiers: EventModifiers = [.command, .option]
     let label: String
     let action: () -> Void
 
     var body: some View {
         Button(action: action) { EmptyView() }
-            .keyboardShortcut(key, modifiers: [.command, .option])
+            .keyboardShortcut(key, modifiers: modifiers)
             .opacity(0)
             .frame(width: 0, height: 0)
             .accessibilityLabel(label)
