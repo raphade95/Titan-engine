@@ -77,10 +77,28 @@ struct ContentView: View {
         HSplitView {
             sidebar
                 .frame(minWidth: 310, idealWidth: 340, maxWidth: 400)
-            viewport
-                .frame(minWidth: 500, maxWidth: .infinity, maxHeight: .infinity)
+            VSplitView {
+                viewport
+                    .frame(minWidth: 500, maxWidth: .infinity, minHeight: 240, maxHeight: .infinity)
+                if model.graphDrawerOpen {
+                    NodeGraphDrawer(model: model)
+                        .frame(minHeight: 220, idealHeight: 380)
+                }
+            }
+            .frame(minWidth: 500, maxWidth: .infinity, maxHeight: .infinity)
         }
         .onAppear { model.rebuild() }
+        .toolbar {
+            ToolbarItem(placement: .primaryAction) {
+                Button {
+                    toggleGraphDrawer()
+                } label: {
+                    Label("Node Graph", systemImage: "point.3.connected.trianglepath.dotted")
+                }
+                .help("Build the terrain as a node graph (⌥⌘G)")
+            }
+        }
+        .background(GraphDrawerShortcut(toggle: toggleGraphDrawer))
     }
 
     // MARK: - Viewport (3D + overlays)
@@ -426,10 +444,53 @@ struct ContentView: View {
 
     // MARK: - Stack tab
 
+    private func toggleGraphDrawer() {
+        if model.graphDrawerOpen {
+            model.graphDrawerOpen = false
+        } else {
+            model.openGraphDrawer()
+            if !model.graphMode {
+                model.graphMode = true
+                model.rebuildFromGraph()
+            }
+        }
+    }
+
     private var stackTab: some View {
         VStack(alignment: .leading, spacing: 14) {
+            if model.graphMode {
+                VStack(alignment: .leading, spacing: 6) {
+                    Label("The node graph is driving the terrain", systemImage: "point.3.connected.trianglepath.dotted")
+                        .font(.system(size: 10, weight: .semibold))
+                    Text("Edits to the stack below will not show until you switch back to it.")
+                        .font(.system(size: 9)).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    HStack(spacing: 6) {
+                        Button("Edit Graph") { model.openGraphDrawer() }
+                        Button("Back to Stack") {
+                            model.graphMode = false
+                            model.graphDrawerOpen = false
+                            model.rebuild()
+                        }
+                    }
+                    .font(.system(size: 10))
+                }
+                .padding(10)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Color.accentColor.opacity(0.14), in: RoundedRectangle(cornerRadius: 8))
+            }
+
             Text("The stack runs top to bottom on every rebuild. Same seed + same stack = identical terrain, every time.")
                 .font(.system(size: 9)).foregroundStyle(.secondary)
+
+            Button {
+                toggleGraphDrawer()
+            } label: {
+                Label(model.graphDrawerOpen ? "Hide Node Graph" : "Open Node Graph",
+                      systemImage: "point.3.connected.trianglepath.dotted")
+                    .frame(maxWidth: .infinity)
+            }
+            .help("A graph can fork and rejoin; the stack is the same thing in a straight line.")
 
             if model.stack.isEmpty {
                 Text("No layers yet — add one below or pick a preset.")
@@ -1041,5 +1102,19 @@ struct ContentView: View {
             .padding(.vertical, 4)
         }
         .buttonStyle(.bordered)
+    }
+}
+
+/// ⌥⌘G from anywhere in the window. A zero-size button rather than a menu
+/// command so the shortcut belongs to the window that owns the drawer.
+struct GraphDrawerShortcut: View {
+    let toggle: () -> Void
+
+    var body: some View {
+        Button(action: toggle) { EmptyView() }
+            .keyboardShortcut("g", modifiers: [.command, .option])
+            .opacity(0)
+            .frame(width: 0, height: 0)
+            .accessibilityLabel("Toggle node graph")
     }
 }

@@ -403,6 +403,20 @@ TITAN_API void titan_clear_terrain(TitanHandle* handle) {
     })
 }
 
+TITAN_API void titan_read_height(TitanHandle* handle, float* out, int count) {
+    if (!handle || !out || count <= 0) { SetError("null handle or buffer"); return; }
+    TITAN_GUARD({
+        Engine(handle)->ReadHeight(out, count);
+    })
+}
+
+TITAN_API void titan_set_height(TitanHandle* handle, const float* data, int count) {
+    if (!handle || !data || count <= 0) { SetError("null handle or buffer"); return; }
+    TITAN_GUARD({
+        Engine(handle)->SetHeight(data, count);
+    })
+}
+
 TITAN_API void titan_apply_noise(TitanHandle* handle,
                                  unsigned int seedOffset,
                                  int noiseType,

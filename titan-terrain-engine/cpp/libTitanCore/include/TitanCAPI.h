@@ -102,6 +102,19 @@ TITAN_API void titan_set_mask(TitanHandle* handle, const float* data, int size);
 // Reset height/flow/snow/water to a flat empty state (stack rebuild start).
 TITAN_API void titan_clear_terrain(TitanHandle* handle);
 
+// --- v0.11: whole-field read/write, for graph evaluation -------------------
+//
+// A node graph forks: two branches run from the same upstream state and are
+// combined further down. That needs somewhere to park a branch's result, and
+// a way to rewind the engine to an earlier surface — otherwise a host has to
+// reimplement the operations to evaluate anything but a straight line.
+//
+// `count` is size*size; a short buffer is filled or read as far as it goes
+// rather than overrunning. titan_set_height resets sediment, flow, snow,
+// water and lava: they describe a history the incoming field does not have.
+TITAN_API void titan_read_height(TitanHandle* handle, float* out, int count);
+TITAN_API void titan_set_height(TitanHandle* handle, const float* data, int count);
+
 // Adds a noise field with a blend mode. noiseType: 0 none, 1 simplex fBm,
 // 2 ridged, 3 billow, 4 voronoi cells, 5 voronoi ridges. blendMode: 0 add,
 // 1 subtract, 2 multiply, 3 max, 4 min, 5 mix (by blendAlpha).

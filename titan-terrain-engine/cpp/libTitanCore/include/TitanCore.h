@@ -212,6 +212,21 @@ public:
     // Resets height, sediment, flow, snow, and water to a flat empty state.
     void ClearTerrain();
 
+    // Whole-field read/write of the terrain surface, for callers that
+    // evaluate a branching graph of operations rather than one linear stack.
+    //
+    // A graph needs to park a branch's result somewhere, run a second branch
+    // from an earlier state, and then combine the two. Doing that host-side
+    // would mean reimplementing the operations; with these it stays a matter
+    // of scheduling calls the engine already owns.
+    //
+    // SetHeight takes the field as bedrock and resets everything derived from
+    // the surface — sediment, flow, snow, water, lava — because those describe
+    // a history this field does not have. Erosion state does not survive a
+    // hand-off between branches, only the surface does.
+    void ReadHeight(float* out, int count) const;
+    void SetHeight(const float* data, int count);
+
     // Adds a noise field onto the existing terrain with the given blend mode.
     // Respects the active mask. Bedrock/sediment re-split 80/20 afterwards.
     void ApplyNoise(const NoiseLayerParams& p);

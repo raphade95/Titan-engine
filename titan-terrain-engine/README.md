@@ -70,6 +70,11 @@ only marshals parameters in and copies buffers out across the C API
   sampler (`titan_sample_curve`) rather than a spline reimplemented per host, so
   it cannot disagree with the result — verified to 1.2e-07 against the applied
   remap.
+- **Node graph (TitanLab)**: the layer stack, but able to fork and rejoin —
+  two treatments of the same base terrain merged by a Combine node, or any
+  node's output used as another's mask. Nodes run the *same* engine calls the
+  stack's layers do; a graph that is still a straight line converts back into
+  a stack. Opens in a drawer under the viewport (⌥⌘G).
 - **Masking**: per-operation masks generated from height/slope/curvature bands
   or fractal noise (`titan_mask_by_feature`, `titan_noise_to_mask`).
 - **Combiner / import**: blend an external heightfield (add/sub/mul/max/min/mix)

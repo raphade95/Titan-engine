@@ -104,6 +104,23 @@ void TerrainEngine::ClearTerrain() {
     m_MassCreated = 0.0;
 }
 
+void TerrainEngine::ReadHeight(float* out, int count) const {
+    if (!out) return;
+    const int n = std::min<int>(count, static_cast<int>(m_Bedrock.size()));
+    for (int i = 0; i < n; ++i) out[i] = m_Bedrock[i] + m_Sediment[i];
+}
+
+void TerrainEngine::SetHeight(const float* data, int count) {
+    if (!data) return;
+    const int n = std::min<int>(count, static_cast<int>(m_Bedrock.size()));
+    ClearTerrain();
+    for (int i = 0; i < n; ++i) {
+        // A non-finite sample would spread through every neighbourhood
+        // operation downstream, so it stops here.
+        m_Bedrock[i] = std::isfinite(data[i]) ? data[i] : 0.0f;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Noise stacking
 // ---------------------------------------------------------------------------

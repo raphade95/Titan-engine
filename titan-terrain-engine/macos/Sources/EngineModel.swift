@@ -39,7 +39,7 @@ func randomSeed() -> String {
 /// A file is stamped with the *minimum* version needed to read it correctly,
 /// not simply the newest this build knows, so a project using no custom curve
 /// still opens in a build that predates them.
-let titanProjectVersion = 3
+let titanProjectVersion = 4
 
 /// A control point of a height-remap curve. Both axes are 0..1.
 struct CurvePoint: Equatable {
@@ -476,6 +476,14 @@ final class EngineModel: ObservableObject {
     @Published var topDownZoom: Double = 1.0
     @Published var topDownImage: CGImage? = nil
 
+    // Node graph (macOS only). `graphMode` means the graph drives the
+    // terrain; the drawer can be open without that being true, so the graph
+    // can be built and previewed alongside the stack before switching.
+    @Published var graph = TerrainGraph()
+    @Published var graphMode = false
+    @Published var graphDrawerOpen = false
+    @Published var nodeThumbnails: [UUID: CGImage] = [:]
+
     @Published var isGenerating = false
     @Published var statusText = "Ready — flat canvas. Pick a preset or choose a noise structure."
     @Published var lastComputeMs: Int = 0
@@ -502,7 +510,13 @@ final class EngineModel: ObservableObject {
     }
 
     deinit {
-        titan_destroy(engine)
+        // A run already dispatched still holds this pointer, and the engine
+        // parallelizes generation internally — freeing it here would pull the
+        // ground out from under a worker thread mid-pass. Destroying it *on*
+        // the serial queue means it happens after whatever is in flight.
+        // Locals, not self: deinit must not let self escape.
+        let handle = engine
+        queue.async { titan_destroy(handle) }
     }
 
     var engineVersion: String {
@@ -767,38 +781,24 @@ final class EngineModel: ObservableObject {
                 if masked { titan_set_mask(engine, nil, 0) }
             }
 
-            // Trace ambient occlusion once the stack has settled, so the mesh
-            // snapshot below carries it. Deliberately after the layer loop: AO
-            // is the engine's most expensive derived map and re-tracing it per
-            // layer would cost more than every simulation pass combined.
             stage("Ambient occlusion…")
-            titan_compute_ao(engine)
-
-            var rangeLo: Float = 0
-            var rangeHi: Float = 0
-            titan_height_range(engine, &rangeLo, &rangeHi)
-            var exportLo: Float = 0
-            var exportHi: Float = 0
-            titan_export_height_range(engine, &exportLo, &exportHi)
-
-            let snapshot = Self.snapshotMesh(engine, heightMax: p.height,
-                                             extent: Float(p.size) * p.cell)
-            let topDown = wantTopDown
-                ? Self.makeTopDownImage(engine, size: Int(p.size), seaLevel: water) : nil
+            let out = Self.finishRun(engine, heightMax: p.height,
+                                     extent: Float(p.size) * p.cell,
+                                     size: p.size, wantTopDown: wantTopDown, seaLevel: water)
             let elapsed = Int(Date().timeIntervalSince(started) * 1000)
 
             DispatchQueue.main.async { [weak self] in
                 guard let self, self.runCounter == run else { return }
                 self.isGenerating = false
-                self.heightRange = (rangeLo, rangeHi)
-                self.exportRange = (exportLo, exportHi)
+                self.heightRange = (out.rangeLo, out.rangeHi)
+                self.exportRange = (out.exportLo, out.exportHi)
                 self.lastComputeMs = elapsed
                 self.statusText = "\(self.engineVersion) — \(elapsed) ms"
-                self.topDownImage = topDown
+                self.topDownImage = out.topDown
                 self.lastFlora = []
                 self.floraCount = 0
                 self.onFlora?([], self.biome)
-                if let snapshot {
+                if let snapshot = out.snapshot {
                     self.lastSnapshot = snapshot
                     self.onMesh?(snapshot)
                 }
@@ -809,6 +809,143 @@ final class EngineModel: ObservableObject {
                 }
             }
         }
+    }
+
+    /// Everything a run does once the terrain itself is final: AO, the ranges
+    /// the export tab reports, the preview mesh, and the minimap. Shared by
+    /// the layer stack and the node graph so the two cannot end a run in
+    /// different states.
+    struct RunOutput {
+        var rangeLo: Float = 0
+        var rangeHi: Float = 0
+        var exportLo: Float = 0
+        var exportHi: Float = 0
+        var snapshot: MeshSnapshot? = nil
+        var topDown: CGImage? = nil
+    }
+
+    nonisolated private static func finishRun(_ engine: OpaquePointer?, heightMax: Float,
+                                              extent: Float, size: Int32,
+                                              wantTopDown: Bool, seaLevel: Float) -> RunOutput {
+        // Deliberately once, at the end: AO is the engine's most expensive
+        // derived map and re-tracing it per layer would cost more than every
+        // simulation pass combined.
+        titan_compute_ao(engine)
+
+        var out = RunOutput()
+        titan_height_range(engine, &out.rangeLo, &out.rangeHi)
+        titan_export_height_range(engine, &out.exportLo, &out.exportHi)
+        out.snapshot = snapshotMesh(engine, heightMax: heightMax, extent: extent)
+        out.topDown = wantTopDown ? makeTopDownImage(engine, size: Int(size), seaLevel: seaLevel)
+                                  : nil
+        return out
+    }
+
+    // MARK: - Node graph
+
+    /// Runs the graph and pushes the previewed node's terrain to the viewport.
+    /// The counterpart to rebuild(): same engine, same operations, same
+    /// ending — only the order they run in is decided differently.
+    func rebuildFromGraph() {
+        runCounter += 1
+        let run = runCounter
+        isGenerating = true
+        statusText = "Evaluating graph…"
+        probe = nil
+
+        let plan = GraphPlan(graph)
+        let gridSize = Int32(size)
+        let cell = Float(worldSize / max(1, size))
+        let seedValue = hashSeed(seed)
+        let wantTopDown = showTopDown || topDownFullscreen
+        let water = Float(seaLevel)
+        let wantThumbs = graphDrawerOpen
+        let heightMax = Float(heightMultiplier)
+        let engine = self.engine
+
+        queue.async { [weak self] in
+            let started = Date()
+            let result = GraphEvaluator.evaluate(
+                plan: plan, engine: engine, gridSize: gridSize, cellSize: cell,
+                seed: seedValue, thumbnails: wantThumbs,
+                progress: { label in
+                    DispatchQueue.main.async { [weak self] in
+                        guard let self, self.runCounter == run else { return }
+                        self.statusText = label
+                    }
+                })
+
+            let out = Self.finishRun(engine, heightMax: heightMax,
+                                     extent: Float(gridSize) * cell, size: gridSize,
+                                     wantTopDown: wantTopDown, seaLevel: water)
+            let elapsed = Int(Date().timeIntervalSince(started) * 1000)
+
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.runCounter == run else { return }
+                self.isGenerating = false
+                self.heightRange = (out.rangeLo, out.rangeHi)
+                self.exportRange = (out.exportLo, out.exportHi)
+                self.lastComputeMs = elapsed
+                self.topDownImage = out.topDown
+                if wantThumbs { self.nodeThumbnails = result.thumbnails }
+                self.lastFlora = []
+                self.floraCount = 0
+                self.onFlora?([], self.biome)
+                if let snapshot = out.snapshot {
+                    self.lastSnapshot = snapshot
+                    self.onMesh?(snapshot)
+                }
+                if let error = result.error {
+                    self.statusText = "Graph — \(error)"
+                } else {
+                    self.statusText = "\(result.evaluated) node\(result.evaluated == 1 ? "" : "s") — \(elapsed) ms"
+                }
+            }
+        }
+    }
+
+    /// Re-runs whichever editor is driving the terrain.
+    func refresh() {
+        if graphMode { rebuildFromGraph() } else { rebuild() }
+    }
+
+    /// Opens the drawer on the work already done: the stack laid out as the
+    /// line it is, rather than an empty canvas. Only converts once — reopening
+    /// keeps whatever the graph has become since.
+    func openGraphDrawer() {
+        if graph.nodes.isEmpty {
+            let base: [String: Double] = [
+                "noiseType": Double(noiseType), "scale": scale, "height": heightMultiplier,
+                "octaves": octaves, "persistence": persistence,
+                "lacunarity": lacunarity, "exponent": exponent, "warp": warpStrength,
+            ]
+            graph = stack.isEmpty ? TerrainGraph.starter()
+                                  : TerrainGraph.from(stack: stack, base: base)
+        }
+        graphDrawerOpen = true
+    }
+
+    /// Hands the graph back to the stack when it is still a straight line, so
+    /// a user can try the graph out and return without losing the work. A
+    /// forked graph cannot be a stack, and this says so rather than quietly
+    /// dropping a branch.
+    @discardableResult
+    func applyGraphToStack() -> Bool {
+        guard let layers = graph.asStack() else { return false }
+        if let terrain = graph.nodes.first(where: { $0.kind == .terrain }) {
+            noiseType = Int(terrain.params["noiseType"] ?? Double(noiseType))
+            scale = terrain.params["scale"] ?? scale
+            heightMultiplier = terrain.params["height"] ?? heightMultiplier
+            octaves = terrain.params["octaves"] ?? octaves
+            persistence = terrain.params["persistence"] ?? persistence
+            lacunarity = terrain.params["lacunarity"] ?? lacunarity
+            exponent = terrain.params["exponent"] ?? exponent
+            warpStrength = terrain.params["warp"] ?? warpStrength
+        }
+        stack = layers
+        graphMode = false
+        rebuild()
+        return true
     }
 
     // Activates a layer's mask on the engine (returns true if one was set).
@@ -834,7 +971,9 @@ final class EngineModel: ObservableObject {
 
 
     // One layer's engine calls — a direct port of the switch in runPipeline.
-    nonisolated private static func execute(_ layer: TitanLayer, on engine: OpaquePointer?,
+    // Internal, not private: the node graph evaluates its nodes through this
+    // same function, so a node and the layer it is named after cannot drift.
+    nonisolated static func execute(_ layer: TitanLayer, on engine: OpaquePointer?,
                                             gridSize: Int32, heightMultiplier: Float,
                                             imported: (data: [Float], size: Int32)?) {
         let p = layer.params
@@ -1106,12 +1245,21 @@ final class EngineModel: ObservableObject {
               let bedrock = titan_bedrock_ptr(engine),
               let sediment = titan_sediment_ptr(engine) else { return nil }
         let count = size * size
-
         var h = [Float](repeating: 0, count: count)
+        for i in 0..<count { h[i] = bedrock[i] + sediment[i] }
+        return colorize(h, size: size, seaLevel: seaLevel, grayscale: false)
+    }
+
+    /// Hypsometric tint + hillshade for an arbitrary field. Shared by the
+    /// minimap and the node graph's thumbnails; `grayscale` draws a mask as
+    /// what it is, a 0-1 coverage field, rather than pretending it is land.
+    nonisolated static func colorize(_ h: [Float], size: Int, seaLevel: Float,
+                                     grayscale: Bool) -> CGImage? {
+        guard size > 1, h.count >= size * size else { return nil }
+        let count = size * size
         var minH = Float.greatestFiniteMagnitude
         var maxH = -Float.greatestFiniteMagnitude
         for i in 0..<count {
-            h[i] = bedrock[i] + sediment[i]
             minH = min(minH, h[i])
             maxH = max(maxH, h[i])
         }
@@ -1135,7 +1283,10 @@ final class EngineModel: ObservableObject {
             for x in 0..<size {
                 let i = y * size + x
                 var r: Float, g: Float, b: Float
-                if h[i] < seaLevel {
+                if grayscale {
+                    let v = (h[i] - minH) / range * 255
+                    r = v; g = v; b = v
+                } else if h[i] < seaLevel {
                     let depth = min(1, (seaLevel - h[i]) / 20)
                     r = 30 - 15 * depth; g = 90 - 45 * depth; b = 160 - 60 * depth
                 } else {
@@ -1296,11 +1447,39 @@ final class EngineModel: ObservableObject {
 
         // Minimum version a reader needs: a project using no custom curve is
         // still a valid v2 and still opens in a build that predates them.
+        //
+        // A graph only forces v4 when it is the thing making the terrain. A
+        // graph sitting alongside a stack that still drives the render is
+        // extra baggage an older reader can ignore and still reproduce the
+        // file exactly, so it stays at the version the stack needs.
         let usesCustomCurve = stack.contains { $0.kind == .curve && !($0.curve ?? []).isEmpty }
-        let fileVersion = usesCustomCurve ? titanProjectVersion : 2
+        let fileVersion = graphMode ? 4 : (usesCustomCurve ? 3 : 2)
 
         var dict: [String: Any] = ["version": fileVersion,
                                    "params": params, "stack": stackJSON]
+        if !graph.nodes.isEmpty {
+            dict["graph"] = [
+                "mode": graphMode,
+                "preview": graph.previewNode?.uuidString as Any,
+                "nodes": graph.nodes.map { node -> [String: Any] in
+                    var entry: [String: Any] = [
+                        "id": node.id.uuidString,
+                        "kind": node.kind.rawValue,
+                        "x": Double(node.position.x), "y": Double(node.position.y),
+                        "enabled": node.enabled,
+                        "params": node.params,
+                    ]
+                    if !node.name.isEmpty { entry["name"] = node.name }
+                    if let curve = node.curve, !curve.isEmpty {
+                        entry["curve"] = curve.map { ["x": $0.x, "y": $0.y] }
+                    }
+                    return entry
+                },
+                "edges": graph.edges.map { edge in
+                    ["from": edge.from.uuidString, "to": edge.to.uuidString, "port": edge.port]
+                },
+            ]
+        }
         if !importedField.isEmpty {
             let bytes = importedField.withUnsafeBufferPointer { Data(buffer: $0) }
             var imp: [String: Any] = ["size": importedSize, "dataB64": bytes.base64EncodedString()]
@@ -1338,6 +1517,68 @@ final class EngineModel: ObservableObject {
         if let s = p["seed"] as? String { seed = s }
         noiseType = noiseTypeNames.firstIndex(of: (p["noiseType"] as? String) ?? "none") ?? 0
         biome = biomeNames.firstIndex(of: (p["biome"] as? String) ?? "temperate") ?? 1
+
+        // The graph, when the file carries one. Nodes keep their identity
+        // across a save so the edges still refer to them.
+        graph = TerrainGraph()
+        graphMode = false
+        if let g = raw["graph"] as? [String: Any] {
+            let restored = TerrainGraph()
+            var ids: [String: UUID] = [:]
+            for entry in (g["nodes"] as? [[String: Any]]) ?? [] {
+                guard let kindName = entry["kind"] as? String,
+                      let kind = NodeKind(rawValue: kindName) else { continue }
+                let id = (entry["id"] as? String).flatMap(UUID.init(uuidString:)) ?? UUID()
+                var node = GraphNode(kind: kind,
+                                     at: CGPoint(x: (entry["x"] as? NSNumber)?.doubleValue ?? 0,
+                                                 y: (entry["y"] as? NSNumber)?.doubleValue ?? 0),
+                                     id: id)
+                node.enabled = (entry["enabled"] as? Bool) ?? true
+                node.name = (entry["name"] as? String) ?? ""
+                if let params = entry["params"] as? [String: Any] {
+                    for def in kind.params {
+                        if let v = (params[def.key] as? NSNumber)?.doubleValue {
+                            node.params[def.key] = min(def.range.upperBound,
+                                                       max(def.range.lowerBound, v))
+                        }
+                    }
+                    // A volcano's position is normalized, not a slider, so it
+                    // is not among the parameter definitions.
+                    if kind == .volcano {
+                        for key in ["x", "y"] {
+                            if let v = (params[key] as? NSNumber)?.doubleValue {
+                                node.params[key] = min(1, max(0, v))
+                            }
+                        }
+                    }
+                }
+                if kind == .curve, let rawCurve = entry["curve"] as? [[String: Any]] {
+                    let pts = rawCurve.compactMap { p -> CurvePoint? in
+                        guard let x = (p["x"] as? NSNumber)?.doubleValue,
+                              let y = (p["y"] as? NSNumber)?.doubleValue else { return nil }
+                        return CurvePoint(x: x, y: y)
+                    }
+                    node.curve = sanitizeCurve(pts) ?? defaultCurve
+                }
+                if let old = entry["id"] as? String { ids[old] = id }
+                restored.nodes.append(node)
+            }
+            for entry in (g["edges"] as? [[String: Any]]) ?? [] {
+                guard let from = (entry["from"] as? String).flatMap({ ids[$0] }),
+                      let to = (entry["to"] as? String).flatMap({ ids[$0] }),
+                      let port = (entry["port"] as? NSNumber)?.intValue else { continue }
+                // Through connect(), so a file cannot introduce a cycle the
+                // editor would never have allowed.
+                restored.connect(from: from, to: to, port: port)
+            }
+            if let preview = (g["preview"] as? String).flatMap({ ids[$0] }) {
+                restored.previewNode = preview
+            }
+            if !restored.nodes.isEmpty {
+                graph = restored
+                graphMode = (g["mode"] as? Bool) ?? false
+            }
+        }
 
         var loaded: [TitanLayer] = []
         for entry in rawStack {
@@ -1403,7 +1644,14 @@ final class EngineModel: ObservableObject {
             }
         }
 
-        rebuild()
+        // A file whose graph was driving the terrain reopens that way, or the
+        // terrain it shows is not the terrain it was saved as.
+        if graphMode {
+            graphDrawerOpen = true
+            rebuildFromGraph()
+        } else {
+            rebuild()
+        }
         return true
     }
 

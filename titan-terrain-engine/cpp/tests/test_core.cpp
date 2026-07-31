@@ -1334,6 +1334,116 @@ void TestResolutionIndependence() {
     std::printf("\n");
 }
 
+void TestGraphPrimitives() {
+    std::printf("Graph evaluation primitives (read/set height)\n");
+
+    const int size = 96;
+    auto fresh = [&](Titan::TerrainEngine& e) {
+        e.Initialize(MakeParams(7, 1, size));
+        e.GenerateHeightmap();
+    };
+
+    // --- Round trip is exact -----------------------------------------------
+    Titan::TerrainEngine a;
+    fresh(a);
+    std::vector<float> field(static_cast<size_t>(size) * size, 0.0f);
+    a.ReadHeight(field.data(), static_cast<int>(field.size()));
+
+    Titan::TerrainEngine b;
+    b.Initialize(MakeParams(7, 1, size));
+    b.SetHeight(field.data(), static_cast<int>(field.size()));
+    bool exact = true;
+    for (int y = 0; y < size && exact; ++y)
+        for (int x = 0; x < size; ++x)
+            if (a.GetHeight(x, y) != b.GetHeight(x, y)) { exact = false; break; }
+    Check(exact, "a field survives read -> set bit-exactly");
+
+    // A parked field must not carry erosion history with it.
+    Check(b.GetSediment(48, 48) == 0.0f, "set clears sediment the field cannot account for");
+
+    // --- Parking mid-chain changes nothing that matters ---------------------
+    // The whole evaluator rests on this: a node's result can be cached and
+    // restored later without altering what the next operation produces.
+    //
+    // Not bit-exact, and it cannot be. The engine carries the surface as a
+    // bedrock/sediment pair; a cached field is their sum, so restoring it puts
+    // the whole value in bedrock and the next operation's re-split rounds
+    // differently in the last bits. The bound below is ~1e-8 of relief, four
+    // orders under the 1e-4 the golden suite treats as exact.
+    //
+    // Surface operations only — erosion reads sediment and flow, which a bare
+    // heightfield does not carry, so those are not interchangeable this way.
+    Titan::TerrainEngine direct;
+    fresh(direct);
+    direct.ApplyBlur(2.0f, 0.6f);
+    direct.ApplyTerrace(10.0f, 0.7f, 2.0f);
+
+    Titan::TerrainEngine parked;
+    fresh(parked);
+    parked.ApplyBlur(2.0f, 0.6f);
+    parked.ReadHeight(field.data(), static_cast<int>(field.size()));
+    parked.SetHeight(field.data(), static_cast<int>(field.size()));  // cache + restore
+    parked.ApplyTerrace(10.0f, 0.7f, 2.0f);
+
+    double worst = 0.0;
+    for (int y = 0; y < size; ++y)
+        for (int x = 0; x < size; ++x)
+            worst = std::max(worst, std::fabs(static_cast<double>(direct.GetHeight(x, y)) -
+                                              parked.GetHeight(x, y)));
+    float lo = 0.0f, hi = 0.0f;
+    direct.HeightRange(lo, hi);
+    const double relief = std::max(1.0f, hi - lo);
+    std::printf("        worst deviation across a cache/restore: %.3e (%.1e of relief)\n",
+                worst, worst / relief);
+    Check(worst / relief < 1e-6,
+          "caching a node's field does not perturb what follows it");
+
+    // --- A fork rejoins the way a linear stack would -------------------------
+    // Branch A blurred, branch B terraced, combined with max: the same result
+    // as doing it by hand, which is what a Combine node must produce.
+    Titan::TerrainEngine forkA, forkB;
+    fresh(forkA);
+    fresh(forkB);
+    forkA.ApplyBlur(3.0f, 1.0f);
+    forkB.ApplyTerrace(8.0f, 0.9f, 2.0f);
+    std::vector<float> fa(field.size()), fb(field.size());
+    forkA.ReadHeight(fa.data(), static_cast<int>(fa.size()));
+    forkB.ReadHeight(fb.data(), static_cast<int>(fb.size()));
+
+    Titan::TerrainEngine joined;
+    joined.Initialize(MakeParams(7, 1, size));
+    joined.SetHeight(fb.data(), static_cast<int>(fb.size()));
+    joined.ApplyHeightfield(fa.data(), size, 1.0f, 3 /* max */, 1.0f);
+
+    double joinWorst = 0.0;
+    for (int i = 0; i < static_cast<int>(field.size()); ++i) {
+        const float expect = std::max(fa[i], fb[i]);
+        const int x = i % size, y = i / size;
+        joinWorst = std::max(joinWorst, std::fabs(static_cast<double>(expect) -
+                                                  joined.GetHeight(x, y)));
+    }
+    std::printf("        worst deviation at the join: %.3e\n", joinWorst);
+    Check(joinWorst < 1e-4, "two branches combine to the same field as doing it by hand");
+
+    // --- Hostile input -------------------------------------------------------
+    std::vector<float> bad(field.size(), std::numeric_limits<float>::quiet_NaN());
+    bad[0] = 5.0f;
+    Titan::TerrainEngine guarded;
+    guarded.Initialize(MakeParams(7, 1, size));
+    guarded.SetHeight(bad.data(), static_cast<int>(bad.size()));
+    bool finite = true;
+    for (int y = 0; y < size && finite; ++y)
+        for (int x = 0; x < size; ++x)
+            if (!std::isfinite(guarded.GetHeight(x, y))) { finite = false; break; }
+    Check(finite, "a non-finite sample cannot enter the terrain");
+
+    // A short buffer must be a partial read, not an overrun.
+    std::vector<float> tiny(8, -1.0f);
+    a.ReadHeight(tiny.data(), static_cast<int>(tiny.size()));
+    Check(tiny[7] != -1.0f, "a short buffer reads as far as it goes");
+    std::printf("\n");
+}
+
 void TestDemImport() {
     std::printf("DEM / GeoTIFF import\n");
 
@@ -2412,6 +2522,7 @@ int main() {
     TestBandScratchSharedWithHosts();
     TestResolutionIndependence();
     TestDemImport();
+    TestGraphPrimitives();
     TestCurveSampling();
     TestTiledExport();
     TestExportHeightRange();
