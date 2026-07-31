@@ -381,6 +381,28 @@ void TerrainEngine::ApplyThermalWeathering(int passes, const ThermalParams& p) {
     const float pi = 3.14159265358979323846f;
     const float talusCardinal = std::tan(p.talusAngleDeg * pi / 180.0f) * m_Params.cellSize;
 
+    // A pass moves material exactly one *cell*, so a pass count is a
+    // cell-space travel distance: at half the sample spacing, the same number
+    // of passes creeps half as far across the actual landscape and the terrain
+    // comes out visibly less settled. The talus angle above was already
+    // cellSize-aware; the iteration count was the last thing in the engine
+    // still denominated in cells.
+    //
+    // Scaling by 1/cellSize makes a pass a fixed *world* distance. cellSize 1.0
+    // is exactly identity (`x * 1.0f` is exact), so every existing project,
+    // preset and golden hash is untouched.
+    //
+    // Capped, because this multiplies work: the cost is passes * size^2 and a
+    // very fine grid over a small world could otherwise ask for hundreds of
+    // full-grid relaxations. The cap is generous enough to cover the whole
+    // resolution slider against a sane world size, and past it thermal simply
+    // under-settles rather than hanging.
+    const float cs = m_Params.cellSize > 0.0f ? m_Params.cellSize : 1.0f;
+    const long long scaled = std::llround(static_cast<double>(passes) / cs);
+    const long long capped = std::min<long long>(scaled,
+                                                 std::max(1, passes) * kThermalPassScaleCap);
+    const int effectivePasses = static_cast<int>(std::max<long long>(1, capped));
+
     static const int dx8[8] = {-1, 1, 0, 0, -1, 1, -1, 1};
     static const int dy8[8] = {0, 0, -1, 1, -1, -1, 1, 1};
     const float sqrt2 = 1.41421356f;
@@ -388,7 +410,7 @@ void TerrainEngine::ApplyThermalWeathering(int passes, const ThermalParams& p) {
     std::vector<float> sedimentDelta(count);
     std::vector<float> bedrockDelta(count);
 
-    for (int pass = 0; pass < passes; ++pass) {
+    for (int pass = 0; pass < effectivePasses; ++pass) {
         std::fill(sedimentDelta.begin(), sedimentDelta.end(), 0.0f);
         std::fill(bedrockDelta.begin(), bedrockDelta.end(), 0.0f);
 

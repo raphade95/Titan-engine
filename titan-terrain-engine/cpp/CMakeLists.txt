@@ -34,6 +34,7 @@ set(TITAN_SOURCES
     libTitanCore/src/Fluvial.cpp
     libTitanCore/src/Layers.cpp
     libTitanCore/src/Volcano.cpp
+    libTitanCore/src/DemImport.cpp
     libTitanCore/src/Filters.cpp
     libTitanCore/src/Export.cpp
     libTitanCore/src/CAPI.cpp

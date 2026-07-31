@@ -126,6 +126,35 @@ exact partition — every sample in exactly one tile, nothing duplicated.
 The tile count must divide the resolution (a 1024 grid tiles 1/2/4/8/16 ways;
 the UI greys out the rest). Each tile covers `worldSize / tiles` world units.
 
+## Importing real-world elevation
+
+Both apps read DEM (digital elevation model) files directly, so you can start
+from a real place and then run Titan's layers over it:
+
+| Format | What it is |
+| --- | --- |
+| `.tif` / `.tiff` | GeoTIFF or plain TIFF — uint8/16/32, int16/32, float32/64; strips or tiles; uncompressed, LZW, DEFLATE or PackBits; horizontal predictor supported |
+| `.hgt` | SRTM tiles — raw big-endian int16, side inferred from file size (1201, 3601, …) |
+| `.dem` | Read as `.hgt` when the layout matches |
+
+Decoding lives in the engine (`titan_decode_dem`), not in either host, so the
+web lab, TitanLab and Unreal all resolve a given file to the same samples.
+
+Three things worth knowing:
+
+- **Voids are filled, not left as holes.** SRTM's `-32768` and TIFF `NaN`/`nodata`
+  samples are replaced from their neighbours so erosion doesn't route water into
+  a cliff of missing data.
+- **The true elevation range is reported separately.** The imported field is
+  normalized to 0–1 for the pipeline, and the app shows the source range in
+  metres (`1201×1201 · elevation 214 → 3402`). Multiply your export's Z range by
+  the real one when you want the result to stay geographically honest.
+- **Non-square sources are stretched to a square.** A 3601×1801 tile is
+  resampled, not cropped. Crop it beforehand if you need the aspect preserved.
+
+Use the imported field as the base terrain, or as one input to a Combiner layer
+to blend real topography with generated detail.
+
 ## Unreal Engine
 
 1. **Landscape mode → New → Import from File** and select the `.r16`.
@@ -172,13 +201,10 @@ wider than a 256 one, while Height stayed absolute. The same seed came out 6.7x
 flatter at 1024 than at 128. The simulation passes were cell-denominated too, so
 refining the grid rewrote the physics on top of that.
 
-Both are fixed. The passes measure in world units, and hydraulic, fluvial and
-blur agree to within 0.2% across a doubling of the grid. Two caveats worth
-knowing:
+Both are fixed. The passes measure in world units, and hydraulic, fluvial, blur
+and thermal all converge across a doubling of the grid — mean deviation 0.0% and
+p99 1.2% for thermal, under 0.2% for the rest. One caveat worth knowing:
 
-- **Thermal weathering is still cell-denominated.** Each pass creeps material
-  exactly one cell, so a finer grid smooths a shorter world distance for the
-  same pass count. Raise the pass count when you raise Resolution.
 - **The default is coarse.** 128 samples over a 128-unit world is one world unit
   per droplet step, which is under-resolved for the droplet model — it leaves
   larger depositional spikes than a finer grid does. The value is preserved for

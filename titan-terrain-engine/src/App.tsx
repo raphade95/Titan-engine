@@ -140,6 +140,9 @@ export default function App() {
   const draggingVolcanoRef = useRef<string | null>(null);
   const [waterLevel, setWaterLevel] = useState(-10);
   const [imported, setImported] = useState<ImportedField | undefined>(undefined);
+  // Provenance line for a real-world DEM: source dimensions and true elevation
+  // range, which is the reason to import one rather than a greyscale image.
+  const [importNote, setImportNote] = useState<string | null>(null);
   const [showMinimap, setShowMinimap] = useState(false);
   // Tiled export: how many tiles per side, and whether neighbours share an
   // edge row (what landscape importers usually expect).
@@ -1348,7 +1351,21 @@ export default function App() {
       let size: number;
       let data: Float32Array;
 
-      if (ext === 'r16' || ext === 'raw') {
+      if (ext === 'tif' || ext === 'tiff' || ext === 'hgt' || ext === 'dem') {
+        // Real-world elevation. The engine decodes it so the web lab, TitanLab
+        // and Unreal all read the same file identically.
+        const engine = engineRef.current;
+        if (!engine) throw new Error('engine still loading');
+        const dem = engine.decodeDem(new Uint8Array(await file.arrayBuffer()));
+        size = dem.size;
+        data = dem.data;
+        const stretched = dem.sourceWidth !== dem.sourceHeight;
+        setImportNote(
+          `${dem.sourceWidth}×${dem.sourceHeight} · elevation ` +
+          `${dem.minElevation.toFixed(0)} → ${dem.maxElevation.toFixed(0)}` +
+          (stretched ? ' · stretched to square' : '')
+        );
+      } else if (ext === 'r16' || ext === 'raw') {
         const u16 = new Uint16Array(await file.arrayBuffer());
         size = Math.floor(Math.sqrt(u16.length));
         if (size < 2 || size * size !== u16.length) {
@@ -1733,10 +1750,12 @@ export default function App() {
                         <ImageIcon className="w-4 h-4 text-emerald-400 shrink-0" />
                         <div className="flex-1 min-w-0">
                           <div className="text-[10px] font-bold truncate">{imported.name ?? 'Imported heightmap'}</div>
-                          <div className="text-[9px] text-zinc-500 font-mono">{imported.size}×{imported.size} · scaled by Height</div>
+                          <div className="text-[9px] text-zinc-500 font-mono">
+                            {importNote ?? `${imported.size}×${imported.size} · scaled by Height`}
+                          </div>
                         </div>
                         <Button variant="ghost" size="sm" className="h-6 w-6 p-0 text-zinc-500 hover:text-red-400"
-                          onClick={() => setImported(undefined)}>
+                          onClick={() => { setImported(undefined); setImportNote(null); }}>
                           <X className="w-3 h-3" />
                         </Button>
                       </div>
@@ -1747,13 +1766,13 @@ export default function App() {
                         onClick={() => importFileRef.current?.click()}
                       >
                         <Upload className="w-3 h-3 mr-2" />
-                        Import .png / .r16 / .r32
+                        Import .png / .r16 / .r32 / GeoTIFF / .hgt
                       </Button>
                     )}
                     <input
                       ref={importFileRef}
                       type="file"
-                      accept=".png,.jpg,.jpeg,.webp,.r16,.r32,.raw,image/*"
+                      accept=".png,.jpg,.jpeg,.webp,.r16,.r32,.raw,.tif,.tiff,.hgt,.dem,image/*"
                       className="hidden"
                       onChange={(e) => {
                         const file = e.target.files?.[0];
@@ -1762,7 +1781,7 @@ export default function App() {
                       }}
                     />
                     <p className="text-[9px] text-zinc-600 leading-relaxed">
-                      The import becomes the base terrain (resampled to the working resolution). Blend it further with a Combine Import layer.
+                      The import becomes the base terrain (resampled to the working resolution). Blend it further with a Combine Import layer. GeoTIFF and SRTM .hgt bring real-world elevation — their true height range is shown so you can set Height to match.
                     </p>
                   </div>
 

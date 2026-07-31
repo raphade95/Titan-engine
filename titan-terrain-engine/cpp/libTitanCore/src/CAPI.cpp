@@ -276,6 +276,40 @@ TITAN_API void titan_apply_heightfield(TitanHandle* handle, const float* data,
     })
 }
 
+TITAN_API int titan_decode_dem(TitanHandle* handle, const uint8_t* data, int bytes) {
+    if (!handle) { SetError("null handle"); return 0; }
+    TITAN_GUARD_RET(0, {
+        if (bytes <= 0) { SetError("empty file"); return 0; }
+        return Engine(handle)->DecodeDem(data, static_cast<size_t>(bytes));
+    })
+}
+
+TITAN_API float* titan_dem_ptr(TitanHandle* handle) {
+    if (!handle) { SetError("null handle"); return nullptr; }
+    TITAN_GUARD_RET(nullptr, {
+        const auto& v = Engine(handle)->DemField();
+        return v.empty() ? nullptr : const_cast<float*>(v.data());
+    })
+}
+
+TITAN_API void titan_dem_elevation_range(TitanHandle* handle, float* outMin, float* outMax) {
+    if (!handle) { SetError("null handle"); return; }
+    TITAN_GUARD({
+        if (outMin) *outMin = Engine(handle)->DemMinElevation();
+        if (outMax) *outMax = Engine(handle)->DemMaxElevation();
+    })
+}
+
+TITAN_API int titan_dem_source_width(TitanHandle* handle) {
+    if (!handle) { SetError("null handle"); return 0; }
+    TITAN_GUARD_RET(0, { return Engine(handle)->DemSourceWidth(); })
+}
+
+TITAN_API int titan_dem_source_height(TitanHandle* handle) {
+    if (!handle) { SetError("null handle"); return 0; }
+    TITAN_GUARD_RET(0, { return Engine(handle)->DemSourceHeight(); })
+}
+
 TITAN_API void titan_compute_slope_map(TitanHandle* handle) {
     if (!handle) { SetError("null handle"); return; }
     TITAN_GUARD({

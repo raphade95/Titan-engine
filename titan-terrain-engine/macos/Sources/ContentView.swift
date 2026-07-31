@@ -339,7 +339,7 @@ struct ContentView: View {
                         Image(systemName: "photo").foregroundStyle(.green)
                         VStack(alignment: .leading, spacing: 1) {
                             Text(name).font(.system(size: 10, weight: .bold)).lineLimit(1)
-                            Text("Base terrain · scaled by Height")
+                            Text(model.importNote ?? "Base terrain · scaled by Height")
                                 .font(.system(size: 8)).foregroundStyle(.secondary)
                         }
                         Spacer()
@@ -355,16 +355,16 @@ struct ContentView: View {
                     Button {
                         let panel = NSOpenPanel()
                         var types: [UTType] = [.png, .jpeg, .tiff]
-                        for ext in ["r16", "r32", "raw"] {
+                        for ext in ["r16", "r32", "raw", "hgt", "dem"] {
                             if let t = UTType(filenameExtension: ext) { types.append(t) }
                         }
                         panel.allowedContentTypes = types
-                        panel.message = "Choose a heightmap (.png, .r16, .r32)"
+                        panel.message = "Choose a heightmap (.png, .r16, .r32) or elevation data (GeoTIFF, .hgt)"
                         if panel.runModal() == .OK, let url = panel.url {
                             model.importHeightmap(url: url)
                         }
                     } label: {
-                        Label("Import .png / .r16 / .r32", systemImage: "square.and.arrow.down")
+                        Label("Import heightmap or DEM", systemImage: "square.and.arrow.down")
                             .frame(maxWidth: .infinity)
                     }
                     .buttonStyle(.bordered)

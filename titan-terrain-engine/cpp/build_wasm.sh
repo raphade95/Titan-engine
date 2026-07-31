@@ -16,7 +16,14 @@ mkdir -p "$OUT_DIR"
 # -ffp-contract=off matters as much as -fno-fast-math: without it the compiler
 # may fuse a*b+c into an FMA where the target has one, making results depend on
 # the instruction set rather than on the seed. Keep in step with CMakeLists.txt.
-emcc -O3 -std=c++20 -fno-fast-math -ffp-contract=off \
+# -fexceptions is required, not optional. Every C API entry point is wrapped in
+# TITAN_GUARD to catch C++ exceptions before they cross the extern "C" boundary,
+# but emscripten disables exceptions by default — so a `throw` did not unwind,
+# it aborted the whole module with "Aborted(undefined)". titan_last_error could
+# never report anything in the web build, and the out-of-memory case the guards
+# were written for would have killed the tab. Surfaced by the DEM decoder, which
+# is the first code that throws on ordinary malformed input.
+emcc -O3 -std=c++20 -fno-fast-math -ffp-contract=off -fexceptions \
   -I libTitanCore/include \
   libTitanCore/src/TitanNoise.cpp \
   libTitanCore/src/TerrainEngine.cpp \
@@ -24,6 +31,7 @@ emcc -O3 -std=c++20 -fno-fast-math -ffp-contract=off \
   libTitanCore/src/Fluvial.cpp \
   libTitanCore/src/Layers.cpp \
   libTitanCore/src/Volcano.cpp \
+  libTitanCore/src/DemImport.cpp \
   libTitanCore/src/Filters.cpp \
   libTitanCore/src/Export.cpp \
   libTitanCore/src/CAPI.cpp \

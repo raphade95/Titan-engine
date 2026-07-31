@@ -444,6 +444,9 @@ final class EngineModel: ObservableObject {
 
     // Imported heightfield (normalized 0..1), additive base after generate.
     @Published var importedName: String? = nil
+    /// Provenance for a real-world DEM: source dimensions and true elevation
+    /// range, which is the reason to import one rather than a greyscale image.
+    @Published var importNote: String? = nil
     private(set) var importedField: [Float] = []
     private(set) var importedSize: Int = 0
 
@@ -1166,7 +1169,31 @@ final class EngineModel: ObservableObject {
         let ext = url.pathExtension.lowercased()
         var decoded: (size: Int, data: [Float])? = nil
 
-        if ext == "r16" || ext == "raw" {
+        if ext == "tif" || ext == "tiff" || ext == "hgt" || ext == "dem" {
+            // Real-world elevation. Decoded by the engine so the web lab,
+            // TitanLab and Unreal all read the same file identically.
+            if let raw = try? Data(contentsOf: url) {
+                titan_clear_error()
+                let side: Int32 = raw.withUnsafeBytes { (b: UnsafeRawBufferPointer) in
+                    titan_decode_dem(engine, b.bindMemory(to: UInt8.self).baseAddress,
+                                     Int32(raw.count))
+                }
+                if side > 0, let ptr = titan_dem_ptr(engine) {
+                    let n = Int(side) * Int(side)
+                    decoded = (Int(side), Array(UnsafeBufferPointer(start: ptr, count: n)))
+                    var lo: Float = 0, hi: Float = 0
+                    titan_dem_elevation_range(engine, &lo, &hi)
+                    let sw = Int(titan_dem_source_width(engine))
+                    let sh = Int(titan_dem_source_height(engine))
+                    importNote = String(format: "%d×%d · elevation %.0f → %.0f%@",
+                                        sw, sh, lo, hi,
+                                        sw == sh ? "" : " · stretched to square")
+                } else if let err = titan_last_error() {
+                    statusText = "Import failed — \(String(cString: err))"
+                    return
+                }
+            }
+        } else if ext == "r16" || ext == "raw" {
             if let raw = try? Data(contentsOf: url) {
                 let count = raw.count / 2
                 let side = Int(Double(count).squareRoot())
@@ -1199,7 +1226,7 @@ final class EngineModel: ObservableObject {
         }
 
         guard let decoded else {
-            statusText = "Import failed — need a square .png/.r16/.r32 heightmap"
+            statusText = "Import failed — need a .png/.r16/.r32 heightmap, GeoTIFF or .hgt"
             return
         }
         importedField = decoded.data
@@ -1213,6 +1240,7 @@ final class EngineModel: ObservableObject {
         importedField = []
         importedSize = 0
         importedName = nil
+        importNote = nil
         rebuild()
     }
 

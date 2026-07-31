@@ -55,10 +55,11 @@ only marshals parameters in and copies buffers out across the C API
   seed came out 6.7x flatter at 1024 than at 128 because raising "Resolution"
   silently widened the world while Height stayed absolute. Refining the grid now
   resolves more detail on the same landform, and the simulation passes measure
-  in world units too — hydraulic, fluvial and blur agree to within 0.2% across a
-  doubling of the grid. (Thermal weathering is the exception: each pass creeps
-  material exactly one cell, so a finer grid smooths less for the same pass
-  count.)
+  in world units too — hydraulic, fluvial, blur and thermal all agree across a
+  doubling of the grid. Thermal creep is one cell per pass by construction, so
+  the pass count is scaled by the cell size to cover the same world distance;
+  the multiplier is capped at 16x so a fine grid cannot silently turn a cheap
+  layer into a minutes-long one.
 - World-space noise sampling: adjacent tiles are seamless (chunking-ready).
 - **Cellular noise family**: voronoi F1/F2-F1 plus Worley manhattan/chebyshev
   metrics, and a Musgrave hybrid multifractal "terrain" mode.
@@ -73,6 +74,11 @@ only marshals parameters in and copies buffers out across the C API
   or fractal noise (`titan_mask_by_feature`, `titan_noise_to_mask`).
 - **Combiner / import**: blend an external heightfield (add/sub/mul/max/min/mix)
   with engine-side resampling — also powers .png/.r16/.r32 heightmap import.
+- **Real-world elevation import**: GeoTIFF/TIFF (uint8/16/32, int16/32, float32/64,
+  strips or tiles, LZW / DEFLATE / PackBits, horizontal predictor) and SRTM `.hgt`,
+  decoded in the engine so every host reads a given file identically. The true
+  elevation range is reported alongside the normalized field, so you can set an
+  importing tool's Z scale from real metres.
 - Gradient generators (linear/radial stamps), full slope & curvature maps.
 - Exports: 16-bit RAW heightmap (`.r16`), 16-bit PNG, float32 RAW/EXR, OBJ
   mesh, RGBA splatmap PNG, world-space normal map PNG, ambient-occlusion PNG.

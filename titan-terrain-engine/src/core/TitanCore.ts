@@ -337,6 +337,46 @@ export class TitanCore {
     this.module._titan_compute_ao(this.handle);
   }
 
+  /**
+   * Decodes a GeoTIFF/TIFF or SRTM .hgt into a square 0..1 field.
+   *
+   * Decoding lives in the engine, not here: all three products then read the
+   * same files identically, and a DEM is genuinely untrusted third-party
+   * binary that deserves one carefully bounds-checked parser rather than one
+   * per host. Throws with the engine's message if the file is unreadable.
+   */
+  decodeDem(bytes: Uint8Array): {
+    size: number; data: Float32Array;
+    minElevation: number; maxElevation: number;
+    sourceWidth: number; sourceHeight: number;
+  } {
+    const m = this.module;
+    m._titan_clear_error();
+    const ptr = m._malloc(bytes.length);
+    try {
+      m.HEAPU8.set(bytes, ptr);
+      const side = m._titan_decode_dem(this.handle, ptr, bytes.length);
+      if (!side) throw new Error(this.lastError() ?? 'could not read that DEM');
+      const range = m._malloc(8);
+      try {
+        m._titan_dem_elevation_range(this.handle, range, range + 4);
+        const dem = m._titan_dem_ptr(this.handle);
+        return {
+          size: side,
+          data: m.HEAPF32.slice(dem >> 2, (dem >> 2) + side * side) as Float32Array,
+          minElevation: m.HEAPF32[range >> 2],
+          maxElevation: m.HEAPF32[(range >> 2) + 1],
+          sourceWidth: m._titan_dem_source_width(this.handle),
+          sourceHeight: m._titan_dem_source_height(this.handle),
+        };
+      } finally {
+        m._free(range);
+      }
+    } finally {
+      m._free(ptr);
+    }
+  }
+
   /** Grid-wide slope map (rise/run), copied out of the scratch buffer. */
   computeSlopeMap(): Float32Array {
     this.module._titan_compute_slope_map(this.handle);

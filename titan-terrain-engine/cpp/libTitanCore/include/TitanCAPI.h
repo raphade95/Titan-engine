@@ -260,6 +260,36 @@ TITAN_API void titan_apply_heightfield(TitanHandle* handle, const float* data,
                                        int srcSize, float heightScale,
                                        int blendMode, float alpha);
 
+// --- v0.10: real-world elevation import -----------------------------------
+//
+// Decodes a GeoTIFF/TIFF or an SRTM .hgt into a square, 0..1 normalized field
+// ready for titan_apply_heightfield. Returns the field's edge length, or 0 on
+// failure (see titan_last_error) — malformed third-party files are expected,
+// so every read in the decoder is bounds-checked and reported rather than
+// trusted.
+//
+// Supports classic TIFF, both byte orders, strips and tiles, 8/16/32-bit
+// unsigned, signed and float samples, horizontal differencing, and none/LZW/
+// Deflate/PackBits compression. BigTIFF is not supported.
+// `bytes` is an int, not an int64: the engine caps DEM dimensions at 32768 a
+// side, so no readable file approaches 2 GB, and an int64 parameter marshals as
+// a BigInt under the WASM build — a trap every JS caller would have to know
+// about. Oversized or negative lengths are rejected.
+TITAN_API int titan_decode_dem(TitanHandle* handle, const uint8_t* data, int bytes);
+
+// The decoded field: edgeSize*edgeSize floats normalized to 0..1.
+TITAN_API float* titan_dem_ptr(TitanHandle* handle);
+
+// The source's real elevation range in its own units (metres, for most DEMs),
+// before normalization — what a user needs to set a true vertical scale.
+// Either pointer may be NULL.
+TITAN_API void titan_dem_elevation_range(TitanHandle* handle, float* outMin, float* outMax);
+
+// Dimensions before the square resample, so a host can say when a rectangular
+// DEM was stretched to fit Titan's square terrain.
+TITAN_API int titan_dem_source_width(TitanHandle* handle);
+TITAN_API int titan_dem_source_height(TitanHandle* handle);
+
 // Derived maps rasterized into scratch (read via titan_scratch_ptr).
 TITAN_API void titan_compute_slope_map(TitanHandle* handle);     // rise/run
 TITAN_API void titan_compute_curvature_map(TitanHandle* handle); // Laplacian
