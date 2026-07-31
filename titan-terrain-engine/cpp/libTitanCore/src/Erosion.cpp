@@ -125,6 +125,38 @@ void TerrainEngine::RunDropletBatch(uint64_t firstDroplet, int count, const Hydr
     const auto spawnMode = static_cast<SpawnMode>(p.spawnMode);
     const bool usePrecip = spawnMode == SpawnMode::Precipitation && !m_Precipitation.empty();
 
+    // The surface as this batch has already reshaped it.
+    //
+    // SampleHeight reads the committed field, which does not include the
+    // deposits this batch is still holding in its delta buffers. The erosion
+    // branch has always read sediment through SampleWithDelta for exactly that
+    // reason; the deposition branch did not, and it is the one that needed it
+    // more. A droplet would fill a hollow, and the next 2047 droplets of the
+    // batch would still measure that hollow as empty and fill it again, with
+    // nothing anywhere bounding the total. That is what the spikes were: after
+    // 200k droplets, 788 cells stood more than a unit above every one of their
+    // eight neighbours, the worst by 113 units on terrain whose median is 29.
+    //
+    // This does not weaken the determinism guarantee. Batches still run
+    // against their own private deltas and merge in fixed batch order, so the
+    // result is unchanged by thread count — the batch is merely consistent
+    // with itself now, which it always claimed to be.
+    auto LiveHeight = [&](float x, float y) -> float {
+        const int nx = static_cast<int>(std::floor(x));
+        const int ny = static_cast<int>(std::floor(y));
+        const float u = x - nx;
+        const float v = y - ny;
+        auto at = [&](int px, int py) -> float {
+            // Clamp to match GetHeight, so edges do not read as cliffs.
+            px = std::clamp(px, 0, size - 1);
+            py = std::clamp(py, 0, size - 1);
+            const size_t i = static_cast<size_t>(py) * size + px;
+            return m_Bedrock[i] + bedrockDelta[i] + m_Sediment[i] + sedimentDelta[i];
+        };
+        return at(nx, ny) * (1 - u) * (1 - v) + at(nx + 1, ny) * u * (1 - v)
+             + at(nx, ny + 1) * (1 - u) * v + at(nx + 1, ny + 1) * u * v;
+    };
+
     // --- Cell space vs. world space ----------------------------------------
     //
     // A droplet advances exactly one *cell* per step while heights are in
@@ -218,8 +250,8 @@ void TerrainEngine::RunDropletBatch(uint64_t firstDroplet, int count, const Hydr
                 break;
             }
 
-            const float newHeight = SampleHeight(posX, posY);
-            const float oldHeight = SampleHeight(oldPosX, oldPosY);
+            const float newHeight = LiveHeight(posX, posY);
+            const float oldHeight = LiveHeight(oldPosX, oldPosY);
             const float deltaHeight = newHeight - oldHeight;
             // Rise per world unit travelled, so the droplet reads the terrain's
             // real steepness rather than a figure that shrinks as the grid is

@@ -1886,12 +1886,43 @@ void TestExportHeightRange() {
         std::printf("        eroded: true max %.2f, export max %.2f, "
                     "usable %.0f%% -> %.0f%%\n",
                     tHi, eHi, 100.0 * before, 100.0 * usableFraction(e));
-        Check(eHi < tHi, "an outlier tail is trimmed off the export range");
+        // This used to assert eHi < tHi, on the grounds that droplet erosion
+        // always leaves towers to trim. It does not any more: the towers came
+        // from droplets measuring a hollow they had already filled, and now
+        // that a batch reads its own deposits the eroded field has no outlier
+        // tail worth cutting. The trim is still correct and still tested below
+        // against outliers that are put there deliberately — what changed is
+        // that erosion has stopped manufacturing its own.
+        Check(eHi <= tHi, "the export range never exceeds the true range");
         Check(usableFraction(e) > 0.7,
               "the terrain occupies most of the exported range");
 
         // Trimming must never invert or collapse the range.
         Check(eHi > eLo, "trimmed range stays ordered");
+    }
+
+    // The trim itself, driven by outliers that are placed rather than hoped
+    // for. A handful of towering cells is exactly the case it exists to
+    // handle, and it must still catch them now that erosion does not supply
+    // any.
+    {
+        Titan::TerrainEngine e;
+        build(e, false, false);
+        const int n = 256 * 256;
+        std::vector<float> h(static_cast<size_t>(n));
+        e.ReadHeight(h.data(), n);
+        float trueMax = 0;
+        for (float v : h) trueMax = std::max(trueMax, v);
+        // 12 needles in 65536 cells — under the 0.1% the trim targets.
+        for (int i = 0; i < 12; ++i) h[static_cast<size_t>(1000 + i * 97)] = trueMax * 4.0f;
+        e.SetHeight(h.data(), n);
+
+        float tLo = 0, tHi = 0, eLo = 0, eHi = 0;
+        e.HeightRange(tLo, tHi);
+        e.ExportHeightRange(eLo, eHi);
+        Check(tHi > trueMax * 3.0f, "the planted needles are in the true range");
+        Check(eHi < tHi * 0.5f, "an outlier tail is trimmed off the export range");
+        Check(eHi > eLo, "the trimmed range stays ordered");
     }
 
     // A thermal settle flattens the towers itself, so a stack ending in one
