@@ -136,6 +136,73 @@ void TerrainEngine::ApplySharpen(float radius, float strength) {
     ResplitHeight(total);
 }
 
+namespace {
+
+// Monotone piecewise-cubic Hermite (Fritsch-Carlson slopes), the one
+// definition of Titan's height-remap curve.
+//
+// Extracted so the curve editors in both apps can *draw* exactly what the
+// engine will *apply*, via titan_sample_curve, rather than each
+// reimplementing the spline. This codebase has already paid for duplicating a
+// formula three ways once — the mask band curve lived in C++, TypeScript and
+// Swift simultaneously and had to agree forever.
+//
+// Control points must be sorted by x; inputs outside [x0, xn] clamp.
+class MonotoneCurve {
+public:
+    MonotoneCurve(const float* xs, const float* ys, int count)
+        : m_Xs(xs), m_Ys(ys), m_N(count), m_Slope(count, 0.0f) {
+        std::vector<float> secant(count - 1, 0.0f);
+        for (int i = 0; i < count - 1; ++i) {
+            const float dx = std::max(1e-6f, xs[i + 1] - xs[i]);
+            secant[i] = (ys[i + 1] - ys[i]) / dx;
+        }
+        m_Slope[0] = secant[0];
+        m_Slope[count - 1] = secant[count - 2];
+        for (int i = 1; i < count - 1; ++i) {
+            m_Slope[i] = (secant[i - 1] * secant[i] <= 0.0f)
+                ? 0.0f : 0.5f * (secant[i - 1] + secant[i]);
+        }
+        for (int i = 0; i < count - 1; ++i) {
+            if (secant[i] == 0.0f) {
+                m_Slope[i] = m_Slope[i + 1] = 0.0f;
+            } else {
+                const float a = m_Slope[i] / secant[i];
+                const float b = m_Slope[i + 1] / secant[i];
+                const float sum = a * a + b * b;
+                if (sum > 9.0f) {
+                    const float tau = 3.0f / std::sqrt(sum);
+                    m_Slope[i] = tau * a * secant[i];
+                    m_Slope[i + 1] = tau * b * secant[i];
+                }
+            }
+        }
+    }
+
+    float Evaluate(float t) const {
+        if (t <= m_Xs[0]) return m_Ys[0];
+        if (t >= m_Xs[m_N - 1]) return m_Ys[m_N - 1];
+        int seg = 0;
+        while (seg < m_N - 2 && t > m_Xs[seg + 1]) ++seg;
+        const float dx = std::max(1e-6f, m_Xs[seg + 1] - m_Xs[seg]);
+        const float u = (t - m_Xs[seg]) / dx;
+        const float u2 = u * u;
+        const float u3 = u2 * u;
+        return m_Ys[seg] * (2 * u3 - 3 * u2 + 1)
+             + m_Slope[seg] * dx * (u3 - 2 * u2 + u)
+             + m_Ys[seg + 1] * (-2 * u3 + 3 * u2)
+             + m_Slope[seg + 1] * dx * (u3 - u2);
+    }
+
+private:
+    const float* m_Xs;
+    const float* m_Ys;
+    int m_N;
+    std::vector<float> m_Slope;
+};
+
+} // namespace
+
 void TerrainEngine::ApplyCurve(const float* xs, const float* ys, int count) {
     if (!xs || !ys || count < 2) return;
     const size_t cells = m_Bedrock.size();
@@ -144,59 +211,28 @@ void TerrainEngine::ApplyCurve(const float* xs, const float* ys, int count) {
     const float range = maxH - minH;
     if (range <= 0.0f) return;
 
-    // Monotone piecewise-cubic Hermite (Fritsch–Carlson slopes). Control
-    // points are assumed sorted by x; inputs outside [x0, xn] clamp.
-    const int n = count;
-    std::vector<float> slope(n, 0.0f);
-    std::vector<float> secant(n - 1, 0.0f);
-    for (int i = 0; i < n - 1; ++i) {
-        const float dx = std::max(1e-6f, xs[i + 1] - xs[i]);
-        secant[i] = (ys[i + 1] - ys[i]) / dx;
-    }
-    slope[0] = secant[0];
-    slope[n - 1] = secant[n - 2];
-    for (int i = 1; i < n - 1; ++i) {
-        slope[i] = (secant[i - 1] * secant[i] <= 0.0f)
-            ? 0.0f : 0.5f * (secant[i - 1] + secant[i]);
-    }
-    for (int i = 0; i < n - 1; ++i) {
-        if (secant[i] == 0.0f) {
-            slope[i] = slope[i + 1] = 0.0f;
-        } else {
-            const float a = slope[i] / secant[i];
-            const float b = slope[i + 1] / secant[i];
-            const float s = a * a + b * b;
-            if (s > 9.0f) {
-                const float tau = 3.0f / std::sqrt(s);
-                slope[i] = tau * a * secant[i];
-                slope[i + 1] = tau * b * secant[i];
-            }
-        }
-    }
-
-    auto evaluate = [&](float t) -> float {
-        if (t <= xs[0]) return ys[0];
-        if (t >= xs[n - 1]) return ys[n - 1];
-        int seg = 0;
-        while (seg < n - 2 && t > xs[seg + 1]) ++seg;
-        const float dx = std::max(1e-6f, xs[seg + 1] - xs[seg]);
-        const float u = (t - xs[seg]) / dx;
-        const float u2 = u * u;
-        const float u3 = u2 * u;
-        return ys[seg] * (2 * u3 - 3 * u2 + 1)
-             + slope[seg] * dx * (u3 - 2 * u2 + u)
-             + ys[seg + 1] * (-2 * u3 + 3 * u2)
-             + slope[seg + 1] * dx * (u3 - u2);
-    };
+    const MonotoneCurve curve(xs, ys, count);
 
     std::vector<float> total(cells);
     for (size_t i = 0; i < cells; ++i) {
         const float h = m_Bedrock[i] + m_Sediment[i];
         const float t = (h - minH) / range;
-        const float remapped = minH + std::clamp(evaluate(t), 0.0f, 1.0f) * range;
+        const float remapped = minH + std::clamp(curve.Evaluate(t), 0.0f, 1.0f) * range;
         total[i] = h + (remapped - h) * MaskAt(static_cast<int>(i));
     }
     ResplitHeight(total);
+}
+
+// Samples the same curve the remap applies, evenly across [0,1]. This is what
+// the editors draw, so a preview can never disagree with the result.
+void TerrainEngine::SampleCurve(const float* xs, const float* ys, int count,
+                                float* out, int samples) {
+    if (!xs || !ys || !out || count < 2 || samples < 2) return;
+    const MonotoneCurve curve(xs, ys, count);
+    for (int i = 0; i < samples; ++i) {
+        const float t = static_cast<float>(i) / static_cast<float>(samples - 1);
+        out[i] = std::clamp(curve.Evaluate(t), 0.0f, 1.0f);
+    }
 }
 
 // ---------------------------------------------------------------------------

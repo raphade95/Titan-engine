@@ -1334,6 +1334,57 @@ void TestResolutionIndependence() {
     std::printf("\n");
 }
 
+void TestCurveSampling() {
+    std::printf("Curve sampling\n");
+
+    // The curve editors draw with SampleCurve and the terrain is remapped by
+    // ApplyCurve. If those ever diverge the editor lies about what it will do,
+    // which is worse than having no editor — so they share one spline and this
+    // asserts they agree.
+    const float xs[5] = {0.0f, 0.3f, 0.5f, 0.7f, 1.0f};
+    const float ys[5] = {0.0f, 0.16f, 0.5f, 0.84f, 1.0f};
+
+    const int samples = 65;
+    std::vector<float> curve(samples, 0.0f);
+    Titan::TerrainEngine::SampleCurve(xs, ys, 5, curve.data(), samples);
+
+    Check(curve.front() >= 0.0f && curve.front() < 1e-5f, "curve starts at its first y");
+    Check(std::fabs(curve.back() - 1.0f) < 1e-5f, "curve ends at its last y");
+    bool monotone = true;
+    for (int i = 1; i < samples; ++i) {
+        if (curve[i] < curve[i - 1] - 1e-6f) { monotone = false; break; }
+    }
+    Check(monotone, "a monotone control polygon yields a monotone curve");
+    Check(AllFinite(curve), "sampled curve holds no NaN/Inf");
+
+    // Apply the same curve to a linear ramp: cell x maps input x/(n-1), so the
+    // resulting height must equal the sampled curve at that same input.
+    const int n = samples;
+    Titan::TerrainEngine e;
+    Titan::TerrainParams p = MakeParams(1, 0, n); // flat base
+    p.heightMultiplier = 100.0f;
+    e.Initialize(p);
+    e.GenerateHeightmap();
+
+    std::vector<float> ramp(static_cast<size_t>(n) * n, 0.0f);
+    for (int y = 0; y < n; ++y) {
+        for (int x = 0; x < n; ++x) {
+            ramp[static_cast<size_t>(y) * n + x] = static_cast<float>(x) / (n - 1);
+        }
+    }
+    e.ApplyHeightfield(ramp.data(), n, 100.0f, 0, 1.0f);
+    e.ApplyCurve(xs, ys, 5);
+
+    float worst = 0.0f;
+    for (int x = 0; x < n; ++x) {
+        const float applied = e.GetHeight(x, n / 2) / 100.0f;
+        worst = std::max(worst, std::fabs(applied - curve[x]));
+    }
+    std::printf("        max |sampled - applied| across the ramp = %.2e\n", worst);
+    Check(worst < 1e-4f, "what the editor draws is what the remap applies");
+    std::printf("\n");
+}
+
 void TestTiledExport() {
     std::printf("Tiled export\n");
 
@@ -2142,6 +2193,7 @@ int main() {
     TestSplatMatchesMesh();
     TestBandScratchSharedWithHosts();
     TestResolutionIndependence();
+    TestCurveSampling();
     TestTiledExport();
     TestExportHeightRange();
     TestLayerResolutionIndependence();

@@ -49,12 +49,56 @@ export function defaultMask(): LayerMask {
   return { mode: 0, lo: 0.35, hi: 1.0, invert: false };
 }
 
+/** A control point of a height-remap curve. Both axes are 0..1. */
+export interface CurvePoint {
+  x: number;
+  y: number;
+}
+
+/** Identity: input height maps to itself. */
+export const DEFAULT_CURVE: CurvePoint[] = [
+  { x: 0, y: 0 }, { x: 0.25, y: 0.25 }, { x: 0.5, y: 0.5 },
+  { x: 0.75, y: 0.75 }, { x: 1, y: 1 },
+];
+
+export const MAX_CURVE_POINTS = 12;
+
+/** Sorted by x, endpoints pinned, everything inside the unit square. */
+export function sanitizeCurve(raw: any): CurvePoint[] | null {
+  if (!Array.isArray(raw) || raw.length < 2) return null;
+  const pts: CurvePoint[] = [];
+  for (const p of raw.slice(0, MAX_CURVE_POINTS)) {
+    const x = Number(p?.x);
+    const y = Number(p?.y);
+    if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
+    pts.push({ x: Math.min(1, Math.max(0, x)), y: Math.min(1, Math.max(0, y)) });
+  }
+  pts.sort((a, b) => a.x - b.x);
+  // The engine's spline assumes strictly increasing x; equal x would divide by
+  // a clamped epsilon and produce a near-vertical segment.
+  pts[0].x = 0;
+  pts[pts.length - 1].x = 1;
+  for (let i = 1; i < pts.length; i++) {
+    if (pts[i].x <= pts[i - 1].x) pts[i].x = Math.min(1, pts[i - 1].x + 1e-3);
+  }
+  return pts;
+}
+
 export interface Layer {
   id: string;
   type: LayerType;
   enabled: boolean;
   params: Record<string, number>;
   mask: LayerMask;
+  /**
+   * Height-remap control points, for `curve` layers.
+   *
+   * The engine has always accepted an arbitrary number of monotone-cubic
+   * control points; the UI exposed five fixed sliders. This carries what the
+   * editor produces. Absent on layers loaded from a file that predates it, in
+   * which case the loader rebuilds it from the old y0..y4 params.
+   */
+  curve?: CurvePoint[];
 }
 
 // An imported heightfield (values normalized 0..1). Acts as an additive
@@ -70,12 +114,28 @@ export interface ImportedField {
  *
  * 1 — world extent was implicitly the sample count (engine cellSize 1.0).
  * 2 — `worldSize` is explicit and `size` is pure sample density.
+ * 3 — curve layers carry arbitrary control points instead of five fixed ones.
  *
- * v1 files still load and still reproduce their original terrain: the loader
- * sets worldSize = size, which is exactly what the old model computed.
+ * Old files always load: v1 sets worldSize = size, exactly what the old model
+ * computed, and a v2 curve layer is rebuilt from its y0..y4 params.
+ *
+ * A file is stamped with the *minimum* version needed to read it correctly,
+ * not simply the newest this build knows. A project that uses no custom curve
+ * is still a valid v2 and still opens in a build that predates them; only one
+ * that would be silently mis-reproduced is marked v3 and refused. Reproduction
+ * is what the format is for, so a reader that cannot honour a file should say
+ * so rather than approximate it.
  */
-export const TITAN_PROJECT_VERSION = 2;
-export type TitanProjectVersion = 1 | 2;
+export const TITAN_PROJECT_VERSION = 3;
+export type TitanProjectVersion = 1 | 2 | 3;
+
+/** Lowest reader version that can reproduce this project faithfully. */
+export function requiredVersion(project: TitanProject): TitanProjectVersion {
+  const usesCustomCurve = project.stack.some(
+    l => l.type === 'curve' && Array.isArray(l.curve) && l.curve.length > 0
+  );
+  return usesCustomCurve ? 3 : 2;
+}
 
 export interface TitanProject {
   version: TitanProjectVersion;
@@ -199,14 +259,10 @@ export const LAYER_DEFS: Record<LayerType, LayerDef> = {
   curve: {
     type: 'curve',
     label: 'Curves',
-    description: 'Custom height remap through five control points over the terrain\'s height range (like Photoshop curves).',
-    params: [
-      { key: 'y0', label: 'Shadows', min: 0, max: 1, step: 0.05, defaultValue: 0 },
-      { key: 'y1', label: 'Low Mids', min: 0, max: 1, step: 0.05, defaultValue: 0.25 },
-      { key: 'y2', label: 'Midtones', min: 0, max: 1, step: 0.05, defaultValue: 0.5 },
-      { key: 'y3', label: 'High Mids', min: 0, max: 1, step: 0.05, defaultValue: 0.75 },
-      { key: 'y4', label: 'Peaks', min: 0, max: 1, step: 0.05, defaultValue: 1 },
-    ],
+    description: 'Custom height remap over the terrain\'s own height range, like Photoshop curves. Drag the points; click the curve to add one, double-click a point to remove it.',
+    // No sliders: this layer is edited through the curve widget, which writes
+    // layer.curve. The engine has always taken arbitrary control points.
+    params: [],
   },
   blur: {
     type: 'blur',
@@ -316,13 +372,15 @@ let nextLayerId = 1;
 export function makeLayer(type: LayerType): Layer {
   const params: Record<string, number> = {};
   for (const p of LAYER_DEFS[type].params) params[p.key] = p.defaultValue;
-  return {
+  const layer: Layer = {
     id: `layer-${nextLayerId++}-${Math.random().toString(36).slice(2, 7)}`,
     type,
     enabled: true,
     params,
     mask: defaultMask(),
   };
+  if (type === 'curve') layer.curve = DEFAULT_CURVE.map(p => ({ ...p }));
+  return layer;
 }
 
 // ---------------------------------------------------------------------------
@@ -537,17 +595,18 @@ export async function runPipeline(
         await yieldFrame();
         if (cb.shouldCancel()) return false;
         break;
-      case 'curve':
-        engine.applyCurve(
-          [0, 0.25, 0.5, 0.75, 1],
-          [layer.params.y0, layer.params.y1, layer.params.y2, layer.params.y3, layer.params.y4]
-        );
+      case 'curve': {
+        const pts = layer.curve && layer.curve.length >= 2
+          ? layer.curve
+          : DEFAULT_CURVE;
+        engine.applyCurve(pts.map(p => p.x), pts.map(p => p.y));
         doneUnits += 1;
         tick(def.label);
         cb.onChunk();
         await yieldFrame();
         if (cb.shouldCancel()) return false;
         break;
+      }
       case 'blur':
         engine.applyBlur(layer.params.radius, layer.params.strength);
         doneUnits += 1;
@@ -692,7 +751,7 @@ function b64ToF32(s: string): Float32Array {
 
 export function serializeProject(project: TitanProject): string {
   const { imported, ...rest } = project;
-  const out: any = { ...rest, version: TITAN_PROJECT_VERSION };
+  const out: any = { ...rest, version: requiredVersion(project) };
   if (imported && imported.data.length > 0) {
     out.imported = { size: imported.size, name: imported.name, dataB64: f32ToB64(imported.data) };
   }
@@ -775,7 +834,7 @@ function sanitizeParams(raw: any, version: number): TerrainParams {
 export function deserializeProject(json: string): TitanProject {
   const raw = JSON.parse(json);
   const version = Number(raw?.version);
-  if (version !== 1 && version !== 2) {
+  if (version !== 1 && version !== 2 && version !== 3) {
     throw new Error(
       Number.isFinite(version)
         ? `.titan version ${version} is newer than this build understands`
@@ -792,6 +851,21 @@ export function deserializeProject(json: string): TitanProject {
       for (const p of LAYER_DEFS[layer.type].params) {
         const v = Number(l.params?.[p.key]);
         if (Number.isFinite(v)) layer.params[p.key] = Math.min(p.max, Math.max(p.min, v));
+      }
+      // Curve control points. A v2 file predates them, so its five fixed
+      // y-values are lifted onto the same x positions they always used —
+      // reproducing exactly the curve the file described.
+      if (layer.type === 'curve') {
+        const explicit = sanitizeCurve(l.curve);
+        if (explicit) {
+          layer.curve = explicit;
+        } else {
+          const ys = [l.params?.y0, l.params?.y1, l.params?.y2, l.params?.y3, l.params?.y4]
+            .map(v => (Number.isFinite(Number(v)) ? Math.min(1, Math.max(0, Number(v))) : null));
+          layer.curve = ys.every(v => v !== null)
+            ? [0, 0.25, 0.5, 0.75, 1].map((x, i) => ({ x, y: ys[i] as number }))
+            : DEFAULT_CURVE.map(p => ({ ...p }));
+        }
       }
       if (l.mask && typeof l.mask === 'object') {
         const mode = Number(l.mask.mode);
@@ -839,7 +913,12 @@ export interface Preset {
   // were authored against — 62 units of volcano reads as a cone across 128
   // world units and as a pimple across 4096.
   params: Omit<TerrainParams, 'seed' | 'size'>;
-  stack: Array<{ type: LayerType; params?: Record<string, number>; mask?: LayerMask }>;
+  stack: Array<{
+    type: LayerType;
+    params?: Record<string, number>;
+    mask?: LayerMask;
+    curve?: CurvePoint[];
+  }>;
 }
 
 export const PRESETS: Preset[] = [
@@ -910,7 +989,11 @@ export const PRESETS: Preset[] = [
       noiseType: 'voronoi', biome: 'desert',
     },
     stack: [
-      { type: 'curve', params: { y0: 0, y1: 0.15, y2: 0.55, y3: 0.85, y4: 1 } },
+      // Was five fixed y-values on a quarter grid; the same shape as points.
+      { type: 'curve', curve: [
+        { x: 0, y: 0 }, { x: 0.25, y: 0.15 }, { x: 0.5, y: 0.55 },
+        { x: 0.75, y: 0.85 }, { x: 1, y: 1 },
+      ] },
       { type: 'noise', params: { noiseType: 0, blend: 0, scale: 6, amplitude: 6, octaves: 6, alpha: 0.5, seedOffset: 3 } },
       { type: 'fluvial', params: { passes: 2, strength: 1.2 } },
       {
@@ -980,6 +1063,7 @@ export function instantiatePreset(preset: Preset): { params: Omit<TerrainParams,
     const layer = makeLayer(entry.type);
     if (entry.params) Object.assign(layer.params, entry.params);
     if (entry.mask) layer.mask = { ...entry.mask };
+    if (entry.curve) layer.curve = entry.curve.map(p => ({ ...p }));
     return layer;
   });
   return { params: preset.params, stack };

@@ -260,6 +260,13 @@ TITAN_API void titan_apply_curve(TitanHandle* handle, const float* xs,
     })
 }
 
+TITAN_API void titan_sample_curve(const float* xs, const float* ys, int count,
+                                  float* out, int samples) {
+    TITAN_GUARD({
+        Titan::TerrainEngine::SampleCurve(xs, ys, count, out, samples);
+    })
+}
+
 TITAN_API void titan_apply_heightfield(TitanHandle* handle, const float* data,
                                        int srcSize, float heightScale,
                                        int blendMode, float alpha) {

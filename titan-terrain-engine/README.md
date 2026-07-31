@@ -62,8 +62,13 @@ only marshals parameters in and copies buffers out across the C API
 - World-space noise sampling: adjacent tiles are seamless (chunking-ready).
 - **Cellular noise family**: voronoi F1/F2-F1 plus Worley manhattan/chebyshev
   metrics, and a Musgrave hybrid multifractal "terrain" mode.
-- **Filters**: clamp, curves (monotone-cubic height remap), blur, sharpen,
-  vertical transform (scale/offset/invert) — all mask-aware.
+- **Filters**: clamp, curves, blur, sharpen, vertical transform
+  (scale/offset/invert) — all mask-aware.
+- **Curve editor**: a draggable monotone-cubic height remap with up to 12
+  control points, in both apps. The preview is drawn from the engine's own
+  sampler (`titan_sample_curve`) rather than a spline reimplemented per host, so
+  it cannot disagree with the result — verified to 1.2e-07 against the applied
+  remap.
 - **Masking**: per-operation masks generated from height/slope/curvature bands
   or fractal noise (`titan_mask_by_feature`, `titan_noise_to_mask`).
 - **Combiner / import**: blend an external heightfield (add/sub/mul/max/min/mix)

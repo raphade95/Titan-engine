@@ -16,7 +16,7 @@ past it, and the work below is not on the table at all:
 | v0.6 | Snow and Lakes promoted from engine-only to layers in both UIs |
 | v0.7 | **Volcanism** — stratovolcano edifice stamping plus a cellular lava flow with yield strength, self-channelizing streams, and chilled lava folded back into the terrain. Drag-to-place in both viewports |
 | v0.8 | **Viewport overhaul** — linear-space lighting, horizon-traced AO shared with the exporter, hemisphere ambient, curvature cavity shading, ACES tone mapping, camera-relative aerial perspective, and simulated snow/lakes actually rendered |
-| v0.9 | **Tiled export** for large worlds, and a world/detail scale split — `worldSize` is the extent, `size` is sample density, and the simulation passes measure in world units so refining the grid converges instead of reshaping the terrain |
+| v0.9 | **Tiled export** for large worlds, a **curve editor** in both apps, and a world/detail scale split — `worldSize` is the extent, `size` is sample density, and the simulation passes measure in world units so refining the grid converges instead of reshaping the terrain |
 | throughout | LOD preview meshing (decouples simulation resolution from preview cost, so grids can exceed 512), parameter sanitization, exception-safe C boundary with `titan_last_error`, canonical engine-side seed hashing and band curves, mass-balance and height-range introspection |
 
 Test coverage grew from ~17 checks to 51 test functions — 213 assertions —
@@ -45,7 +45,7 @@ as a to-do.
 | # | Feature | Present In | Priority | Status |
 |---|---------|-----------|----------|--------|
 | 6 | Clamp / clip heights | WM2 (Clamp), Houdini (Clip), Gaea (Clamp, Clip) | Medium | ✅ v0.5 — `titan_apply_clamp` |
-| 7 | Curves / height remap (custom transfer function) | WM2 (Curves), Houdini (Remap), Gaea (Curve, Recurve, Shaper) | High | ✅ v0.5 — monotone-cubic control points; 5-point layer (web), presets (macOS) |
+| 7 | Curves / height remap (custom transfer function) | WM2 (Curves), Houdini (Remap), Gaea (Curve, Recurve, Shaper) | High | ✅ v0.5 engine; v0.9 draggable editor in both apps, up to 12 points, previewed from the engine's own sampler |
 | 8 | Blur / smooth | Houdini (Blur), Gaea (Blur, Median, SlopeBlur, VariableBlur) | High | ✅ v0.5 — `titan_apply_blur` (masked = SlopeBlur-style workflows) |
 | 9 | Sharpen | Gaea (Sharpen) | Medium | ✅ v0.5 — `titan_apply_sharpen` (unsharp mask) |
 | 10 | Simple transform (scale vertical, offset, invert) | WM2 (Simple Transform), Gaea (Adjust, Autolevel, Flip) | High | ✅ v0.5 — `titan_apply_transform` |

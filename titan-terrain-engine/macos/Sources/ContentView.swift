@@ -533,6 +533,11 @@ struct ContentView: View {
         return VStack(alignment: .leading, spacing: 8) {
             layerHeader(layer, def: def, index: index)
             Text(def.blurb).font(.system(size: 8.5)).foregroundStyle(.secondary)
+            if layer.kind == .curve {
+                CurveEditorView(points: layer.curve ?? defaultCurve) { pts in
+                    model.setLayerCurve(layer.id, pts)
+                }
+            }
             ForEach(def.params.filter { !$0.advanced }, id: \.key) { pd in
                 layerParamRow(layer, pd)
             }

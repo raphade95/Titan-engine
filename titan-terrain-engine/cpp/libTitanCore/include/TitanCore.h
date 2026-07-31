@@ -273,6 +273,12 @@ public:
     // control points in [0,1], applied over the terrain's own height range.
     void ApplyCurve(const float* xs, const float* ys, int count);
 
+    // Samples the same curve ApplyCurve applies, evenly across [0,1]. Static
+    // because it is pure math on the caller's points — the curve editors in
+    // both apps draw with it so a preview can never disagree with the result.
+    static void SampleCurve(const float* xs, const float* ys, int count,
+                            float* out, int samples);
+
     // General combiner / heightfield import: bilinearly resamples a
     // srcSize x srcSize field to the terrain grid, scales samples by
     // heightScale, and blends with the given BlendMode (alpha for Mix).

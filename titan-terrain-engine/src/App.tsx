@@ -43,7 +43,9 @@ import {
 import { TitanCore } from './core/TitanCore';
 import { makeZip } from './core/zip';
 import { TerrainParams, ExportKind } from './core/types';
+import { CurveEditor } from './components/CurveEditor';
 import {
+  CurvePoint,
   ImportedField,
   Layer,
   LAYER_DEFS,
@@ -1302,6 +1304,19 @@ export default function App() {
     setStack(s => s.map(l => (l.id === id ? { ...l, enabled } : l)));
   const setLayerParam = (id: string, key: string, value: number) =>
     setStack(s => s.map(l => (l.id === id ? { ...l, params: { ...l.params, [key]: value } } : l)));
+  const setLayerCurve = (id: string, curve: CurvePoint[]) =>
+    setStack(s => s.map(l => (l.id === id ? { ...l, curve } : l)));
+  // The preview is drawn from the engine's own spline, so it cannot disagree
+  // with what the remap will do. Null before the WASM module is up.
+  const sampleCurve = React.useCallback((pts: CurvePoint[], samples: number) => {
+    const engine = engineRef.current;
+    if (!engine || pts.length < 2) return null;
+    try {
+      return engine.sampleCurve(pts.map(p => p.x), pts.map(p => p.y), samples);
+    } catch {
+      return null;
+    }
+  }, []);
   const setLayerMask = (id: string, patch: Partial<LayerMask>) =>
     setStack(s => s.map(l => (l.id === id ? { ...l, mask: { ...l.mask, ...patch } } : l)));
   const moveLayer = (id: string, dir: -1 | 1) =>
@@ -1950,6 +1965,13 @@ export default function App() {
                         </div>
                         <p className="text-[9px] text-zinc-600 mb-4 leading-relaxed">{def.description}</p>
                         <div className="space-y-4">
+                          {layer.type === 'curve' && (
+                            <CurveEditor
+                              points={layer.curve ?? []}
+                              sample={sampleCurve}
+                              onChange={(pts) => setLayerCurve(layer.id, pts)}
+                            />
+                          )}
                           {def.params.filter(pd => !pd.advanced).map(pd => (
                             <div key={pd.key} className="space-y-2">
                               <div className="flex items-center justify-between">

@@ -24,6 +24,7 @@ xcrun swiftc -O -swift-version 5 \
   Sources/Shaders.swift \
   Sources/Renderer.swift \
   Sources/ContentView.swift \
+  Sources/CurveEditorView.swift \
   ../cpp/build/libTitanCore.a \
   -lc++ \
   -framework SwiftUI -framework MetalKit -framework Metal -framework AppKit \

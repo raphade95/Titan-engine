@@ -277,6 +277,29 @@ export class TitanCore {
     this.module._titan_apply_sharpen(this.handle, radius, strength);
   }
 
+  /**
+   * Samples the remap curve the engine would apply, for previewing it.
+   *
+   * Calls into C++ rather than reimplementing the monotone-cubic spline in
+   * TypeScript (and again in Swift): a curve editor whose preview disagrees
+   * with the result is worse than no editor, and this codebase has already
+   * paid once for the same formula living in three places.
+   */
+  sampleCurve(xs: number[], ys: number[], samples: number): Float32Array {
+    const m = this.module;
+    const n = Math.min(xs.length, ys.length);
+    const ptr = m._malloc(n * 8 + samples * 4);
+    try {
+      m.HEAPF32.set(xs.slice(0, n), ptr >> 2);
+      m.HEAPF32.set(ys.slice(0, n), (ptr >> 2) + n);
+      const outPtr = ptr + n * 8;
+      m._titan_sample_curve(ptr, ptr + n * 4, n, outPtr, samples);
+      return m.HEAPF32.slice(outPtr >> 2, (outPtr >> 2) + samples) as Float32Array;
+    } finally {
+      m._free(ptr);
+    }
+  }
+
   /** Custom transfer curve: control points in [0,1], sorted by x. */
   applyCurve(xs: number[], ys: number[]): void {
     const m = this.module;

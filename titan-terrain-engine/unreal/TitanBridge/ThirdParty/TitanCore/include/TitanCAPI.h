@@ -245,6 +245,13 @@ TITAN_API void titan_apply_sharpen(TitanHandle* handle, float radius, float stre
 TITAN_API void titan_apply_curve(TitanHandle* handle, const float* xs,
                                  const float* ys, int count);
 
+// Samples that same curve evenly across [0,1] into `out` (`samples` floats).
+// No handle: it is pure math on the caller's control points. The curve editors
+// draw with this rather than reimplementing the spline, so a preview cannot
+// disagree with what the remap will do.
+TITAN_API void titan_sample_curve(const float* xs, const float* ys, int count,
+                                  float* out, int samples);
+
 // General combiner / heightfield import: resamples a srcSize x srcSize
 // float field to the terrain grid, scales samples by heightScale, and
 // blends (blendMode as titan_apply_noise; alpha for Mix). Import = clear

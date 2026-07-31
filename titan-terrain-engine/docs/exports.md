@@ -29,8 +29,15 @@ scale.
 
 This split arrived with `.titan` **version 2**. Version 1 files predate it and
 load unchanged: their extent was implicitly their sample count, so the loader
-sets `worldSize = size`, reproducing exactly the terrain the file described. Both
-apps read v1 and v2 and write v2.
+sets `worldSize = size`, reproducing exactly the terrain the file described.
+
+**Version 3** adds arbitrary curve control points (a v2 curve layer carried five
+fixed values, which the loader lifts onto the same x positions they always
+used). Files are stamped with the *minimum* version needed to read them
+correctly, not the newest the writing build knows — a project using no custom
+curve is still a valid v2 and still opens in an older build. A reader refuses a
+file newer than it understands rather than approximating it, because
+reproduction is the whole point of the format.
 
 ### Normalized formats and the real height range
 

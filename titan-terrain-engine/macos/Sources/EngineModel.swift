@@ -31,10 +31,45 @@ func randomSeed() -> String {
 ///
 /// 1 — world extent was implicitly the sample count (engine cellSize 1.0).
 /// 2 — `worldSize` is explicit and `size` is pure sample density.
+/// 3 — curve layers carry arbitrary control points instead of five fixed ones.
 ///
-/// v1 files still load and still reproduce their original terrain: the loader
-/// sets worldSize = size, which is exactly what the old model computed.
-let titanProjectVersion = 2
+/// Old files always load: v1 sets worldSize = size, exactly what the old model
+/// computed, and a v2 curve layer is rebuilt from its y0..y4 params.
+///
+/// A file is stamped with the *minimum* version needed to read it correctly,
+/// not simply the newest this build knows, so a project using no custom curve
+/// still opens in a build that predates them.
+let titanProjectVersion = 3
+
+/// A control point of a height-remap curve. Both axes are 0..1.
+struct CurvePoint: Equatable {
+    var x: Double
+    var y: Double
+}
+
+let defaultCurve: [CurvePoint] = [
+    CurvePoint(x: 0, y: 0), CurvePoint(x: 0.25, y: 0.25), CurvePoint(x: 0.5, y: 0.5),
+    CurvePoint(x: 0.75, y: 0.75), CurvePoint(x: 1, y: 1),
+]
+
+let maxCurvePoints = 12
+
+/// Sorted by x, endpoints pinned, everything inside the unit square.
+func sanitizeCurve(_ raw: [CurvePoint]) -> [CurvePoint]? {
+    guard raw.count >= 2 else { return nil }
+    var pts = raw.prefix(maxCurvePoints).map {
+        CurvePoint(x: min(1, max(0, $0.x)), y: min(1, max(0, $0.y)))
+    }
+    pts.sort { $0.x < $1.x }
+    // The engine's spline assumes strictly increasing x; equal x would divide
+    // by a clamped epsilon and produce a near-vertical segment.
+    pts[0].x = 0
+    pts[pts.count - 1].x = 1
+    for i in 1..<pts.count where pts[i].x <= pts[i - 1].x {
+        pts[i].x = min(1, pts[i - 1].x + 1e-3)
+    }
+    return pts
+}
 
 // Names shared with the web lab's .titan format.
 let noiseTypeNames = ["none", "standard", "ridged", "billow", "voronoi",
@@ -95,6 +130,9 @@ struct TitanLayer: Identifiable {
     var enabled = true
     var params: [String: Double]
     var mask = LayerMask()
+    /// Height-remap control points, for `.curve` layers. The engine has always
+    /// accepted an arbitrary number; the UI offered five fixed sliders.
+    var curve: [CurvePoint]? = nil
 }
 
 struct ParamDef {
@@ -210,14 +248,10 @@ let layerDefs: [LayerKind: LayerDef] = [
         ]),
     .curve: LayerDef(
         label: "Curves",
-        blurb: "Custom height remap through five control points (like Photoshop curves).",
-        params: [
-            ParamDef(key: "y0", label: "Shadows", range: 0...1, step: 0.05, def: 0),
-            ParamDef(key: "y1", label: "Low Mids", range: 0...1, step: 0.05, def: 0.25),
-            ParamDef(key: "y2", label: "Midtones", range: 0...1, step: 0.05, def: 0.5),
-            ParamDef(key: "y3", label: "High Mids", range: 0...1, step: 0.05, def: 0.75),
-            ParamDef(key: "y4", label: "Peaks", range: 0...1, step: 0.05, def: 1),
-        ]),
+        blurb: "Custom height remap over the terrain's own height range, like Photoshop curves. Drag the points; click the curve to add one, double-click a point to remove it.",
+        // No sliders: this layer is edited through the curve widget, which
+        // writes layer.curve. The engine has always taken arbitrary points.
+        params: []),
     .blur: LayerDef(
         label: "Blur",
         blurb: "Smooths the terrain. Pair with a slope mask to soften only the flats.",
@@ -308,7 +342,30 @@ let layerDefs: [LayerKind: LayerDef] = [
 func makeLayer(_ kind: LayerKind) -> TitanLayer {
     var params: [String: Double] = [:]
     for p in layerDefs[kind]!.params { params[p.key] = p.def }
-    return TitanLayer(kind: kind, params: params)
+    var layer = TitanLayer(kind: kind, params: params)
+    if kind == .curve { layer.curve = defaultCurve }
+    return layer
+}
+
+/// Samples the remap curve the engine would apply, for previewing it.
+///
+/// Calls into C++ rather than reimplementing the monotone-cubic spline in
+/// Swift (and again in TypeScript): a curve editor whose preview disagrees
+/// with the result is worse than no editor.
+func sampleCurve(_ points: [CurvePoint], samples: Int) -> [Float] {
+    guard points.count >= 2, samples >= 2 else { return [] }
+    let xs = points.map { Float($0.x) }
+    let ys = points.map { Float($0.y) }
+    var out = [Float](repeating: 0, count: samples)
+    xs.withUnsafeBufferPointer { xb in
+        ys.withUnsafeBufferPointer { yb in
+            out.withUnsafeMutableBufferPointer { ob in
+                titan_sample_curve(xb.baseAddress, yb.baseAddress,
+                                   Int32(points.count), ob.baseAddress, Int32(samples))
+            }
+        }
+    }
+    return out
 }
 
 // ---------------------------------------------------------------------------
@@ -323,10 +380,12 @@ struct Preset: Identifiable {
 }
 
 private func presetLayer(_ kind: LayerKind, _ params: [String: Double],
-                         mask: LayerMask? = nil) -> TitanLayer {
+                         mask: LayerMask? = nil,
+                         curve: [CurvePoint]? = nil) -> TitanLayer {
     var layer = makeLayer(kind)
     for (k, v) in params { layer.params[k] = v }
     if let mask { layer.mask = mask }
+    if let curve { layer.curve = curve }
     return layer
 }
 
@@ -478,6 +537,12 @@ final class EngineModel: ObservableObject {
         stack[i].params[key] = value
     }
 
+    func setLayerCurve(_ id: UUID, _ points: [CurvePoint]) {
+        guard let i = stack.firstIndex(where: { $0.id == id }) else { return }
+        stack[i].curve = points
+        rebuild()
+    }
+
     func setLayerMask(_ id: UUID, _ transformMask: (inout LayerMask) -> Void) {
         guard let i = stack.firstIndex(where: { $0.id == id }) else { return }
         transformMask(&stack[i].mask)
@@ -580,7 +645,12 @@ final class EngineModel: ObservableObject {
                 m.worldSize = 128; m.scale = 1.6; m.heightMultiplier = 55; m.octaves = 5; m.persistence = 0.5
                 m.exponent = 1.0; m.warpStrength = 0.3; m.noiseType = 4; m.biome = 3
                 m.stack = [
-                    presetLayer(.curve, ["y0": 0, "y1": 0.15, "y2": 0.55, "y3": 0.85, "y4": 1]),
+                    // Was five fixed y-values on a quarter grid; same shape.
+                    presetLayer(.curve, [:], curve: [
+                        CurvePoint(x: 0, y: 0), CurvePoint(x: 0.25, y: 0.15),
+                        CurvePoint(x: 0.5, y: 0.55), CurvePoint(x: 0.75, y: 0.85),
+                        CurvePoint(x: 1, y: 1),
+                    ]),
                     presetLayer(.noise, ["noiseType": 0, "blend": 0, "scale": 6, "amplitude": 6,
                                          "octaves": 6, "alpha": 0.5, "seedOffset": 3]),
                     presetLayer(.fluvial, ["passes": 2, "strength": 1.2]),
@@ -804,11 +874,12 @@ final class EngineModel: ObservableObject {
         case .clamp:
             titan_apply_clamp(engine, f("min"), f("max"))
         case .curve:
-            let xs: [Float] = [0, 0.25, 0.5, 0.75, 1]
-            let ys: [Float] = [f("y0"), f("y1"), f("y2"), f("y3"), f("y4")]
+            let pts = (layer.curve?.count ?? 0) >= 2 ? layer.curve! : defaultCurve
+            let xs = pts.map { Float($0.x) }
+            let ys = pts.map { Float($0.y) }
             xs.withUnsafeBufferPointer { xb in
                 ys.withUnsafeBufferPointer { yb in
-                    titan_apply_curve(engine, xb.baseAddress, yb.baseAddress, 5)
+                    titan_apply_curve(engine, xb.baseAddress, yb.baseAddress, Int32(pts.count))
                 }
             }
         case .blur:
@@ -1181,7 +1252,7 @@ final class EngineModel: ObservableObject {
         params["size"] = Int(size)
 
         let stackJSON: [[String: Any]] = stack.map { layer in
-            [
+            var entry: [String: Any] = [
                 "id": layer.id.uuidString,
                 "type": layer.kind.rawValue,
                 "enabled": layer.enabled,
@@ -1189,9 +1260,18 @@ final class EngineModel: ObservableObject {
                 "mask": ["mode": layer.mask.mode, "lo": layer.mask.lo,
                          "hi": layer.mask.hi, "invert": layer.mask.invert],
             ]
+            if let curve = layer.curve, !curve.isEmpty {
+                entry["curve"] = curve.map { ["x": $0.x, "y": $0.y] }
+            }
+            return entry
         }
 
-        var dict: [String: Any] = ["version": titanProjectVersion,
+        // Minimum version a reader needs: a project using no custom curve is
+        // still a valid v2 and still opens in a build that predates them.
+        let usesCustomCurve = stack.contains { $0.kind == .curve && !($0.curve ?? []).isEmpty }
+        let fileVersion = usesCustomCurve ? titanProjectVersion : 2
+
+        var dict: [String: Any] = ["version": fileVersion,
                                    "params": params, "stack": stackJSON]
         if !importedField.isEmpty {
             let bytes = importedField.withUnsafeBufferPointer { Data(buffer: $0) }
@@ -1243,6 +1323,31 @@ final class EngineModel: ObservableObject {
                         layer.params[def.key] = min(def.range.upperBound,
                                                     max(def.range.lowerBound, v))
                     }
+                }
+            }
+            // Curve control points. A v2 file predates them, so its five
+            // fixed y-values are lifted onto the x positions they always used,
+            // reproducing exactly the curve the file described.
+            if kind == .curve {
+                var pts: [CurvePoint] = []
+                if let raw = entry["curve"] as? [[String: Any]] {
+                    for p in raw {
+                        if let x = (p["x"] as? NSNumber)?.doubleValue,
+                           let y = (p["y"] as? NSNumber)?.doubleValue {
+                            pts.append(CurvePoint(x: x, y: y))
+                        }
+                    }
+                }
+                if let cleaned = sanitizeCurve(pts) {
+                    layer.curve = cleaned
+                } else if let params = entry["params"] as? [String: Any] {
+                    let keys = ["y0", "y1", "y2", "y3", "y4"]
+                    let ys = keys.compactMap { (params[$0] as? NSNumber)?.doubleValue }
+                    layer.curve = ys.count == 5
+                        ? zip([0, 0.25, 0.5, 0.75, 1], ys).map { CurvePoint(x: $0, y: min(1, max(0, $1))) }
+                        : defaultCurve
+                } else {
+                    layer.curve = defaultCurve
                 }
             }
             if let mask = entry["mask"] as? [String: Any] {
