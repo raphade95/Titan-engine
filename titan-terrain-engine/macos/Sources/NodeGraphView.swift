@@ -109,8 +109,13 @@ struct NodeGraphDrawer: View {
                 // enclosing VSplitView compresses it past the minHeight set on
                 // the drawer itself — which is what clipped the control strip
                 // off the bottom edge.
+                // 330 is not arbitrary: the search palette is 288pt tall, and
+                // a canvas shorter than that cannot show one without it
+                // scrolling or being clamped against an edge. The node cards
+                // are 96pt, so this also leaves room for two rows of graph
+                // rather than one.
                 GraphCanvas(model: model, selection: $selection, selectedEdge: $selectedEdge)
-                    .frame(minWidth: 420, minHeight: 240)
+                    .frame(minWidth: 420, minHeight: 330)
                 inspector
                     .frame(minWidth: 220, idealWidth: 268, maxWidth: 340)
             }
@@ -313,6 +318,10 @@ struct GraphCanvas: View {
     /// this the canvas was never in the responder chain, so selecting a wire
     /// or a node and pressing Delete did nothing at all.
     @FocusState private var canvasFocused: Bool
+    /// The palette's search field. It opens to be typed into — that is the
+    /// whole point of a search palette — and it was never given focus, so the
+    /// first thing you typed went nowhere and the list stayed unfiltered.
+    @FocusState private var searchFocused: Bool
 
     /// The canvas's own coordinate space: unscaled and unpanned, so a gesture
     /// location converts to graph space through toGraph and nothing else.
@@ -711,6 +720,8 @@ struct GraphCanvas: View {
                 .textFieldStyle(.plain)
                 .font(.system(size: 12))
                 .padding(8)
+                .focused($searchFocused)
+                .onAppear { searchFocused = true }
                 .onSubmit { if let first = matches.first { place(first, at: point, from: connectFrom) } }
             Divider()
             ScrollView {

@@ -87,7 +87,7 @@ struct ContentView: View {
                     .frame(minWidth: 500, maxWidth: .infinity, minHeight: 240, maxHeight: .infinity)
                 if model.graphDrawerOpen {
                     NodeGraphDrawer(model: model)
-                        .frame(minHeight: 280, idealHeight: 380)
+                        .frame(minHeight: 370, idealHeight: 460)
                 }
             }
             .frame(minWidth: 500, maxWidth: .infinity, maxHeight: .infinity)
