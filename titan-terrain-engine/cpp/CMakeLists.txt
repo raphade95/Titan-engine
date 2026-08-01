@@ -58,4 +58,12 @@ if(NOT EMSCRIPTEN)
 
     add_executable(titan_bench tests/bench_core.cpp)
     target_link_libraries(titan_bench PRIVATE TitanCore)
+
+    # The Unreal plugin's engine contract. TitanBridge is the one host CI
+    # cannot compile — no Unreal on a runner — so this replays its generation
+    # path natively and checks everything it assumes about the mesh it gets
+    # back. Runs in every matrix job, because the plugin ships on Mac and
+    # Win64 and a contract that only holds on one of them is not a contract.
+    add_executable(titan_bridge_contract tests/test_bridge_contract.cpp)
+    target_link_libraries(titan_bridge_contract PRIVATE TitanCore)
 endif()

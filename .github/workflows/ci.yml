@@ -33,6 +33,22 @@ jobs:
         run: .\build\Release\titan_tests.exe
         working-directory: titan-terrain-engine/cpp
 
+      # TitanBridge is the one host nothing here can compile — it needs Unreal,
+      # which is not on a runner. The header-sync and library-symbol jobs prove
+      # the plugin is built against current declarations and that everything it
+      # calls still exists; neither notices when a signature holds while the
+      # meaning under it changes. This replays the plugin's generation path and
+      # checks what it assumes about the mesh it gets back.
+      - name: Unreal plugin engine contract (Unix)
+        if: runner.os != 'Windows'
+        run: ./build/titan_bridge_contract
+        working-directory: titan-terrain-engine/cpp
+
+      - name: Unreal plugin engine contract (Windows)
+        if: runner.os == 'Windows'
+        run: .\build\Release\titan_bridge_contract.exe
+        working-directory: titan-terrain-engine/cpp
+
       # The behavioural tests above only prove a platform agrees with itself.
       # These compare against checked-in constants, which is what actually
       # tests the cross-platform seed guarantee. Layer 1 (integer) must match
