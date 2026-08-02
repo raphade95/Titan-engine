@@ -2,6 +2,10 @@
 
 #include "Async/Async.h"
 #include "ProceduralMeshComponent.h"
+#include "Landscape.h"
+#include "LandscapeInfo.h"
+#include "LandscapeProxy.h"
+#include "Engine/World.h"
 #include "TitanBridgeModule.h"
 #include "TitanCAPI.h"
 
@@ -20,6 +24,30 @@ uint32 HashSeed(const FString& Seed)
     const FTCHARToUTF8 Utf8(*Seed);
     return titan_hash_seed(Utf8.Get());
 }
+
+// Landscape geometry is not free-form: a landscape is a whole number of
+// components, each a whole number of subsections, each SubsectionSizeQuads
+// across, and the vertex count is that product plus one. Ask for 300 and you
+// get nothing. 63-quad subsections, two per component, is Unreal's own default
+// and gives 126 quads per component.
+constexpr int32 kSubsectionSizeQuads = 63;
+constexpr int32 kNumSubsections = 2;
+constexpr int32 kQuadsPerComponent = kSubsectionSizeQuads * kNumSubsections;
+
+/** The valid landscape vertex count closest to (and at least) a requested one. */
+int32 LandscapeVertsFor(int32 Requested)
+{
+    const int32 Components = FMath::Max(1, FMath::RoundToInt(
+        static_cast<float>(Requested - 1) / static_cast<float>(kQuadsPerComponent)));
+    return Components * kQuadsPerComponent + 1;
+}
+
+// Landscape stores height as uint16 with 32768 as the zero plane, scaled by
+// LANDSCAPE_ZSCALE (1/128) and then by the actor's Z scale. Spreading the
+// terrain across the full 16-bit range and deriving Z scale from that is what
+// keeps the vertical precision — anchoring to a fixed Z scale instead throws
+// most of the range away on a terrain that does not happen to fill it.
+constexpr float kLandscapeZScale = 1.0f / 128.0f;
 } // namespace
 
 ATitanTerrainActor::ATitanTerrainActor()
@@ -77,6 +105,8 @@ void ATitanTerrainActor::RunGeneration(bool bWithCollision)
     struct FSettings
     {
         int32 Resolution;
+        int32 WorldSize;
+        ETitanOutput Output;
         float Scale, Height, Exponent, Warp, UnitsPerWorldUnit, CellSize;
         int32 Octaves, NoiseType;
         uint32 SeedHash;
@@ -93,8 +123,9 @@ void ATitanTerrainActor::RunGeneration(bool bWithCollision)
     // produced a different place. It also meant the plugin could not
     // reproduce a project from the app unless the app happened to be at
     // World Size == Resolution, against a manifest promising exactly that.
-    S.CellSize = static_cast<float>(FMath::Clamp(WorldSize, 64, 8192))
-               / static_cast<float>(S.Resolution);
+    S.WorldSize = FMath::Clamp(WorldSize, 64, 8192);
+    S.Output = Output;
+    S.CellSize = static_cast<float>(S.WorldSize) / static_cast<float>(S.Resolution);
     S.Scale = Scale;
     S.Height = HeightMultiplier;
     S.Exponent = Exponent;
@@ -130,6 +161,86 @@ void ATitanTerrainActor::RunGeneration(bool bWithCollision)
         if (S.bRivers) { titan_erode_fluvial(Engine, S.RiverPasses, S.RiverStrength); }
         if (S.bDroplets) { titan_erode_hydraulic(Engine, S.DropletCount, S.SpawnMode); }
         if (S.bThermal) { titan_erode_thermal(Engine, S.ThermalPasses, S.Talus, 0.5f); }
+
+        if (S.Output == ETitanOutput::Landscape)
+        {
+            // Read the surface out rather than building a mesh: a landscape
+            // wants a heightfield, and the mesh would be thrown away.
+            const int32 Count = S.Resolution * S.Resolution;
+            TArray<float> Field;
+            Field.SetNumUninitialized(Count);
+            titan_read_height(Engine, Field.GetData(), Count);
+            titan_destroy(Engine);
+
+            TSharedPtr<FTitanHeightField> HF = MakeShared<FTitanHeightField>();
+            HF->VertsPerSide = LandscapeVertsFor(S.Resolution);
+            HF->SubsectionSizeQuads = kSubsectionSizeQuads;
+            HF->NumSubsections = kNumSubsections;
+
+            const int32 V = HF->VertsPerSide;
+            HF->Heights.SetNumUninitialized(V * V);
+
+            float MinH = TNumericLimits<float>::Max();
+            float MaxH = TNumericLimits<float>::Lowest();
+            for (int32 i = 0; i < Count; ++i)
+            {
+                MinH = FMath::Min(MinH, Field[i]);
+                MaxH = FMath::Max(MaxH, Field[i]);
+            }
+            const float RangeH = FMath::Max(MaxH - MinH, KINDA_SMALL_NUMBER);
+
+            // Bilinear resample from the engine's grid onto the landscape's.
+            // The two rarely match: landscape sizes are quantised and the
+            // engine's resolution is not.
+            const float Step = static_cast<float>(S.Resolution - 1)
+                             / static_cast<float>(V - 1);
+            for (int32 y = 0; y < V; ++y)
+            {
+                const float sy = FMath::Min(y * Step, static_cast<float>(S.Resolution - 1));
+                const int32 y0 = FMath::FloorToInt(sy);
+                const int32 y1 = FMath::Min(y0 + 1, S.Resolution - 1);
+                const float fy = sy - y0;
+                for (int32 x = 0; x < V; ++x)
+                {
+                    const float sx = FMath::Min(x * Step, static_cast<float>(S.Resolution - 1));
+                    const int32 x0 = FMath::FloorToInt(sx);
+                    const int32 x1 = FMath::Min(x0 + 1, S.Resolution - 1);
+                    const float fx = sx - x0;
+
+                    const float h = FMath::Lerp(
+                        FMath::Lerp(Field[y0 * S.Resolution + x0], Field[y0 * S.Resolution + x1], fx),
+                        FMath::Lerp(Field[y1 * S.Resolution + x0], Field[y1 * S.Resolution + x1], fx),
+                        fy);
+
+                    // Spread across the whole 16-bit range; the actor's Z
+                    // scale below turns that back into centimetres.
+                    const float Normalized = (h - MinH) / RangeH;
+                    HF->Heights[y * V + x] = static_cast<uint16>(
+                        FMath::Clamp(Normalized * 65535.0f, 0.0f, 65535.0f));
+                }
+            }
+
+            // X and Y: the landscape is V-1 quads across and must cover
+            // WorldSize world units, same as the procedural mesh path.
+            const float SpanCm = static_cast<float>(S.WorldSize) * S.UnitsPerWorldUnit;
+            const float ScaleXY = SpanCm / static_cast<float>(V - 1);
+            // Z: 65535 quantisation steps must come out as the terrain's real
+            // vertical range in centimetres.
+            const float ScaleZ = (RangeH * S.UnitsPerWorldUnit) * 128.0f / 65535.0f;
+            HF->Scale = FVector(ScaleXY, ScaleXY, FMath::Max(ScaleZ, KINDA_SMALL_NUMBER));
+
+            AsyncTask(ENamedThreads::GameThread, [WeakThis, HF, MyGeneration]()
+            {
+                ATitanTerrainActor* Self = WeakThis.Get();
+                if (!Self || Self->GenerationCounter.load() != MyGeneration)
+                {
+                    return;
+                }
+                Self->ApplyLandscape(HF);
+            });
+            return;
+        }
+
         titan_build_mesh(Engine);
 
         const int32 VertexCount = titan_mesh_vertex_count(Engine);
@@ -206,4 +317,87 @@ void ATitanTerrainActor::ApplyMesh(TSharedPtr<FTitanMeshData> Data, bool bWithCo
 
     ProceduralMesh->SetCastShadow(true);
     ProceduralMesh->MarkRenderStateDirty();
+}
+
+void ATitanTerrainActor::ApplyLandscape(TSharedPtr<FTitanHeightField> Field)
+{
+#if WITH_EDITOR
+    if (!Field.IsValid() || Field->VertsPerSide <= 0)
+    {
+        return;
+    }
+
+    UWorld* World = GetWorld();
+    if (!World)
+    {
+        return;
+    }
+
+    // Replace rather than accumulate: regenerating should not leave a stack of
+    // landscapes on top of each other.
+    if (SpawnedLandscape)
+    {
+        SpawnedLandscape->Destroy();
+        SpawnedLandscape = nullptr;
+    }
+    // The procedural mesh is this actor's other output; clear it so the two
+    // are never both standing in the same place.
+    if (ProceduralMesh)
+    {
+        ProceduralMesh->ClearAllMeshSections();
+    }
+
+    const int32 V = Field->VertsPerSide;
+
+    FActorSpawnParameters Params;
+    Params.ObjectFlags = RF_Transactional;
+    ALandscape* Landscape = World->SpawnActor<ALandscape>(
+        GetActorLocation(), GetActorRotation(), Params);
+    if (!Landscape)
+    {
+        UE_LOG(LogTemp, Warning, TEXT("TitanBridge: could not spawn a Landscape actor."));
+        return;
+    }
+
+    Landscape->SetActorRelativeScale3D(Field->Scale);
+
+    // Automatic lighting LOD, the same rule the New Landscape tool uses.
+    Landscape->StaticLightingLOD = FMath::DivideAndRoundUp(
+        FMath::CeilLogTwo((V * V) / (2048 * 2048) + 1), static_cast<uint32>(2));
+
+    // Height data is keyed by edit-layer guid; the invalid guid is the
+    // "no edit layers" key, which is what a plain landscape wants.
+    TMap<FGuid, TArray<uint16>> HeightData;
+    HeightData.Add(FGuid(), Field->Heights);
+    TMap<FGuid, TArray<FLandscapeImportLayerInfo>> MaterialLayers;
+    MaterialLayers.Add(FGuid(), TArray<FLandscapeImportLayerInfo>());
+
+    // A *fresh* guid, not the actor's own. Passing the actor's existing guid
+    // makes Import treat the call as a reimport of a landscape it already
+    // knows, and it quietly produces no components — the actor exists, with
+    // zero bounds and nothing to sculpt.
+    Landscape->Import(
+        FGuid::NewGuid(),
+        0, 0, V - 1, V - 1,
+        Field->NumSubsections,
+        Field->SubsectionSizeQuads,
+        HeightData,
+        nullptr,
+        MaterialLayers,
+        ELandscapeImportAlphamapType::Additive,
+        TArrayView<const FLandscapeLayer>());
+
+    // Without a LandscapeInfo the landscape renders but behaves like a prop:
+    // no sculpting, no layer painting.
+    if (ULandscapeInfo* Info = Landscape->GetLandscapeInfo())
+    {
+        Info->UpdateLayerInfoMap(Landscape);
+    }
+
+    SpawnedLandscape = Landscape;
+#else
+    (void)Field;
+    UE_LOG(LogTemp, Warning,
+           TEXT("TitanBridge: Landscape output is editor only; nothing was built."));
+#endif
 }

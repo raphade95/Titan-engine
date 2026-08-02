@@ -46,9 +46,23 @@ full = spawn("TitanFull", 256)
 half = spawn("TitanHalf", 128)
 check(full is not None and half is not None, "both actors spawn in the editor world")
 
+# A third actor set to Landscape output. It builds a separate ALandscape
+# rather than a mesh section, so it is polled on its own terms below.
+land = spawn("TitanLandscape", 256)
+land.set_editor_property("output", unreal.TitanOutput.LANDSCAPE)
+
 full.generate_terrain()
 half.generate_terrain()
+land.generate_terrain()
 log("[titan-test] generation requested")
+
+
+def landscapes():
+    found = []
+    for actor in unreal.EditorLevelLibrary.get_all_level_actors():
+        if isinstance(actor, unreal.Landscape):
+            found.append(actor)
+    return found
 
 state = {"ticks": 0, "handle": None}
 
@@ -88,6 +102,31 @@ def finish():
         # 4. The terrain has actual relief rather than being a flat plane.
         check(extent.z > 1.0, "terrain has vertical relief",
               "half-height %.0f cm" % extent.z)
+
+        # 5. Landscape output built a real ALandscape, not a mesh.
+        found = landscapes()
+        check(len(found) == 1, "Landscape output spawned one Landscape actor",
+              "found %d: %s" % (len(found),
+                                [a.get_actor_label() for a in found]))
+        if found:
+            ls = found[0]
+            _, ls_extent = ls.get_actor_bounds(False)
+            ls_span = ls_extent.x * 2.0
+            check(abs(ls_span - expected) < expected * 0.05,
+                  "the Landscape covers the same world as the mesh path",
+                  "%.0f cm vs %.0f expected" % (ls_span, expected))
+            check(ls_extent.z > 1.0, "the Landscape has vertical relief",
+                  "half-height %.0f cm" % ls_extent.z)
+            # A landscape with no LandscapeInfo looks correct and behaves like
+            # a prop: no sculpting, no layer painting. Worth asserting.
+            check(ls.get_landscape_actor() is not None,
+                  "the Landscape resolves its own actor (LandscapeInfo exists)")
+        # The mesh on the landscape actor must be cleared, or both outputs
+        # occupy the same space.
+        land_mesh = land.get_editor_property("procedural_mesh")
+        check(land_mesh.get_num_sections() == 0,
+              "the landscape actor's own mesh is cleared",
+              "sections=%d" % land_mesh.get_num_sections())
     except Exception as exc:                                  # noqa: BLE001
         check(False, "test body raised", exc)
 
@@ -103,7 +142,7 @@ def finish():
 
 def poll(delta_seconds):
     state["ticks"] += 1
-    if sections(full) >= 1 and sections(half) >= 1:
+    if sections(full) >= 1 and sections(half) >= 1 and len(landscapes()) >= 1:
         finish()
     elif state["ticks"] > MAX_TICKS:
         check(False, "generation completed within the tick budget",

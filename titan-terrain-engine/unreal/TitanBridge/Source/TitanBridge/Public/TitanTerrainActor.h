@@ -23,6 +23,21 @@ enum class ETitanRainfall : uint8
     Highlands = 1 UMETA(DisplayName = "Highlands")
 };
 
+UENUM(BlueprintType)
+enum class ETitanOutput : uint8
+{
+    /** A procedural mesh on this actor. Fast to regenerate; good for iterating. */
+    ProceduralMesh = 0 UMETA(DisplayName = "Procedural Mesh"),
+    /**
+     * A real Landscape actor. Slower to build and quantised to a valid
+     * landscape size, but it is what the rest of the engine expects terrain to
+     * be: landscape materials and layer painting, foliage, World Partition,
+     * and the sculpt tools all work on it and none of them work on a
+     * procedural mesh. Editor only.
+     */
+    Landscape = 1 UMETA(DisplayName = "Landscape")
+};
+
 /**
  * Deterministic procedural terrain powered by libTitanCore.
  * Same seed + same settings = identical terrain, on Mac and Windows,
@@ -37,6 +52,14 @@ public:
     ATitanTerrainActor();
 
     // --- Base terrain ------------------------------------------------------
+
+    /**
+     * What Generate Terrain builds. Landscape is editor only: it spawns a
+     * separate Landscape actor next to this one, and this actor's own
+     * procedural mesh is cleared.
+     */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Titan|Base")
+    ETitanOutput Output = ETitanOutput::ProceduralMesh;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Titan|Base")
     FString Seed = TEXT("titan");
@@ -173,8 +196,28 @@ private:
         TArray<FColor> VertexColors;
     };
 
+    /**
+     * A heightfield on its way to a Landscape: already resampled to a valid
+     * landscape vertex count and quantised to uint16, because both of those
+     * are worth doing off the game thread.
+     */
+    struct FTitanHeightField
+    {
+        TArray<uint16> Heights;
+        int32 VertsPerSide = 0;
+        int32 SubsectionSizeQuads = 0;
+        int32 NumSubsections = 0;
+        /** Actor scale that makes the quantised data span the intended world. */
+        FVector Scale = FVector::OneVector;
+    };
+
     void RunGeneration(bool bWithCollision);
     void ApplyMesh(TSharedPtr<FTitanMeshData> Data, bool bWithCollision);
+    void ApplyLandscape(TSharedPtr<FTitanHeightField> Field);
+
+    /** The Landscape this actor last built, so regenerating replaces it. */
+    UPROPERTY()
+    TObjectPtr<AActor> SpawnedLandscape;
 
     std::atomic<int32> GenerationCounter{0};
 };

@@ -17,7 +17,11 @@ public class TitanBridge : ModuleRules
             "Core",
             "CoreUObject",
             "Engine",
-            "ProceduralMeshComponent"
+            "ProceduralMeshComponent",
+            // Landscape output. The module is Runtime, but ALandscape::Import
+            // is editor-only, so the landscape path is guarded by WITH_EDITOR
+            // and compiles out of a packaged game.
+            "Landscape"
         });
 
         string ThirdParty = Path.Combine(ModuleDirectory, "..", "..", "ThirdParty", "TitanCore");
