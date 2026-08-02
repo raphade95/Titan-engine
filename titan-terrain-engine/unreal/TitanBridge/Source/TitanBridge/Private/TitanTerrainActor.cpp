@@ -77,7 +77,7 @@ void ATitanTerrainActor::RunGeneration(bool bWithCollision)
     struct FSettings
     {
         int32 Resolution;
-        float Scale, Height, Exponent, Warp, UnitsPerCell;
+        float Scale, Height, Exponent, Warp, UnitsPerWorldUnit, CellSize;
         int32 Octaves, NoiseType;
         uint32 SeedHash;
         bool bRivers; int32 RiverPasses; float RiverStrength;
@@ -86,11 +86,20 @@ void ATitanTerrainActor::RunGeneration(bool bWithCollision)
     };
     FSettings S;
     S.Resolution = FMath::Clamp(Resolution, 64, 1024);
+    // Cell size is world size divided by sample count, exactly as TitanLab
+    // computes it. It used to be hardcoded to 1.0, which silently made
+    // Resolution a world-size control: the terrain's extent was its pixel
+    // count, so raising detail widened the landscape and the same seed
+    // produced a different place. It also meant the plugin could not
+    // reproduce a project from the app unless the app happened to be at
+    // World Size == Resolution, against a manifest promising exactly that.
+    S.CellSize = static_cast<float>(FMath::Clamp(WorldSize, 64, 8192))
+               / static_cast<float>(S.Resolution);
     S.Scale = Scale;
     S.Height = HeightMultiplier;
     S.Exponent = Exponent;
     S.Warp = WarpStrength;
-    S.UnitsPerCell = UnitsPerCell;
+    S.UnitsPerWorldUnit = UnitsPerWorldUnit;
     S.Octaves = Octaves;
     S.NoiseType = static_cast<int32>(NoiseType);
     S.SeedHash = HashSeed(Seed);
@@ -114,7 +123,7 @@ void ATitanTerrainActor::RunGeneration(bool bWithCollision)
             return;
         }
 
-        titan_configure(Engine, S.Resolution, 1.0f, S.Scale, S.Height, S.SeedHash,
+        titan_configure(Engine, S.Resolution, S.CellSize, S.Scale, S.Height, S.SeedHash,
                         S.Octaves, 0.5f, 2.0f, S.Exponent, S.NoiseType, S.Warp,
                         1.0f, 2.0f, 0.0f, 0.0f);
         titan_generate(Engine);
@@ -139,7 +148,7 @@ void ATitanTerrainActor::RunGeneration(bool bWithCollision)
         Data->Triangles.Reserve(IndexCount);
 
         // Core is Y-up; Unreal is Z-up in centimetres. Swap Y/Z and scale.
-        const float U = S.UnitsPerCell;
+        const float U = S.UnitsPerWorldUnit;
         for (int32 V = 0; V < VertexCount; ++V)
         {
             Data->Vertices.Add(FVector(Positions[V * 3 + 0] * U,

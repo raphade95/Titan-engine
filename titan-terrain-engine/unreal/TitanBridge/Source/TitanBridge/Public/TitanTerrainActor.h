@@ -41,10 +41,26 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Titan|Base")
     FString Seed = TEXT("titan");
 
-    /** Grid resolution per side (vertices). */
+    /**
+     * Sample density per side. Detail only — this does not change how large
+     * the terrain is. Set World Size for that.
+     */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Titan|Base",
               meta = (ClampMin = 64, ClampMax = 1024))
     int32 Resolution = 256;
+
+    /**
+     * How much world the terrain covers, in Titan world units. This is the
+     * same control as World Size in TitanLab, and it must match the project
+     * you are reproducing: noise is sampled in world space, so a terrain
+     * generated over 128 units is a different landscape from the same seed
+     * generated over 256, at any resolution.
+     *
+     * Multiply by Units Per World Unit to get the size in centimetres.
+     */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Titan|Base",
+              meta = (ClampMin = 64, ClampMax = 8192))
+    int32 WorldSize = 256;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Titan|Base")
     ETitanNoiseType NoiseType = ETitanNoiseType::Ridged;
@@ -72,10 +88,17 @@ public:
               meta = (ClampMin = "0.0", ClampMax = "2.0"))
     float WarpStrength = 0.6f;
 
-    /** Unreal centimetres per terrain cell. */
+    /**
+     * Unreal centimetres per Titan world unit. The actor's terrain ends up
+     * World Size * this across, so the default 256 units at 100 cm is a
+     * 256 m tile.
+     *
+     * Named per cell before World Size existed, when a cell was a world unit
+     * by accident of the two being locked together.
+     */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Titan|Base",
               meta = (ClampMin = "10.0", ClampMax = "10000.0"))
-    float UnitsPerCell = 100.0f;
+    float UnitsPerWorldUnit = 100.0f;
 
     // --- Simulation stack (runs in order) ----------------------------------
 

@@ -35,12 +35,17 @@ void Check(bool condition, const char* label) {
 // The plugin's own defaults, from TitanTerrainActor.h.
 struct PluginDefaults {
     int   resolution   = 256;
+    int   worldSize    = 256;
     float scale        = 2.5f;
     float height       = 70.0f;
     int   octaves      = 8;
     float exponent     = 1.1f;
     float warp         = 0.6f;
-    float unitsPerCell = 100.0f;
+    float unitsPerWorldUnit = 100.0f;
+
+    float cellSize() const {
+        return static_cast<float>(worldSize) / static_cast<float>(resolution);
+    }
     int   noiseType    = 2;      // ETitanNoiseType::Ridged
     int   riverPasses  = 3;
     float riverStrength = 1.2f;
@@ -60,12 +65,7 @@ int main() {
     if (!engine) return 1;
 
     // --- the plugin's exact call sequence ---------------------------------
-    //
-    // Note the 1.0f cell size: that is what the plugin passes today. It is
-    // transcribed rather than corrected, because this file's job is to
-    // describe what the shipped plugin does. See the world-model note in
-    // docs/unreal.md.
-    titan_configure(engine, P.resolution, 1.0f, P.scale, P.height,
+    titan_configure(engine, P.resolution, P.cellSize(), P.scale, P.height,
                     titan_hash_seed("titan"), P.octaves, 0.5f, 2.0f,
                     P.exponent, P.noiseType, P.warp, 1.0f, 2.0f, 0.0f, 0.0f);
     titan_generate(engine);
@@ -184,21 +184,46 @@ int main() {
 
     // --- world scale -------------------------------------------------------
     //
-    // The plugin multiplies positions by UnitsPerCell to get centimetres. The
-    // engine's own extent is size * cellSize, so with the cell size the plugin
-    // passes, one core unit is one cell and the terrain spans
-    // resolution * UnitsPerCell cm. Assert the mesh actually matches that, so
-    // a change to the engine's mesh extent cannot silently rescale a level.
+    // The engine's extent is size * cellSize, which is World Size by
+    // construction, and the plugin multiplies by UnitsPerWorldUnit to get
+    // centimetres. So the terrain must span WorldSize * UnitsPerWorldUnit
+    // regardless of resolution — that independence is the whole point of the
+    // cell-size fix, and asserting the span here is what stops it regressing.
     float minX = positions[0], maxX = positions[0];
     for (int v = 0; v < vertexCount; ++v) {
         minX = std::min(minX, positions[v * 3 + 0]);
         maxX = std::max(maxX, positions[v * 3 + 0]);
     }
-    const float span = (maxX - minX) * P.unitsPerCell;
-    const float expected = static_cast<float>(P.resolution) * P.unitsPerCell;
+    const float span = (maxX - minX) * P.unitsPerWorldUnit;
+    const float expected = static_cast<float>(P.worldSize) * P.unitsPerWorldUnit;
     std::printf("        terrain spans %.0f cm, expected about %.0f cm\n", span, expected);
     Check(std::fabs(span - expected) < expected * 0.05f,
-          "the mesh spans resolution * UnitsPerCell centimetres");
+          "the mesh spans WorldSize * UnitsPerWorldUnit centimetres");
+
+    // And the independence itself: the same world size at half the sample
+    // density must cover the same ground. Under the old hardcoded cell size
+    // this failed by a factor of two, silently, which is what made Resolution
+    // a world-size control.
+    TitanHandle* coarse = titan_create();
+    PluginDefaults C;
+    C.resolution = P.resolution / 2;
+    titan_configure(coarse, C.resolution, C.cellSize(), C.scale, C.height,
+                    titan_hash_seed("titan"), C.octaves, 0.5f, 2.0f,
+                    C.exponent, C.noiseType, C.warp, 1.0f, 2.0f, 0.0f, 0.0f);
+    titan_generate(coarse);
+    titan_build_mesh(coarse);
+    const int coarseCount = titan_mesh_vertex_count(coarse);
+    const float* coarsePos = titan_mesh_positions_ptr(coarse);
+    float cMin = coarsePos[0], cMax = coarsePos[0];
+    for (int v = 0; v < coarseCount; ++v) {
+        cMin = std::min(cMin, coarsePos[v * 3 + 0]);
+        cMax = std::max(cMax, coarsePos[v * 3 + 0]);
+    }
+    const float coarseSpan = (cMax - cMin) * C.unitsPerWorldUnit;
+    std::printf("        half resolution spans %.0f cm\n", coarseSpan);
+    Check(std::fabs(coarseSpan - span) < span * 0.05f,
+          "halving Resolution changes detail, not how much world is covered");
+    titan_destroy(coarse);
 
     titan_destroy(engine);
 
