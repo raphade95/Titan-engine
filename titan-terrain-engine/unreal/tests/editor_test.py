@@ -26,6 +26,23 @@ def check(ok, label, detail=""):
     log("[titan-test] %s  %s %s" % ("PASS" if ok else "FAIL", label, detail))
 
 
+# Start from an empty level, not whatever the editor opens by default.
+#
+# This cost a whole debugging session: the default startup map is an Open
+# World template that already contains a Landscape actor, so the landscape
+# assertions below were measuring the template's terrain and reporting
+# failures that had nothing to do with the plugin. A test that inherits an
+# unknown world is not testing what it thinks it is.
+try:
+    subsystem = unreal.get_editor_subsystem(unreal.LevelEditorSubsystem)
+    made = subsystem.new_level("/Game/TitanEditorTestMap")
+    check(bool(made), "started from a new empty level")
+except Exception as exc:                                          # noqa: BLE001
+    check(False, "started from a new empty level", exc)
+
+pre_existing = None  # filled in once landscapes() is defined
+
+
 def spawn(name, resolution):
     actor = unreal.EditorLevelLibrary.spawn_actor_from_class(
         unreal.TitanTerrainActor, unreal.Vector(0.0, 0.0, 0.0))
@@ -42,6 +59,18 @@ def spawn(name, resolution):
     return actor
 
 
+def landscapes():
+    found = []
+    for actor in unreal.EditorLevelLibrary.get_all_level_actors():
+        if isinstance(actor, unreal.Landscape):
+            found.append(actor)
+    return found
+
+
+pre_existing = len(landscapes())
+check(pre_existing == 0, "the level starts with no Landscape actors",
+      "found %d" % pre_existing)
+
 full = spawn("TitanFull", 256)
 half = spawn("TitanHalf", 128)
 check(full is not None and half is not None, "both actors spawn in the editor world")
@@ -57,12 +86,13 @@ land.generate_terrain()
 log("[titan-test] generation requested")
 
 
-def landscapes():
-    found = []
-    for actor in unreal.EditorLevelLibrary.get_all_level_actors():
-        if isinstance(actor, unreal.Landscape):
-            found.append(actor)
-    return found
+def spawned_landscape():
+    """The landscape the plugin itself recorded — authoritative about whether
+    ApplyLandscape ran at all, as opposed to what happens to be in the world."""
+    try:
+        return land.get_editor_property("spawned_landscape")
+    except Exception:                                             # noqa: BLE001
+        return None
 
 state = {"ticks": 0, "handle": None}
 
@@ -104,12 +134,16 @@ def finish():
               "half-height %.0f cm" % extent.z)
 
         # 5. Landscape output built a real ALandscape, not a mesh.
+        # Ask the plugin what it built, rather than inferring from the world.
+        mine = spawned_landscape()
+        check(mine is not None,
+              "ApplyLandscape ran and recorded a Landscape actor")
         found = landscapes()
-        check(len(found) == 1, "Landscape output spawned one Landscape actor",
+        check(len(found) == 1, "exactly one Landscape actor exists",
               "found %d: %s" % (len(found),
                                 [a.get_actor_label() for a in found]))
-        if found:
-            ls = found[0]
+        if mine is not None:
+            ls = mine
             _, ls_extent = ls.get_actor_bounds(False)
             ls_span = ls_extent.x * 2.0
             check(abs(ls_span - expected) < expected * 0.05,
@@ -142,7 +176,8 @@ def finish():
 
 def poll(delta_seconds):
     state["ticks"] += 1
-    if sections(full) >= 1 and sections(half) >= 1 and len(landscapes()) >= 1:
+    if (sections(full) >= 1 and sections(half) >= 1
+            and spawned_landscape() is not None):
         finish()
     elif state["ticks"] > MAX_TICKS:
         check(False, "generation completed within the tick budget",

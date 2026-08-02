@@ -215,8 +215,17 @@ private:
     void ApplyMesh(TSharedPtr<FTitanMeshData> Data, bool bWithCollision);
     void ApplyLandscape(TSharedPtr<FTitanHeightField> Field);
 
-    /** The Landscape this actor last built, so regenerating replaces it. */
-    UPROPERTY()
+    /**
+     * The Landscape this actor last built, so regenerating replaces it rather
+     * than stacking a new one on top.
+     *
+     * Visible rather than a bare UPROPERTY: a bare one is invisible to
+     * Blueprint and to Python, so neither the editor test nor a user could ask
+     * the actor what it had produced — which read as "the landscape was never
+     * built" when it had been.
+     */
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Titan",
+              meta = (AllowPrivateAccess = "true"))
     TObjectPtr<AActor> SpawnedLandscape;
 
     std::atomic<int32> GenerationCounter{0};
