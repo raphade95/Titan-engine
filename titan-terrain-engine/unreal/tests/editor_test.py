@@ -16,6 +16,9 @@ RESULT = os.environ.get("TITAN_TEST_RESULT", "/tmp/TitanEditorTest/result.json")
 CM_PER_UNIT = 100.0
 WORLD_SIZE = 256
 MAX_TICKS = 1800          # generous; erosion at 256 takes a moment
+HERE = os.path.dirname(os.path.abspath(__file__))
+FIXTURE = os.path.join(HERE, "fixtures", "alpine.titan")
+FIXTURE_V4 = os.path.join(HERE, "fixtures", "graph_v4.titan")
 
 log = unreal.log
 results = {"checks": [], "done": False}
@@ -155,6 +158,48 @@ def finish():
             # a prop: no sculpting, no layer painting. Worth asserting.
             check(ls.get_landscape_actor() is not None,
                   "the Landscape resolves its own actor (LandscapeInfo exists)")
+        # 6. .titan import. A real project saved out of TitanLab, not a
+        #    hand-written approximation of the schema — the point is to catch
+        #    the format drifting away from this reader.
+        imp = unreal.EditorLevelLibrary.spawn_actor_from_class(
+            unreal.TitanTerrainActor, unreal.Vector(0.0, 0.0, 0.0))
+        imp.set_actor_label("TitanImported")
+        imp.set_editor_property("project_file", unreal.FilePath(FIXTURE))
+        imp.import_project()
+        report = imp.get_editor_property("import_report")
+        check(report.startswith("Imported v2"),
+              "the project imports and reports what it did", report)
+        check(imp.get_editor_property("seed") == "wvcwvqj",
+              "seed came across", imp.get_editor_property("seed"))
+        check(imp.get_editor_property("resolution") == 128,
+              "resolution came across",
+              imp.get_editor_property("resolution"))
+        check(imp.get_editor_property("world_size") == 128,
+              "world size came across",
+              imp.get_editor_property("world_size"))
+        check(imp.get_editor_property("noise_type") == unreal.TitanNoiseType.RIDGED,
+              "noise structure mapped from its name")
+        check(imp.get_editor_property("octaves") == 8, "octaves came across")
+        # The fixture's stack is fluvial + hydraulic + thermal, so all three
+        # toggles must be on and none reported as skipped.
+        check(imp.get_editor_property("river_networks")
+              and imp.get_editor_property("hydraulic_erosion")
+              and imp.get_editor_property("thermal_weathering"),
+              "all three erosion layers were recognised")
+        check("not reproduced" not in report,
+              "nothing in this project was silently dropped", report)
+        # 65536 iterations / 16384 per round = 4.
+        check(imp.get_editor_property("droplet_rounds") == 4,
+              "hydraulic iterations converted to rounds",
+              imp.get_editor_property("droplet_rounds"))
+
+        # A v4 file is graph-driven and must be refused, not approximated.
+        imp.set_editor_property("project_file", unreal.FilePath(FIXTURE_V4))
+        imp.import_project()
+        v4 = imp.get_editor_property("import_report")
+        check("failed" in v4.lower() and "node graph" in v4.lower(),
+              "a graph-driven v4 project is refused with a reason", v4)
+
         # The mesh on the landscape actor must be cleared, or both outputs
         # occupy the same space.
         land_mesh = land.get_editor_property("procedural_mesh")

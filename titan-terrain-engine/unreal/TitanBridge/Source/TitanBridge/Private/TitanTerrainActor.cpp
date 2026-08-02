@@ -6,6 +6,11 @@
 #include "LandscapeInfo.h"
 #include "LandscapeProxy.h"
 #include "Engine/World.h"
+#include "Misc/FileHelper.h"
+#include "Misc/Paths.h"
+#include "Serialization/JsonReader.h"
+#include "Serialization/JsonSerializer.h"
+#include "Dom/JsonObject.h"
 #include "TitanBridgeModule.h"
 #include "TitanCAPI.h"
 
@@ -400,4 +405,196 @@ void ATitanTerrainActor::ApplyLandscape(TSharedPtr<FTitanHeightField> Field)
     UE_LOG(LogTemp, Warning,
            TEXT("TitanBridge: Landscape output is editor only; nothing was built."));
 #endif
+}
+
+// ---------------------------------------------------------------------------
+// TitanLab project import
+// ---------------------------------------------------------------------------
+
+void ATitanTerrainActor::ImportProject()
+{
+    ImportReport.Empty();
+    TArray<FString> Notes;
+    auto Fail = [&](const FString& Why)
+    {
+        ImportReport = FString::Printf(TEXT("Import failed: %s"), *Why);
+        UE_LOG(LogTemp, Warning, TEXT("TitanBridge: %s"), *ImportReport);
+    };
+
+    const FString Path = ProjectFile.FilePath;
+    if (Path.IsEmpty())
+    {
+        Fail(TEXT("no project file set."));
+        return;
+    }
+
+    FString Resolved = Path;
+    if (FPaths::IsRelative(Resolved))
+    {
+        Resolved = FPaths::ConvertRelativePathToFull(FPaths::ProjectDir(), Resolved);
+    }
+
+    FString Text;
+    if (!FFileHelper::LoadFileToString(Text, *Resolved))
+    {
+        Fail(FString::Printf(TEXT("could not read '%s'."), *Resolved));
+        return;
+    }
+
+    TSharedPtr<FJsonObject> Root;
+    const TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(Text);
+    if (!FJsonSerializer::Deserialize(Reader, Root) || !Root.IsValid())
+    {
+        Fail(TEXT("the file is not valid JSON."));
+        return;
+    }
+
+    // Version is a minimum-reader rule, not a stamp of what wrote the file:
+    // refusing a version this build cannot honour is the point of it. A v4
+    // file is graph-driven, and a graph is macOS-only — there is nothing here
+    // that could reproduce it, and approximating it would be worse than
+    // saying so.
+    const int32 Version = static_cast<int32>(Root->GetNumberField(TEXT("version")));
+    if (Version >= 4)
+    {
+        Fail(FString::Printf(
+            TEXT("this project is v%d — its terrain is made by a node graph, which "
+                 "this plugin cannot evaluate. Bake the graph to a layer stack in "
+                 "TitanLab and save again."), Version));
+        return;
+    }
+
+    const TSharedPtr<FJsonObject>* Params = nullptr;
+    if (!Root->TryGetObjectField(TEXT("params"), Params) || !Params)
+    {
+        Fail(TEXT("the file has no params block."));
+        return;
+    }
+
+    // --- base terrain: this part reproduces exactly ------------------------
+    const TSharedPtr<FJsonObject>& P = *Params;
+    P->TryGetStringField(TEXT("seed"), Seed);
+
+    double Number = 0.0;
+    if (P->TryGetNumberField(TEXT("size"), Number))
+    {
+        Resolution = FMath::Clamp(static_cast<int32>(Number), 64, 1024);
+    }
+    if (P->TryGetNumberField(TEXT("worldSize"), Number))
+    {
+        WorldSize = FMath::Clamp(static_cast<int32>(Number), 64, 8192);
+    }
+    if (P->TryGetNumberField(TEXT("scale"), Number))            { Scale = Number; }
+    if (P->TryGetNumberField(TEXT("heightMultiplier"), Number)) { HeightMultiplier = Number; }
+    if (P->TryGetNumberField(TEXT("octaves"), Number))          { Octaves = static_cast<int32>(Number); }
+    if (P->TryGetNumberField(TEXT("exponent"), Number))         { Exponent = Number; }
+    if (P->TryGetNumberField(TEXT("warpStrength"), Number))     { WarpStrength = Number; }
+
+    // TitanLab stores the structure by name. Only the four this actor exposes
+    // can be honoured; the rest are real engine noise types with no property
+    // here, so say so rather than quietly substituting one.
+    FString NoiseName;
+    if (P->TryGetStringField(TEXT("noiseType"), NoiseName))
+    {
+        if (NoiseName == TEXT("none"))          { NoiseType = ETitanNoiseType::Flat; }
+        else if (NoiseName == TEXT("standard")) { NoiseType = ETitanNoiseType::Simplex; }
+        else if (NoiseName == TEXT("ridged"))   { NoiseType = ETitanNoiseType::Ridged; }
+        else if (NoiseName == TEXT("billow"))   { NoiseType = ETitanNoiseType::Billow; }
+        else
+        {
+            Notes.Add(FString::Printf(
+                TEXT("noise structure '%s' has no equivalent here; left as-is"),
+                *NoiseName));
+        }
+    }
+
+    // Persistence and lacunarity are fixed at 0.5 / 2.0 in this plugin's
+    // configure call, so a project that moved them will not reproduce.
+    double Persistence = 0.5, Lacunarity = 2.0;
+    P->TryGetNumberField(TEXT("persistence"), Persistence);
+    P->TryGetNumberField(TEXT("lacunarity"), Lacunarity);
+    if (!FMath::IsNearlyEqual(static_cast<float>(Persistence), 0.5f, 1e-3f)
+        || !FMath::IsNearlyEqual(static_cast<float>(Lacunarity), 2.0f, 1e-3f))
+    {
+        Notes.Add(FString::Printf(
+            TEXT("persistence %.2f / lacunarity %.2f cannot be set here (fixed at 0.5 / 2.0)"),
+            Persistence, Lacunarity));
+    }
+
+    // --- the stack: partly ------------------------------------------------
+    //
+    // This actor has three erosion toggles; TitanLab has an ordered stack of
+    // any length. Matching by kind is the honest subset — it cannot preserve
+    // ordering, repeats, masks or per-layer curves, so anything it cannot
+    // carry is listed rather than dropped in silence.
+    bRiverNetworks = false;
+    bHydraulicErosion = false;
+    bThermalWeathering = false;
+
+    int32 Recognised = 0;
+    TArray<FString> Skipped;
+    const TArray<TSharedPtr<FJsonValue>>* Stack = nullptr;
+    if (Root->TryGetArrayField(TEXT("stack"), Stack) && Stack)
+    {
+        for (const TSharedPtr<FJsonValue>& Entry : *Stack)
+        {
+            const TSharedPtr<FJsonObject> Layer = Entry->AsObject();
+            if (!Layer.IsValid()) { continue; }
+            if (!Layer->GetBoolField(TEXT("enabled"))) { continue; }
+
+            const FString Type = Layer->GetStringField(TEXT("type"));
+            const TSharedPtr<FJsonObject>* LP = nullptr;
+            Layer->TryGetObjectField(TEXT("params"), LP);
+
+            auto Param = [&](const TCHAR* Key, double Fallback) -> double
+            {
+                double Out = Fallback;
+                if (LP && (*LP)->TryGetNumberField(Key, Out)) { return Out; }
+                return Fallback;
+            };
+
+            if (Type == TEXT("fluvial"))
+            {
+                bRiverNetworks = true;
+                RiverPasses = FMath::Clamp(static_cast<int32>(Param(TEXT("passes"), 3)), 1, 12);
+                RiverStrength = Param(TEXT("strength"), 1.2);
+                ++Recognised;
+            }
+            else if (Type == TEXT("hydraulic"))
+            {
+                bHydraulicErosion = true;
+                const int32 Iterations = static_cast<int32>(Param(TEXT("iterations"), 65536));
+                DropletRounds = FMath::Clamp(FMath::RoundToInt(Iterations / 16384.0f), 1, 16);
+                ++Recognised;
+            }
+            else if (Type == TEXT("thermal"))
+            {
+                bThermalWeathering = true;
+                ThermalPasses = FMath::Clamp(static_cast<int32>(Param(TEXT("passes"), 12)), 1, 50);
+                TalusAngle = Param(TEXT("talusAngle"), 35.0);
+                ++Recognised;
+            }
+            else
+            {
+                Skipped.AddUnique(Type);
+            }
+        }
+    }
+
+    if (Skipped.Num() > 0)
+    {
+        Notes.Add(FString::Printf(TEXT("%d layer kind(s) not reproduced: %s"),
+                                  Skipped.Num(), *FString::Join(Skipped, TEXT(", "))));
+    }
+
+    ImportReport = FString::Printf(TEXT("Imported v%d: base terrain, %d erosion layer(s)."),
+                                   Version, Recognised);
+    if (Notes.Num() > 0)
+    {
+        ImportReport += FString::Printf(TEXT(" Not carried over: %s."),
+                                        *FString::Join(Notes, TEXT("; ")));
+    }
+    UE_LOG(LogTemp, Log, TEXT("TitanBridge: %s"), *ImportReport);
+
+    GenerateTerrain();
 }

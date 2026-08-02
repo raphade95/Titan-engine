@@ -180,6 +180,30 @@ public:
     UFUNCTION(CallInEditor, BlueprintCallable, Category = "Titan")
     void FinalizeCollision();
 
+    // --- TitanLab project ---------------------------------------------------
+
+    /** A .titan project saved from TitanLab. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Titan|Project",
+              meta = (FilePathFilter = "titan", RelativeToGameDir))
+    FFilePath ProjectFile;
+
+    /**
+     * Loads Project File into this actor's settings and regenerates.
+     *
+     * Reproduces the project's base terrain exactly — seed, world size, noise
+     * structure and shape are all carried across. The layer stack is only
+     * partly understood: this actor has three erosion toggles where TitanLab
+     * has an ordered stack of any length, so erosion layers are matched to
+     * those toggles and everything else is reported as skipped rather than
+     * silently dropped. Import Report says exactly what happened.
+     */
+    UFUNCTION(CallInEditor, BlueprintCallable, Category = "Titan|Project")
+    void ImportProject();
+
+    /** What the last import did, including anything it could not reproduce. */
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Titan|Project")
+    FString ImportReport;
+
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Titan")
     TObjectPtr<UProceduralMeshComponent> ProceduralMesh;
 

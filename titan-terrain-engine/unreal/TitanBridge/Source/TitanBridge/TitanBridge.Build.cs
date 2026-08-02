@@ -21,7 +21,9 @@ public class TitanBridge : ModuleRules
             // Landscape output. The module is Runtime, but ALandscape::Import
             // is editor-only, so the landscape path is guarded by WITH_EDITOR
             // and compiles out of a packaged game.
-            "Landscape"
+            "Landscape",
+            // .titan project import
+            "Json"
         });
 
         string ThirdParty = Path.Combine(ModuleDirectory, "..", "..", "ThirdParty", "TitanCore");

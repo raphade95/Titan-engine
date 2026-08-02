@@ -1,0 +1,80 @@
+{
+  "params" : {
+    "biome" : "temperate",
+    "exponent" : 1.1000000000000001,
+    "heightMultiplier" : 70,
+    "lacunarity" : 2,
+    "noiseType" : "ridged",
+    "octaves" : 8,
+    "persistence" : 0.5,
+    "scale" : 2.5,
+    "seed" : "wvcwvqj",
+    "size" : 128,
+    "warpStrength" : 0.59999999999999998,
+    "worldSize" : 128
+  },
+  "stack" : [
+    {
+      "enabled" : true,
+      "id" : "C59A74D2-5582-4E63-B372-C319201D5458",
+      "mask" : {
+        "hi" : 1,
+        "invert" : false,
+        "lo" : 0.34999999999999998,
+        "mode" : 0
+      },
+      "params" : {
+        "areaExponent" : 0.5,
+        "depositRatio" : 0.29999999999999999,
+        "erodeConstant" : 0.014999999999999999,
+        "maxStep" : 2,
+        "passes" : 3,
+        "slopeExponent" : 1,
+        "strength" : 1.2
+      },
+      "type" : "fluvial"
+    },
+    {
+      "enabled" : true,
+      "id" : "2B627837-7781-4E5F-8662-AC3CA7821AE7",
+      "mask" : {
+        "hi" : 1,
+        "invert" : false,
+        "lo" : 0.34999999999999998,
+        "mode" : 0
+      },
+      "params" : {
+        "bedrockSpeed" : 0.050000000000000003,
+        "capacity" : 4,
+        "deposit" : 0.10000000000000001,
+        "dissolve" : 0.10000000000000001,
+        "evaporate" : 0.01,
+        "gravity" : 4,
+        "inertia" : 0.10000000000000001,
+        "iterations" : 65536,
+        "lifetime" : 60,
+        "radius" : 3,
+        "spawnMode" : 1
+      },
+      "type" : "hydraulic"
+    },
+    {
+      "enabled" : true,
+      "id" : "EC44AB40-F9E9-4669-9835-E0F3D053F7FF",
+      "mask" : {
+        "hi" : 1,
+        "invert" : false,
+        "lo" : 0.34999999999999998,
+        "mode" : 0
+      },
+      "params" : {
+        "bedrockBreakdown" : 0.050000000000000003,
+        "passes" : 12,
+        "rate" : 0.5,
+        "talusAngle" : 35
+      },
+      "type" : "thermal"
+    }
+  ],
+  "version" : 2
+}
