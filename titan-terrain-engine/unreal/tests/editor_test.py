@@ -167,9 +167,19 @@ def finish():
             ls_origin, _ = ls.get_actor_bounds(False)
             ls_floor = ls_origin.z - ls_extent.z
             mesh_floor = full_origin.z - extent.z
-            check(abs(ls_floor - mesh_floor) < max(200.0, abs(mesh_floor) * 0.1),
-                  "the Landscape sits on the same floor as the mesh, not in the air",
+            check(abs(ls_floor - mesh_floor) < 50.0,
+                  "the Landscape sits on the same floor as the mesh",
                   "landscape floor %.0f cm vs mesh floor %.0f cm" % (ls_floor, mesh_floor))
+            # And that floor is the actor's own Z. Agreeing with each other is
+            # not enough: both used to float by the terrain's own minimum
+            # height, which put a project's base 145 cm above the ground you
+            # placed it on.
+            check(abs(mesh_floor) < 50.0,
+                  "the mesh base lands at the actor's Z, not above it",
+                  "%.0f cm" % mesh_floor)
+            check(abs(ls_floor) < 50.0,
+                  "the Landscape base lands at the actor's Z, not above it",
+                  "%.0f cm" % ls_floor)
             check(ls.get_editor_property("landscape_material") is not None,
                   "the Landscape has a material")
         # 6. .titan import. A real project saved out of TitanLab, not a

@@ -119,8 +119,8 @@ def finish():
             check(extent.z > 1.0, "the WP landscape has vertical relief",
                   "half-height %.0f cm" % extent.z)
             floor = origin.z - extent.z
-            check(abs(floor) < 500.0,
-                  "the WP landscape sits near the actor's floor, not in the air",
+            check(abs(floor) < 50.0,
+                  "the WP landscape's base lands at the actor's Z",
                   "floor %.0f cm" % floor)
             check(ls.get_landscape_actor() is not None,
                   "the WP landscape resolves its LandscapeInfo")

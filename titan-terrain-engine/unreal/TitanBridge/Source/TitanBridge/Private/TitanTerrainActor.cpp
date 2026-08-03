@@ -265,8 +265,13 @@ void ATitanTerrainActor::RunGeneration(bool bWithCollision)
             //
             // Offsetting by that half-range puts the landscape's floor exactly
             // where the mesh's floor is.
-            HF->BaseOffsetCm = static_cast<double>(MinH) * S.UnitsPerWorldUnit
-                             + 32768.0 * kLandscapeZScale * ScaleZ;
+            // Only the 32768-step term. Including MinH here would carry the
+            // terrain's own lowest height as an offset, floating the base
+            // above the actor by however far the engine's minimum happens to
+            // sit above zero — 145 cm on a typical project. The base belongs
+            // at the actor's Z, so the terrain lands on the ground you placed
+            // it on rather than hovering a metre and a half over it.
+            HF->BaseOffsetCm = 32768.0 * kLandscapeZScale * ScaleZ;
 
             AsyncTask(ENamedThreads::GameThread, [WeakThis, HF, MyGeneration]()
             {
@@ -281,6 +286,23 @@ void ATitanTerrainActor::RunGeneration(bool bWithCollision)
         }
 
         titan_build_mesh(Engine);
+
+        // The mesh's floor goes to the actor's Z as well, so the two outputs
+        // agree about where the terrain is. The engine's lowest sample is not
+        // zero — erosion and deposition move both ends of the range — so
+        // writing raw heights left the terrain hovering above its own actor.
+        float MeshMinH = TNumericLimits<float>::Max();
+        {
+            const int32 FieldCount = S.Resolution * S.Resolution;
+            TArray<float> Field;
+            Field.SetNumUninitialized(FieldCount);
+            titan_read_height(Engine, Field.GetData(), FieldCount);
+            for (int32 i = 0; i < FieldCount; ++i)
+            {
+                MeshMinH = FMath::Min(MeshMinH, Field[i]);
+            }
+        }
+        if (!FMath::IsFinite(MeshMinH)) { MeshMinH = 0.0f; }
 
         const int32 VertexCount = titan_mesh_vertex_count(Engine);
         const int32 IndexCount = titan_mesh_index_count(Engine);
@@ -303,7 +325,7 @@ void ATitanTerrainActor::RunGeneration(bool bWithCollision)
         {
             Data->Vertices.Add(FVector(Positions[V * 3 + 0] * U,
                                        Positions[V * 3 + 2] * U,
-                                       Positions[V * 3 + 1] * U));
+                                       (Positions[V * 3 + 1] - MeshMinH) * U));
             Data->Normals.Add(FVector(Normals[V * 3 + 0],
                                       Normals[V * 3 + 2],
                                       Normals[V * 3 + 1]));
