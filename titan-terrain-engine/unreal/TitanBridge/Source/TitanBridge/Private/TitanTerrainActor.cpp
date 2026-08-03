@@ -6,6 +6,8 @@
 #include "LandscapeInfo.h"
 #include "LandscapeProxy.h"
 #include "Engine/World.h"
+#include "Materials/MaterialInterface.h"
+#include "UObject/ConstructorHelpers.h"
 #include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
 #include "Serialization/JsonReader.h"
@@ -62,6 +64,18 @@ ATitanTerrainActor::ATitanTerrainActor()
     ProceduralMesh = CreateDefaultSubobject<UProceduralMeshComponent>(TEXT("TitanMesh"));
     RootComponent = ProceduralMesh;
     ProceduralMesh->bUseAsyncCooking = true;
+
+    // An engine material by default, so generated terrain arrives shaded
+    // instead of as the grey "no material assigned" placeholder. The plugin
+    // declares CanContainContent false and so cannot ship a material of its
+    // own; this is a stand-in the user is expected to replace, which is why
+    // it is an exposed property rather than something applied unconditionally.
+    static ConstructorHelpers::FObjectFinder<UMaterialInterface> DefaultMat(
+        TEXT("/Engine/BasicShapes/BasicShapeMaterial"));
+    if (DefaultMat.Succeeded())
+    {
+        TerrainMaterial = DefaultMat.Object;
+    }
 }
 
 void ATitanTerrainActor::BeginPlay()
@@ -234,6 +248,22 @@ void ATitanTerrainActor::RunGeneration(bool bWithCollision)
             const float ScaleZ = (RangeH * S.UnitsPerWorldUnit) * 128.0f / 65535.0f;
             HF->Scale = FVector(ScaleXY, ScaleXY, FMath::Max(ScaleZ, KINDA_SMALL_NUMBER));
 
+            // Where to put the landscape so it lands where the mesh would.
+            //
+            // A landscape's world Z at sample v is
+            //     ActorZ + (v - 32768) * (1/128) * ScaleZ
+            // so v = 0 — the terrain's lowest point — sits 32768 quantisation
+            // steps BELOW the actor. Spawn at the actor's own Z and the
+            // terrain straddles it: the lower half buried, the upper half
+            // hanging in the air. The mesh path has no such offset because it
+            // writes true heights, so the two outputs disagreed about where
+            // the same terrain was by half its vertical range.
+            //
+            // Offsetting by that half-range puts the landscape's floor exactly
+            // where the mesh's floor is.
+            HF->BaseOffsetCm = static_cast<double>(MinH) * S.UnitsPerWorldUnit
+                             + 32768.0 * kLandscapeZScale * ScaleZ;
+
             AsyncTask(ENamedThreads::GameThread, [WeakThis, HF, MyGeneration]()
             {
                 ATitanTerrainActor* Self = WeakThis.Get();
@@ -320,6 +350,10 @@ void ATitanTerrainActor::ApplyMesh(TSharedPtr<FTitanMeshData> Data, bool bWithCo
         TArray<FProcMeshTangent>(),
         bWithCollision);
 
+    if (TerrainMaterial)
+    {
+        ProceduralMesh->SetMaterial(0, TerrainMaterial);
+    }
     ProceduralMesh->SetCastShadow(true);
     ProceduralMesh->MarkRenderStateDirty();
 }
@@ -356,8 +390,10 @@ void ATitanTerrainActor::ApplyLandscape(TSharedPtr<FTitanHeightField> Field)
 
     FActorSpawnParameters Params;
     Params.ObjectFlags = RF_Transactional;
+    FVector SpawnAt = GetActorLocation();
+    SpawnAt.Z += Field->BaseOffsetCm;
     ALandscape* Landscape = World->SpawnActor<ALandscape>(
-        GetActorLocation(), GetActorRotation(), Params);
+        SpawnAt, GetActorRotation(), Params);
     if (!Landscape)
     {
         UE_LOG(LogTemp, Warning, TEXT("TitanBridge: could not spawn a Landscape actor."));
@@ -365,6 +401,10 @@ void ATitanTerrainActor::ApplyLandscape(TSharedPtr<FTitanHeightField> Field)
     }
 
     Landscape->SetActorRelativeScale3D(Field->Scale);
+    if (TerrainMaterial)
+    {
+        Landscape->LandscapeMaterial = TerrainMaterial;
+    }
 
     // Automatic lighting LOD, the same rule the New Landscape tool uses.
     Landscape->StaticLightingLOD = FMath::DivideAndRoundUp(

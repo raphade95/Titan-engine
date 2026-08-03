@@ -113,7 +113,7 @@ def finish():
 
         # 2. Bounds. This is the cell-size fix, measured where a designer sees
         #    it: the actor must be WorldSize * cm-per-unit across.
-        _, extent = full.get_actor_bounds(False)
+        full_origin, extent = full.get_actor_bounds(False)
         span_x = extent.x * 2.0
         span_y = extent.y * 2.0
         expected = WORLD_SIZE * CM_PER_UNIT
@@ -158,6 +158,20 @@ def finish():
             # a prop: no sculpting, no layer painting. Worth asserting.
             check(ls.get_landscape_actor() is not None,
                   "the Landscape resolves its own actor (LandscapeInfo exists)")
+
+            # Grounding. A landscape's zero plane is sample 32768, so spawning
+            # it at the actor's Z buries the lower half of the terrain and
+            # leaves the upper half in the air. Its floor must line up with the
+            # mesh path's floor, or the same project lands in two different
+            # places depending on which output you picked.
+            ls_origin, _ = ls.get_actor_bounds(False)
+            ls_floor = ls_origin.z - ls_extent.z
+            mesh_floor = full_origin.z - extent.z
+            check(abs(ls_floor - mesh_floor) < max(200.0, abs(mesh_floor) * 0.1),
+                  "the Landscape sits on the same floor as the mesh, not in the air",
+                  "landscape floor %.0f cm vs mesh floor %.0f cm" % (ls_floor, mesh_floor))
+            check(ls.get_editor_property("landscape_material") is not None,
+                  "the Landscape has a material")
         # 6. .titan import. A real project saved out of TitanLab, not a
         #    hand-written approximation of the schema — the point is to catch
         #    the format drifting away from this reader.
@@ -199,6 +213,10 @@ def finish():
         v4 = imp.get_editor_property("import_report")
         check("failed" in v4.lower() and "node graph" in v4.lower(),
               "a graph-driven v4 project is refused with a reason", v4)
+
+        # Terrain must not arrive as the grey no-material placeholder.
+        check(full.get_editor_property("procedural_mesh").get_material(0) is not None,
+              "the procedural mesh has a material")
 
         # The mesh on the landscape actor must be cleared, or both outputs
         # occupy the same space.

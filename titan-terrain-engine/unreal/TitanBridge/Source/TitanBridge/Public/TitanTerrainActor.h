@@ -61,6 +61,18 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Titan|Base")
     ETitanOutput Output = ETitanOutput::ProceduralMesh;
 
+    /**
+     * Material for the generated terrain, applied to whichever output is
+     * used. Defaults to an engine material so terrain arrives shaded rather
+     * than as the grey default-material placeholder.
+     *
+     * The engine writes biome colour into vertex colours; a material that
+     * reads Vertex Color will show it. Landscape output needs a material
+     * built for landscape if you want layer painting.
+     */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Titan|Base")
+    TObjectPtr<UMaterialInterface> TerrainMaterial;
+
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Titan|Base")
     FString Seed = TEXT("titan");
 
@@ -233,6 +245,13 @@ private:
         int32 NumSubsections = 0;
         /** Actor scale that makes the quantised data span the intended world. */
         FVector Scale = FVector::OneVector;
+        /**
+         * Z to spawn the landscape at so its lowest point sits where the
+         * procedural mesh's lowest point would. Landscape treats 32768 as its
+         * zero plane, so without this the terrain straddles the actor —
+         * half of it buried, half in the air.
+         */
+        double BaseOffsetCm = 0.0;
     };
 
     void RunGeneration(bool bWithCollision);
