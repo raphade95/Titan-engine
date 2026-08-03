@@ -73,6 +73,22 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Titan|Base")
     TObjectPtr<UMaterialInterface> TerrainMaterial;
 
+    /**
+     * Landscape components per streaming proxy, in a World Partition world.
+     *
+     * A landscape built as one actor never streams — every component is always
+     * loaded, which is exactly what World Partition exists to avoid. Splitting
+     * it into proxies on a grid is how it becomes streamable. Smaller values
+     * mean more, smaller proxies: finer streaming granularity, more actors.
+     * Four matches Unreal's own New Landscape default.
+     *
+     * Ignored outside World Partition, where there is nothing to stream.
+     */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Titan|Base",
+              meta = (ClampMin = 1, ClampMax = 16,
+                      EditCondition = "Output == ETitanOutput::Landscape"))
+    int32 WorldPartitionGridSize = 4;
+
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Titan|Base")
     FString Seed = TEXT("titan");
 

@@ -5,6 +5,10 @@
 #include "Landscape.h"
 #include "LandscapeInfo.h"
 #include "LandscapeProxy.h"
+#include "LandscapeSubsystem.h"
+#include "LandscapeStreamingProxy.h"
+#include "EngineUtils.h"
+#include "WorldPartition/WorldPartition.h"
 #include "Engine/World.h"
 #include "Materials/MaterialInterface.h"
 #include "UObject/ConstructorHelpers.h"
@@ -434,9 +438,41 @@ void ATitanTerrainActor::ApplyLandscape(TSharedPtr<FTitanHeightField> Field)
 
     // Without a LandscapeInfo the landscape renders but behaves like a prop:
     // no sculpting, no layer painting.
-    if (ULandscapeInfo* Info = Landscape->GetLandscapeInfo())
+    ULandscapeInfo* Info = Landscape->GetLandscapeInfo();
+    if (Info)
     {
         Info->UpdateLayerInfoMap(Landscape);
+    }
+
+    // Split into streaming proxies, or the landscape never streams.
+    //
+    // A landscape imported as a single actor holds every component always
+    // loaded — which is precisely what World Partition exists to avoid, so a
+    // large world built this way pays the cost of WP and gets none of the
+    // benefit. ChangeGridSize is what Unreal's own New Landscape tool calls
+    // for this, and it replaces the one actor with a grid of
+    // ALandscapeStreamingProxy actors that WP can stream in and out.
+    //
+    // Only in a partitioned world: outside one there are no proxies to make
+    // and nothing to stream.
+    ULandscapeSubsystem* Subsystem = World->GetSubsystem<ULandscapeSubsystem>();
+    if (Info && World->GetWorldPartition() != nullptr && Subsystem)
+    {
+        Subsystem->ChangeGridSize(Info, static_cast<uint32>(
+            FMath::Clamp(WorldPartitionGridSize, 1, 16)));
+
+        // Reported, because it is the difference between a world that streams
+        // and one that only looks like it does, and nothing else says so.
+        // Note a landscape smaller than one grid cell correctly yields zero
+        // proxies — there is nothing to split.
+        int32 ProxyCount = 0;
+        for (TActorIterator<ALandscapeStreamingProxy> It(World); It; ++It)
+        {
+            if (It->GetLandscapeActor() == Landscape) { ++ProxyCount; }
+        }
+        UE_LOG(LogTemp, Log,
+               TEXT("TitanBridge: %dx%d landscape split into %d streaming proxies "
+                    "(grid size %d)"), V, V, ProxyCount, WorldPartitionGridSize);
     }
 
     SpawnedLandscape = Landscape;
