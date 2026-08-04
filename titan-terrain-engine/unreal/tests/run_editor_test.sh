@@ -56,6 +56,7 @@ cat > "$WORK/TitanEditorTest.uproject" <<'JSON'
 }
 JSON
 
+
 echo "==> Driving the editor"
 # -ExecCmds rather than the pythonscript commandlet, deliberately. The
 # commandlet runs the script and exits without ticking, and generation
@@ -73,8 +74,10 @@ if [ ! -f "$RESULT" ]; then
     exit 1
 fi
 
-python3 - "$RESULT" <<'PY'
+report() {
+    python3 - "$1" "$2" <<'PY'
 import json, sys
+name = sys.argv[2]
 data = json.load(open(sys.argv[1]))
 failed = 0
 for c in data["checks"]:
@@ -83,7 +86,29 @@ for c in data["checks"]:
     failed += 0 if c["ok"] else 1
 print()
 if failed or not data.get("done"):
-    print("EDITOR TEST FAILED (%d check%s)" % (failed, "" if failed == 1 else "s"))
+    print("%s FAILED (%d check%s)" % (name, failed, "" if failed == 1 else "s"))
     sys.exit(1)
-print("EDITOR TEST PASSED (%d checks)" % len(data["checks"]))
+print("%s PASSED (%d checks)" % (name, len(data["checks"])))
 PY
+}
+
+STATUS=0
+report "$RESULT" "EDITOR TEST" || STATUS=1
+
+# World Partition needs a different world, so it is a separate editor run
+# rather than another phase of the same script.
+echo
+echo "==> Driving the editor (World Partition)"
+WP_RESULT="$WORK/result_wp.json"
+rm -f "$WP_RESULT"
+TITAN_WP_RESULT="$WP_RESULT" "$EDITOR" "$WORK/TitanEditorTest.uproject" \
+    -ExecCmds="py $HERE/editor_test_wp.py" \
+    -unattended -nopause -nosplash -nullrhi -stdout >"$WORK/editor_wp.log" 2>&1
+
+if [ ! -f "$WP_RESULT" ]; then
+    echo "WORLD PARTITION TEST DID NOT REPORT — see $WORK/editor_wp.log" >&2
+    tail -20 "$WORK/editor_wp.log" >&2
+    exit 1
+fi
+report "$WP_RESULT" "WORLD PARTITION TEST" || STATUS=1
+exit $STATUS

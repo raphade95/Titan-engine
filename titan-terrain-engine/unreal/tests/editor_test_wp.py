@@ -22,65 +22,84 @@ MAX_TICKS = 2400
 
 results = {"checks": [], "done": False}
 
+ACTORS = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
+LEVELS = unreal.get_editor_subsystem(unreal.LevelEditorSubsystem)
+
+
 
 def check(ok, label, detail=""):
     results["checks"].append({"ok": bool(ok), "label": label, "detail": str(detail)})
     unreal.log("[titan-wp] %s  %s %s" % ("PASS" if ok else "FAIL", label, detail))
 
 
+def bail(why):
+    check(False, "World Partition level setup succeeded", why)
+    results["done"] = True
+    with open(RESULT, "w") as handle:
+        json.dump(results, handle, indent=2)
+    unreal.log("[titan-wp] ABORTED: %s" % why)
+    os._exit(0)
+
+
 # Open World is Unreal's own World Partition template, so this is the same
 # world shape a customer starts from rather than a hand-rolled approximation.
-made = False
-try:
-    sub = unreal.get_editor_subsystem(unreal.LevelEditorSubsystem)
-    made = sub.new_level_from_template("/Game/TitanWPMap",
-                                       "/Engine/Maps/Templates/OpenWorld")
-except Exception as exc:                                          # noqa: BLE001
-    check(False, "created a World Partition level from the Open World template", exc)
-# Whether this call succeeds is not the requirement — being in a World
-# Partition world is. The editor's own default startup map is the Open World
-# template, so the test lands in a WP world either way; recorded rather than
-# asserted so a False here does not read as a failure of the plugin.
-unreal.log("[titan-wp] new_level_from_template returned %s" % made)
-
-# Confirm the world really is partitioned rather than trusting the template
-# name. WorldDataLayers only exists in a World Partition world, so its
-# presence is the evidence; asking the UWorld for a "world_partition"
-# property is not exposed to Python and quietly reports nothing, which would
-# have made every check below meaningless while still looking like a result.
-data_layers = [a for a in unreal.EditorLevelLibrary.get_all_level_actors()
-               if type(a).__name__ == "WorldDataLayers"]
-check(len(data_layers) > 0,
-      "the level really is World Partition enabled",
-      "WorldDataLayers actors: %d" % len(data_layers))
+# Setup is deferred to ticks for the same reason the main suite defers it:
+# -ExecCmds runs while the editor is still bringing a world up, and on 5.5
+# spawning into a freshly created level asserts inside SpawnActorFromClass.
+G = {}
 
 
 def landscapes():
-    return [a for a in unreal.EditorLevelLibrary.get_all_level_actors()
+    return [a for a in ACTORS.get_all_level_actors()
             if isinstance(a, unreal.Landscape)]
 
 
-baseline = landscapes()
-unreal.log("[titan-wp] template already has %d landscape(s)" % len(baseline))
+def make_level():
+    try:
+        made = LEVELS.new_level_from_template("/Game/TitanWPMap",
+                                              "/Engine/Maps/Templates/OpenWorld")
+    except Exception as exc:                                      # noqa: BLE001
+        bail("new_level_from_template raised: %s" % exc)
+        return
+    if not made:
+        bail("new_level_from_template returned False; refusing to test in "
+             "whatever world the editor happened to open")
+    check(True, "created a World Partition level from the Open World template")
 
-actor = unreal.EditorLevelLibrary.spawn_actor_from_class(
-    unreal.TitanTerrainActor, unreal.Vector(0.0, 0.0, 0.0))
-actor.set_actor_label("TitanWP")
-actor.set_editor_property("resolution", 1024)
-actor.set_editor_property("world_size", WORLD_SIZE)
-actor.set_editor_property("units_per_world_unit", CM_PER_UNIT)
-actor.set_editor_property("hydraulic_erosion", False)
-actor.set_editor_property("river_networks", False)
-actor.set_editor_property("thermal_weathering", False)
-actor.set_editor_property("output", unreal.TitanOutput.LANDSCAPE)
-actor.generate_terrain()
+    # Confirm the world really is partitioned rather than trusting the
+    # template name. WorldDataLayers only exists in a World Partition world,
+    # so its presence is the evidence; asking the UWorld for a
+    # "world_partition" property is not exposed to Python and quietly reports
+    # nothing, which would have made every check below meaningless while
+    # still looking like a result.
+    data_layers = [a for a in ACTORS.get_all_level_actors()
+                   if type(a).__name__ == "WorldDataLayers"]
+    check(len(data_layers) > 0,
+          "the level really is World Partition enabled",
+          "WorldDataLayers actors: %d" % len(data_layers))
+
+
+def make_actor():
+    unreal.log("[titan-wp] template already has %d landscape(s)" % len(landscapes()))
+    a = ACTORS.spawn_actor_from_class(
+        unreal.TitanTerrainActor, unreal.Vector(0.0, 0.0, 0.0))
+    a.set_actor_label("TitanWP")
+    a.set_editor_property("resolution", 1024)
+    a.set_editor_property("world_size", WORLD_SIZE)
+    a.set_editor_property("units_per_world_unit", CM_PER_UNIT)
+    a.set_editor_property("hydraulic_erosion", False)
+    a.set_editor_property("river_networks", False)
+    a.set_editor_property("thermal_weathering", False)
+    a.set_editor_property("output", unreal.TitanOutput.LANDSCAPE)
+    a.generate_terrain()
+    G["actor"] = a
 
 state = {"ticks": 0, "handle": None}
 
 
 def mine():
     try:
-        return actor.get_editor_property("spawned_landscape")
+        return G["actor"].get_editor_property("spawned_landscape")
     except Exception:                                             # noqa: BLE001
         return None
 
@@ -93,7 +112,7 @@ def finish():
             # Once split, the parent landscape's own bounds are legitimately
             # zero: its components have moved out into the proxies. So measure
             # the terrain through whatever actually holds it.
-            parts = [a for a in unreal.EditorLevelLibrary.get_all_level_actors()
+            parts = [a for a in ACTORS.get_all_level_actors()
                      if isinstance(a, unreal.LandscapeStreamingProxy)
                      and a.get_landscape_actor() == ls] or [ls]
             xs_lo = min(a.get_actor_bounds(False)[0].x - a.get_actor_bounds(False)[1].x
@@ -132,7 +151,7 @@ def finish():
             # landscape of its own, and counting every proxy in the level
             # mixes the two — which first showed up as the terrain measuring
             # eight times its own width.
-            proxies = [a for a in unreal.EditorLevelLibrary.get_all_level_actors()
+            proxies = [a for a in ACTORS.get_all_level_actors()
                        if isinstance(a, unreal.LandscapeStreamingProxy)
                        and a.get_landscape_actor() == ls]
             check(len(proxies) > 0,
@@ -166,6 +185,19 @@ def finish():
 
 def poll(delta_seconds):
     state["ticks"] += 1
+    n = state["ticks"]
+    try:
+        if n == 3:
+            make_level()
+            return
+        if n == 10:
+            make_actor()
+            return
+    except Exception as exc:                                      # noqa: BLE001
+        bail("setup raised on tick %d: %s" % (n, exc))
+        return
+    if n < 11:
+        return
     if mine() is not None:
         finish()
     elif state["ticks"] > MAX_TICKS:
