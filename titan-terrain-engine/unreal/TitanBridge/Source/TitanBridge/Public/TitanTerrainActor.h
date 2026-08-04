@@ -200,6 +200,20 @@ public:
     UFUNCTION(CallInEditor, BlueprintCallable, Category = "Titan")
     void GenerateTerrain();
 
+    /**
+     * Generates on the calling thread and applies the result before
+     * returning, instead of dispatching to a worker.
+     *
+     * The editor stalls for the duration, so this is not the button to use
+     * while iterating — GenerateTerrain is. It exists for automation: a
+     * commandlet does not tick, so the game-thread task the async path ends
+     * with never runs there and the terrain never arrives. That is what
+     * blocks the editor test suite on UE 5.5, where spawning an actor from
+     * Python is only possible from a commandlet.
+     */
+    UFUNCTION(CallInEditor, BlueprintCallable, Category = "Titan")
+    void GenerateTerrainNow();
+
     /** Picks a fresh random seed, then regenerates. */
     UFUNCTION(CallInEditor, BlueprintCallable, Category = "Titan")
     void RandomizeSeed();
@@ -270,7 +284,7 @@ private:
         double BaseOffsetCm = 0.0;
     };
 
-    void RunGeneration(bool bWithCollision);
+    void RunGeneration(bool bWithCollision, bool bSynchronous = false);
     void ApplyMesh(TSharedPtr<FTitanMeshData> Data, bool bWithCollision);
     void ApplyLandscape(TSharedPtr<FTitanHeightField> Field);
 

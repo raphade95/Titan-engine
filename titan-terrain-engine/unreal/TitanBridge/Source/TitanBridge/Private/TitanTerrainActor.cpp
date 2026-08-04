@@ -96,6 +96,11 @@ void ATitanTerrainActor::GenerateTerrain()
     RunGeneration(bGenerateCollision);
 }
 
+void ATitanTerrainActor::GenerateTerrainNow()
+{
+    RunGeneration(bGenerateCollision, /*bSynchronous=*/true);
+}
+
 void ATitanTerrainActor::RandomizeSeed()
 {
     const TCHAR Charset[] = TEXT("abcdefghijklmnopqrstuvwxyz0123456789");
@@ -113,7 +118,7 @@ void ATitanTerrainActor::FinalizeCollision()
     RunGeneration(true);
 }
 
-void ATitanTerrainActor::RunGeneration(bool bWithCollision)
+void ATitanTerrainActor::RunGeneration(bool bWithCollision, bool bSynchronous)
 {
     // Refuse to generate against a mismatched engine binary rather than emit
     // terrain from an ABI we cannot trust. StartupModule logs the detail.
@@ -169,7 +174,7 @@ void ATitanTerrainActor::RunGeneration(bool bWithCollision)
 
     TWeakObjectPtr<ATitanTerrainActor> WeakThis(this);
 
-    Async(EAsyncExecution::Thread, [WeakThis, S, MyGeneration, bWithCollision]()
+    auto Work = [WeakThis, S, MyGeneration, bWithCollision, bSynchronous]()
     {
         TitanHandle* Engine = titan_create();
         if (!Engine)
@@ -273,7 +278,7 @@ void ATitanTerrainActor::RunGeneration(bool bWithCollision)
             // it on rather than hovering a metre and a half over it.
             HF->BaseOffsetCm = 32768.0 * kLandscapeZScale * ScaleZ;
 
-            AsyncTask(ENamedThreads::GameThread, [WeakThis, HF, MyGeneration]()
+            auto DeliverLandscape = [WeakThis, HF, MyGeneration]()
             {
                 ATitanTerrainActor* Self = WeakThis.Get();
                 if (!Self || Self->GenerationCounter.load() != MyGeneration)
@@ -281,7 +286,12 @@ void ATitanTerrainActor::RunGeneration(bool bWithCollision)
                     return;
                 }
                 Self->ApplyLandscape(HF);
-            });
+            };
+            // Synchronous callers are already on the game thread, so applying
+            // inline is both correct and the whole point: a commandlet never
+            // pumps the task graph, so a queued task would never run.
+            if (bSynchronous) { DeliverLandscape(); }
+            else { AsyncTask(ENamedThreads::GameThread, MoveTemp(DeliverLandscape)); }
             return;
         }
 
@@ -347,7 +357,7 @@ void ATitanTerrainActor::RunGeneration(bool bWithCollision)
 
         titan_destroy(Engine);
 
-        AsyncTask(ENamedThreads::GameThread, [WeakThis, Data, MyGeneration, bWithCollision]()
+        auto DeliverMesh = [WeakThis, Data, MyGeneration, bWithCollision]()
         {
             ATitanTerrainActor* Self = WeakThis.Get();
             if (!Self || Self->GenerationCounter.load() != MyGeneration)
@@ -355,8 +365,16 @@ void ATitanTerrainActor::RunGeneration(bool bWithCollision)
                 return; // superseded or actor gone
             }
             Self->ApplyMesh(Data, bWithCollision);
-        });
-    });
+        };
+        if (bSynchronous) { DeliverMesh(); }
+        else { AsyncTask(ENamedThreads::GameThread, MoveTemp(DeliverMesh)); }
+    };
+
+    // Inline when asked. GenerateTerrainNow stalls the caller for the whole
+    // pipeline, which is unacceptable while iterating and necessary for
+    // automation — see the comment on that function.
+    if (bSynchronous) { Work(); }
+    else { Async(EAsyncExecution::Thread, MoveTemp(Work)); }
 }
 
 void ATitanTerrainActor::ApplyMesh(TSharedPtr<FTitanMeshData> Data, bool bWithCollision)
