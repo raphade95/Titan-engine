@@ -68,6 +68,16 @@ TITAN_SYNC_RESULT="$SYNC_RESULT" "$EDITOR" "$WORK/TitanEditorTest.uproject" \
     -run=pythonscript -script="$HERE/editor_test_sync.py" \
     -unattended -nopause -nosplash >"$WORK/editor_sync.log" 2>&1
 
+# World Partition, synchronously, on every engine. This one loads Unreal's
+# Open World template rather than creating a level from it — loading is an
+# operation 5.5 tolerates and creating is not — so WP is covered there too.
+echo "==> Driving the editor (World Partition, synchronous)"
+WPSYNC_RESULT="$WORK/result_wp_sync.json"
+rm -f "$WPSYNC_RESULT"
+TITAN_WPSYNC_RESULT="$WPSYNC_RESULT" "$EDITOR" "$WORK/TitanEditorTest.uproject" \
+    -run=pythonscript -script="$HERE/editor_test_wp_sync.py" \
+    -unattended -nopause -nosplash >"$WORK/editor_wp_sync.log" 2>&1
+
 echo "==> Driving the editor"
 # -ExecCmds rather than the pythonscript commandlet, deliberately. The
 # commandlet runs the script and exits without ticking, and generation
@@ -111,10 +121,19 @@ fi
 report "$SYNC_RESULT" "SYNCHRONOUS TEST" || STATUS=1
 echo
 
+if [ ! -f "$WPSYNC_RESULT" ]; then
+    echo "SYNCHRONOUS WORLD PARTITION TEST DID NOT REPORT — see $WORK/editor_wp_sync.log" >&2
+    tail -20 "$WORK/editor_wp_sync.log" >&2
+    exit 1
+fi
+report "$WPSYNC_RESULT" "SYNCHRONOUS WORLD PARTITION TEST" || STATUS=1
+echo
+
 if [ "$TICK_OK" = "0" ]; then
     echo "EDITOR TEST SKIPPED — this engine cannot spawn actors from Python"
-    echo "  under -ExecCmds (known on UE 5.5). The synchronous suite above"
-    echo "  covers the same ground; see $WORK/editor.log."
+    echo "  under -ExecCmds (known on UE 5.5). The two synchronous suites"
+    echo "  above cover the same ground, World Partition included;"
+    echo "  see $WORK/editor.log."
     exit $STATUS
 fi
 report "$RESULT" "EDITOR TEST" || STATUS=1
