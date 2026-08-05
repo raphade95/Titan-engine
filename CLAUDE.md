@@ -35,6 +35,12 @@ acted on with confidence, so a stale entry is worse than a missing one. Update
 it in the same commit as the change it describes, and delete anything that has
 stopped being true rather than letting it accumulate.
 
+## Commits
+
+**Do not add a `Co-Authored-By:` trailer.** Ralph asked for it removed and the
+history was rewritten to strip it, so re-adding it would quietly undo that.
+Commits are authored by him alone.
+
 ## Layout
 
 | Path | What |
