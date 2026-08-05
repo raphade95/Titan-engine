@@ -3,6 +3,38 @@
 Deterministic procedural terrain. One C++ engine, three hosts. Everything
 lives under `titan-terrain-engine/`.
 
+## Current state — 2026-08-03
+
+Pre-launch. Engine C API is at v0.11, `.titan` format at v4.
+
+**Working:** TitanLab has the node graph, curve editor, DEM import, tiled
+export and undo/redo. The web lab mirrors it minus the graph. The Unreal
+plugin builds on UE 5.8 and 5.5 with mesh and Landscape output, `.titan`
+import (v2/v3; refuses v4), and World Partition streaming proxies.
+
+**Known open — check these before assuming something is a new bug:**
+
+- The Unreal plugin calls **19 of the engine's 95** exported functions. Its
+  `.titan` stack import understands only `fluvial`, `hydraulic` and `thermal`;
+  everything else is named in `ImportReport` rather than dropped silently.
+- Its default material is an engine stand-in and ignores the biome colour the
+  engine writes into vertex colours.
+- Nothing conforms imported terrain to ground already in a level; it is placed
+  at the actor.
+- **UE 5.6 is untested** — the directory here is a stub. 5.5 is verified only
+  through the synchronous suites, so its async delivery path is unproven.
+- `titan_version()` still reports 0.5.0, years behind the actual API level.
+- The `h + (x - h) * MaskAt(i)` rounding that broke snow idempotence also sits
+  in terrace, clamp, blur, sharpen and curve. None is idempotence-tested and
+  fixing them would move goldens.
+- The erosion fix (droplets reading their own batch's deposits) changed what
+  existing `.titan` projects render. Deliberate, and unversioned.
+
+**Keep this section honest.** It is read at the start of every session and
+acted on with confidence, so a stale entry is worse than a missing one. Update
+it in the same commit as the change it describes, and delete anything that has
+stopped being true rather than letting it accumulate.
+
 ## Layout
 
 | Path | What |
